@@ -1,7 +1,14 @@
 import { LOCAL_PART_REGEX, DEFAULT_RESERVED_LOCAL_PARTS } from '@hpc-mail/shared';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/errors';
-import { claimRandomBatch, MAX_BATCH_CLAIM, parseBatchCount, randomLocalPart, unavailableMessage } from './claim-helpers';
+import {
+  claimList,
+  MAX_BATCH_CLAIM,
+  parseBatchCount,
+  randomLocalPart,
+  randomLocalParts,
+  unavailableMessage,
+} from './claim-helpers';
 
 describe('randomLocalPart', () => {
   it('生成 8 位、字母开头、符合 LOCAL_PART 规则且不含易混字符的前缀', () => {
@@ -47,61 +54,62 @@ describe('parseBatchCount', () => {
   });
 });
 
-describe('claimRandomBatch', () => {
-  const taken = () => new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 });
-  const sequence = () => {
+describe('randomLocalParts', () => {
+  it('生成指定个数、互不相同的合法前缀；随机源撞车时继续取', () => {
+    const values = randomLocalParts(5);
+    expect(values).toHaveLength(5);
+    expect(new Set(values).size).toBe(5);
+    for (const value of values) expect(value).toMatch(LOCAL_PART_REGEX);
+    const seq = ['aa', 'aa', 'bb', 'aa', 'cc'];
     let n = 0;
-    return () => `p${++n}`;
-  };
+    expect(randomLocalParts(3, () => seq[n++]!)).toEqual(['aa', 'bb', 'cc']);
+  });
+});
 
-  it('顺序认领 count 个，用所选域名，并逐个汇报进度', async () => {
-    const claim = vi.fn(async (body: { localPart: string; domain: string }) => ({ address: `${body.localPart}@${body.domain}` }));
+describe('claimList', () => {
+  const taken = () => new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 });
+  const ok = (body: { localPart: string; domain: string }) => Promise.resolve({ address: `${body.localPart}@${body.domain}` });
+
+  it('按给定顺序、用所选域名逐个认领，并逐个汇报进度', async () => {
+    const claim = vi.fn(ok);
     const progress = vi.fn();
-    const result = await claimRandomBatch(3, 'a.test', claim, progress, sequence());
-    expect(result).toEqual({ claimed: ['p1@a.test', 'p2@a.test', 'p3@a.test'], stoppedBy: null });
+    const result = await claimList(['one', 'two', 'three'], 'a.test', claim, progress);
+    expect(result).toEqual({ claimed: ['one@a.test', 'two@a.test', 'three@a.test'], remaining: [], stoppedBy: null });
     expect(claim.mock.calls.map(([body]) => body)).toEqual([
-      { localPart: 'p1', domain: 'a.test' },
-      { localPart: 'p2', domain: 'a.test' },
-      { localPart: 'p3', domain: 'a.test' },
+      { localPart: 'one', domain: 'a.test' },
+      { localPart: 'two', domain: 'a.test' },
+      { localPart: 'three', domain: 'a.test' },
     ]);
     expect(progress.mock.calls.map(([n]) => n)).toEqual([1, 2, 3]);
   });
 
-  it('前缀被占用时同一个名额换前缀重试，不多占名额', async () => {
-    const claim = vi
-      .fn()
-      .mockRejectedValueOnce(taken())
-      .mockImplementation(async (body: { localPart: string; domain: string }) => ({ address: `${body.localPart}@${body.domain}` }));
-    const result = await claimRandomBatch(2, 'a.test', claim, undefined, sequence());
-    expect(result.claimed).toEqual(['p2@a.test', 'p3@a.test']);
-    expect(result.stoppedBy).toBeNull();
+  it('某个前缀被抢先占用：只跳过它、不替用户改名，其余照常认领', async () => {
+    const claim = vi.fn((body: { localPart: string; domain: string }) => (body.localPart === 'two' ? Promise.reject(taken()) : ok(body)));
+    const result = await claimList(['one', 'two', 'three'], 'a.test', claim);
+    expect(result).toEqual({ claimed: ['one@a.test', 'three@a.test'], remaining: ['two'], stoppedBy: null });
+    expect(claim).toHaveBeenCalledTimes(3);
   });
 
-  it('连续冲突超过重试次数就停止并保留已认领的', async () => {
-    const claim = vi.fn(async (body: { localPart: string; domain: string }) => {
-      if (body.localPart === 'p1') return { address: 'p1@a.test' };
-      throw taken();
+  it('配额用尽等其他错误立即停止：带出后端原因，未尝试的与被占用的都留在 remaining，不再继续请求', async () => {
+    const claim = vi.fn((body: { localPart: string; domain: string }) => {
+      if (body.localPart === 'one') return Promise.reject(taken());
+      if (body.localPart === 'three') return Promise.reject(new ApiError('认领地址数已达上限（2）', { code: 'forbidden', httpStatus: 403 }));
+      return ok(body);
     });
-    const result = await claimRandomBatch(3, 'a.test', claim, undefined, sequence());
-    expect(result.claimed).toEqual(['p1@a.test']);
-    expect(result.stoppedBy).toContain('多次冲突');
-    expect(claim).toHaveBeenCalledTimes(1 + 5);
-  });
-
-  it('配额用尽等其他错误立即停止，带出后端原因，不再继续请求', async () => {
-    const claim = vi
-      .fn()
-      .mockResolvedValueOnce({ address: 'p1@a.test' })
-      .mockRejectedValueOnce(new ApiError('认领地址数已达上限（2）', { code: 'forbidden', httpStatus: 403 }));
-    const result = await claimRandomBatch(5, 'a.test', claim, undefined, sequence());
-    expect(result).toEqual({ claimed: ['p1@a.test'], stoppedBy: '认领地址数已达上限（2）' });
-    expect(claim).toHaveBeenCalledTimes(2);
+    const result = await claimList(['one', 'two', 'three', 'four'], 'a.test', claim);
+    expect(result).toEqual({
+      claimed: ['two@a.test'],
+      remaining: ['one', 'three', 'four'],
+      stoppedBy: '认领地址数已达上限（2）',
+    });
+    expect(claim).toHaveBeenCalledTimes(3);
   });
 
   it('非 ApiError 的异常也不会抛出，给通用提示', async () => {
     const claim = vi.fn().mockRejectedValue(new TypeError('boom'));
-    expect(await claimRandomBatch(2, 'a.test', claim, undefined, sequence())).toEqual({
+    expect(await claimList(['one', 'two'], 'a.test', claim)).toEqual({
       claimed: [],
+      remaining: ['one', 'two'],
       stoppedBy: '认领失败，请重试',
     });
   });

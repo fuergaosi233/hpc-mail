@@ -34,7 +34,7 @@ export function unavailableMessage(availability: Pick<MailboxAvailability, 'avai
   return availability.reason ? REASON_MESSAGES[availability.reason] : '该地址暂不可认领';
 }
 
-/** 单次随机批量认领的个数上限 */
+/** 单次最多生成/认领的地址个数 */
 export const MAX_BATCH_CLAIM = 20;
 
 /** 个数输入框文本 → 1..MAX_BATCH_CLAIM 的整数；空或非法按 1 */
@@ -44,42 +44,50 @@ export function parseBatchCount(text: string): number {
   return Math.min(value, MAX_BATCH_CLAIM);
 }
 
-/** 随机前缀撞上已被占用的地址时，同一个名额最多换几次前缀 */
-const MAX_TAKEN_RETRIES = 5;
+/** 一次生成 count 个互不相同的随机前缀 */
+export function randomLocalParts(count: number, random: () => string = randomLocalPart): string[] {
+  const seen = new Set<string>();
+  while (seen.size < count) seen.add(random());
+  return [...seen];
+}
 
-export interface BatchClaimResult {
+export interface ClaimListResult {
   claimed: string[];
-  /** 没认领满的原因；全部认领成功为 null */
+  /** 没能认领的前缀（被占用的 + 因中途停止而没试的），保持用户给出的顺序 */
+  remaining: string[];
+  /** 中途因配额、权限、网络等停止时的原因；仅「被占用」导致的未认领不算 */
   stoppedBy: string | null;
 }
 
 /**
- * 顺序随机认领 count 个地址。逐个调用单个认领接口，配额、域名与权限校验沿用后端那一份：
- * 前缀被占用就换一个重试；遇到配额用尽、权限、网络等其他错误立即停止并保留已认领的，不再硬撞。
+ * 按用户确认的前缀列表顺序认领。逐个调用单个认领接口，配额、域名与权限校验沿用后端那一份：
+ * 前缀恰好被别人占用只跳过这一个（不替用户改名），其余错误立即停止并保留已认领的，不再硬撞。
  */
-export async function claimRandomBatch(
-  count: number,
+export async function claimList(
+  localParts: string[],
   domain: string,
   claim: (body: ClaimMailboxRequest) => Promise<Pick<Mailbox, 'address'> | undefined>,
-  onProgress: (claimed: number) => void = () => {},
-  random: () => string = randomLocalPart,
-): Promise<BatchClaimResult> {
+  onProgress: (done: number) => void = () => {},
+): Promise<ClaimListResult> {
   const claimed: string[] = [];
-  for (let slot = 0; slot < count; slot++) {
-    let done = false;
-    for (let attempt = 0; attempt < MAX_TAKEN_RETRIES && !done; attempt++) {
-      const localPart = random();
-      try {
-        const created = await claim({ localPart, domain });
-        claimed.push(created?.address ?? `${localPart}@${domain}`);
-        onProgress(claimed.length);
-        done = true;
-      } catch (error) {
-        if (error instanceof ApiError && error.code === 'address_taken') continue;
-        return { claimed, stoppedBy: error instanceof ApiError ? error.message : '认领失败，请重试' };
+  const remaining: string[] = [];
+  for (let i = 0; i < localParts.length; i++) {
+    const localPart = localParts[i]!;
+    try {
+      const created = await claim({ localPart, domain });
+      claimed.push(created?.address ?? `${localPart}@${domain}`);
+      onProgress(claimed.length);
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'address_taken') {
+        remaining.push(localPart);
+        continue;
       }
+      return {
+        claimed,
+        remaining: [...remaining, ...localParts.slice(i)],
+        stoppedBy: error instanceof ApiError ? error.message : '认领失败，请重试',
+      };
     }
-    if (!done) return { claimed, stoppedBy: '随机地址多次冲突，请稍后重试' };
   }
-  return { claimed, stoppedBy: null };
+  return { claimed, remaining, stoppedBy: null };
 }
