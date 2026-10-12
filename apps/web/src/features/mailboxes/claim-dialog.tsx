@@ -1,24 +1,25 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { Check, Shuffle, X } from 'lucide-react';
-import { type FormEvent, useEffect, useId, useState } from 'react';
+import { type FormEvent, useEffect, useId, useRef, useState } from 'react';
 import { claimMailboxRequestSchema, domainSchema, localPartSchema } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { Button } from '@/components/ui/button';
 import { writeClipboard } from '@/components/ui/copy-button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
+import { IconButton } from '@/components/ui/icon-button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
 import { toast } from '@/components/ui/toast';
 import { cn } from '@/lib/cn';
 import {
-  type BatchClaimResult,
-  claimRandomBatch,
+  claimList,
+  type ClaimListResult,
   MAX_BATCH_CLAIM,
   parseBatchCount,
   randomLocalPart,
+  randomLocalParts,
   unavailableMessage,
 } from './claim-helpers';
 
@@ -27,6 +28,14 @@ export interface ClaimDialogProps {
   onOpenChange: (open: boolean) => void;
   domains: string[];
 }
+
+interface Row {
+  id: number;
+  localPart: string;
+}
+
+/** 前缀输入停手多久后才去查可用性 */
+const CHECK_DEBOUNCE_MS = 400;
 
 function announceClaimed(address: string) {
   toast({
@@ -45,53 +54,75 @@ function announceClaimed(address: string) {
 
 export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const queryClient = useQueryClient();
-  const inputId = useId();
-  const statusId = `${inputId}-status`;
-  const [localPart, setLocalPart] = useState('');
+  const baseId = useId();
+  const nextRowId = useRef(1);
+  const newRow = (localPart = ''): Row => ({ id: nextRowId.current++, localPart });
+
+  const [rows, setRows] = useState<Row[]>(() => [newRow()]);
   const [domain, setDomain] = useState(domains[0] ?? '');
-  const [debounced, setDebounced] = useState('');
+  /** 每行已「停手」的前缀：与当前输入一致时才发可用性查询 */
+  const [settled, setSettled] = useState<Record<number, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [countText, setCountText] = useState('1');
-  /** 批量认领进行中已认领的个数；null 表示没有在批量认领 */
+  /** 认领进行中已认领的个数；null 表示没在认领 */
   const [progress, setProgress] = useState<number | null>(null);
-  const [result, setResult] = useState<(BatchClaimResult & { requested: number }) | null>(null);
+  const [result, setResult] = useState<ClaimListResult | null>(null);
   const count = parseBatchCount(countText);
-  const batching = progress !== null;
+  const claiming = progress !== null;
 
   useEffect(() => {
     if (!domains.includes(domain)) setDomain(domains[0] ?? '');
   }, [open, domain, domains]);
 
   useEffect(() => {
-    const timer = globalThis.setTimeout(() => setDebounced(localPart), 400);
+    const timer = globalThis.setTimeout(
+      () => setSettled(Object.fromEntries(rows.map((row) => [row.id, row.localPart]))),
+      CHECK_DEBOUNCE_MS,
+    );
     return () => globalThis.clearTimeout(timer);
-  }, [localPart]);
+  }, [rows]);
 
-  const localValid = localPartSchema.safeParse(localPart).success;
   const domainValid = domains.includes(domain) && domainSchema.safeParse(domain).success;
 
-  const availability = useQuery({
-    queryKey: queryKeys.mailboxes.availability(debounced, domain),
-    queryFn: () => mailboxApi.availability(debounced, domain),
-    enabled: open && localValid && domainValid && debounced.length > 0 && debounced === localPart,
+  const checks = useQueries({
+    queries: rows.map((row) => ({
+      queryKey: queryKeys.mailboxes.availability(settled[row.id] ?? '', domain),
+      queryFn: () => mailboxApi.availability(settled[row.id]!, domain),
+      enabled:
+        open &&
+        !result &&
+        domainValid &&
+        settled[row.id] === row.localPart &&
+        localPartSchema.safeParse(row.localPart).success,
+    })),
   });
 
-  const claim = useMutation({
-    mutationFn: () => mailboxApi.claim({ localPart, domain }),
-    onSuccess: (created) => {
-      announceClaimed(created?.address ?? `${localPart}@${domain}`);
-      invalidateMailboxOwnership(queryClient);
-      onOpenChange(false);
-      reset();
-    },
-    onError: (err) => setError(err instanceof ApiError ? err.message : '认领失败，请重试'),
+  const duplicates = new Set(
+    rows.map((row) => row.localPart).filter((value, index, all) => value && all.indexOf(value) !== index),
+  );
+
+  const states = rows.map((row, index) => {
+    const parsed = localPartSchema.safeParse(row.localPart);
+    const valid = parsed.success;
+    const check = checks[index]!;
+    const settledNow = settled[row.id] === row.localPart && !check.isFetching;
+    const formatError = row.localPart.length > 0 && !valid ? parsed.error?.issues[0]?.message : null;
+    const unavailable = valid && settledNow && check.data ? unavailableMessage(check.data) : null;
+    return {
+      valid,
+      checking: valid && settled[row.id] === row.localPart && check.isFetching,
+      available: valid && settledNow && check.data?.available === true,
+      error: formatError ?? (duplicates.has(row.localPart) ? '与其他地址重复' : null) ?? unavailable,
+    };
   });
+  const canSubmit = domainValid && !claiming && states.every((state) => state.valid && state.error === null);
 
   function reset() {
-    setLocalPart('');
-    setDebounced('');
+    setRows([newRow()]);
+    setSettled({});
     setError(null);
     setCountText('1');
+    setProgress(null);
     setResult(null);
   }
 
@@ -100,21 +131,83 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
     reset();
   }
 
-  const claimBatch = async () => {
+  const editRow = (id: number, value: string) => {
+    setRows((current) => current.map((row) => (row.id === id ? { ...row, localPart: value } : row)));
+    setError(null);
+  };
+
+  /** 随机值无需等防抖：直接视为已停手，立即查可用性 */
+  const fillRows = (next: Row[]) => {
+    setRows(next);
+    setSettled(Object.fromEntries(next.map((row) => [row.id, row.localPart])));
+    setError(null);
+  };
+
+  const randomizeAll = () => fillRows(randomLocalParts(count).map((value) => newRow(value)));
+
+  const rerollRow = (id: number) => {
+    const taken = new Set(rows.map((row) => row.localPart));
+    let value = randomLocalPart();
+    while (taken.has(value)) value = randomLocalPart();
+    fillRows(rows.map((row) => (row.id === id ? { ...row, localPart: value } : row)));
+  };
+
+  const removeRow = (id: number) => fillRows(rows.filter((row) => row.id !== id));
+
+  const handleSubmit = async (event: FormEvent) => {
+    event.preventDefault();
     setError(null);
     if (!domainValid) {
       setError('可用域名已变更，请重新选择');
       return;
     }
+    for (const row of rows) {
+      const parsed = claimMailboxRequestSchema.safeParse({ localPart: row.localPart, domain });
+      if (!parsed.success) {
+        setError(parsed.error.issues[0]?.message ?? '请检查输入');
+        return;
+      }
+    }
+    if (!canSubmit) return;
+
     setProgress(0);
-    const outcome = await claimRandomBatch(count, domain, mailboxApi.claim, setProgress);
+    const outcome = await claimList(
+      rows.map((row) => row.localPart),
+      domain,
+      mailboxApi.claim,
+      setProgress,
+    );
     setProgress(null);
+
+    if (outcome.claimed.length > 0) {
+      invalidateMailboxOwnership(queryClient);
+    } else {
+      // 一个都没认领上：只需让已缓存的可用性重新核对，被占用的行会随即标红
+      void queryClient.invalidateQueries({ queryKey: [...queryKeys.mailboxes.root, 'availability'] });
+    }
     if (outcome.claimed.length === 0) {
-      setError(outcome.stoppedBy ?? '认领失败，请重试');
+      setError(
+        outcome.stoppedBy ??
+          (rows.length === 1 ? '该地址已被占用，换一个前缀试试' : '这些地址刚被别人认领，请修改后重试'),
+      );
       return;
     }
-    invalidateMailboxOwnership(queryClient);
-    setResult({ ...outcome, requested: count });
+    if (rows.length === 1) {
+      announceClaimed(outcome.claimed[0]!);
+      close();
+      return;
+    }
+    setResult(outcome);
+  };
+
+  /** 回到表单，只保留没认领成功的前缀继续修改 */
+  const editRemaining = () => {
+    if (!result) return;
+    const next = result.remaining.map((value) => newRow(value));
+    setResult(null);
+    setError(null);
+    setCountText(String(next.length));
+    fillRows(next);
   };
 
   const copyAll = () =>
@@ -122,52 +215,14 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       toast(ok ? { title: '已复制全部地址', variant: 'success' } : { title: '复制失败，请手动选择', variant: 'error' }),
     );
 
-  const changeLocalPart = (value: string) => {
-    setLocalPart(value);
-    setError(null);
-  };
-
-  const randomize = () => {
-    const next = randomLocalPart();
-    changeLocalPart(next);
-    // 随机值无需等防抖，立即查可用性
-    setDebounced(next);
-  };
-
-  const settled = debounced === localPart && !availability.isFetching;
-  const checking = localValid && debounced === localPart && availability.isFetching;
-  const showAvailable = localValid && settled && availability.data?.available === true;
-  const unavailable = localValid && settled && availability.data ? unavailableMessage(availability.data) : null;
-  const formatError = localPart.length > 0 && !localValid ? localPartSchema.safeParse(localPart).error?.issues[0]?.message : null;
-
-  const handleSubmit = (event: FormEvent) => {
-    event.preventDefault();
-    setError(null);
-    if (!domainValid) {
-      setError('可用域名已变更，请重新选择');
-      return;
-    }
-    const parsed = claimMailboxRequestSchema.safeParse({ localPart, domain });
-    if (!parsed.success) {
-      setError(parsed.error.issues[0]?.message ?? '请检查输入');
-      return;
-    }
-    if (unavailable) {
-      setError(unavailable);
-      return;
-    }
-    claim.mutate();
-  };
-
-  const statusText = formatError ?? unavailable ?? (showAvailable ? `${localPart}@${domain} 可以认领` : null);
-  const statusTone = formatError || unavailable ? 'text-critical' : showAvailable ? 'text-positive' : 'text-ink-tertiary';
+  const multiple = rows.length > 1;
 
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        // 批量认领进行中不允许关闭，否则结果无处可看
-        if (!next && batching) return;
+        // 认领进行中不允许关闭，否则结果无处可看
+        if (!next && claiming) return;
         onOpenChange(next);
         if (!next) reset();
       }}
@@ -182,7 +237,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
             <DialogBody className="flex flex-col gap-3">
               <p role="status" className="text-sm text-ink">
                 已认领 {result.claimed.length} 个地址
-                {result.claimed.length < result.requested && `（计划 ${result.requested} 个）`}
+                {result.remaining.length > 0 && `，还有 ${result.remaining.length} 个未认领`}
               </p>
               <ul className="max-h-60 divide-y divide-line overflow-y-auto rounded-lg border border-line bg-surface">
                 {result.claimed.map((address) => (
@@ -191,9 +246,11 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                   </li>
                 ))}
               </ul>
-              {result.stoppedBy && (
+              {result.remaining.length > 0 && (
                 <p role="alert" className="text-sm text-critical">
-                  未能认领满：{result.stoppedBy}
+                  {result.stoppedBy
+                    ? `未能认领满：${result.stoppedBy}`
+                    : `${result.remaining.length} 个地址刚被别人认领，可返回修改后重试。`}
                 </p>
               )}
             </DialogBody>
@@ -201,115 +258,156 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
               <Button type="button" variant="secondary" onClick={copyAll}>
                 复制全部地址
               </Button>
+              {result.remaining.length > 0 && !result.stoppedBy && (
+                <Button type="button" variant="secondary" onClick={editRemaining}>
+                  返回修改
+                </Button>
+              )}
               <Button type="button" onClick={close}>
                 完成
               </Button>
             </DialogFooter>
           </>
         ) : (
-          <form onSubmit={handleSubmit}>
+          <form onSubmit={(event) => void handleSubmit(event)}>
             <DialogBody className="flex flex-col gap-4">
               <div className="flex flex-col gap-1.5">
-                <div className="flex items-center justify-between gap-2">
-                  <label htmlFor={inputId} className="text-sm font-medium text-ink">
+                <label htmlFor={`${baseId}-domain`} className="text-sm font-medium text-ink">
+                  域名
+                </label>
+                <Select value={domain} onValueChange={setDomain}>
+                  <SelectTrigger id={`${baseId}-domain`} aria-label="域名">
+                    <SelectValue placeholder="选择域名" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {domains.map((item) => (
+                      <SelectItem key={item} value={item}>
+                        {item}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label htmlFor={`${baseId}-0`} className="text-sm font-medium text-ink">
                     邮箱地址
                     <span className="ml-0.5 text-critical">*</span>
                   </label>
                   <div className="flex items-center gap-1">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={batching}
-                      onClick={count > 1 ? () => void claimBatch() : randomize}
-                    >
+                    <Button type="button" variant="ghost" size="sm" disabled={claiming} onClick={randomizeAll}>
                       <Shuffle className="size-4" />
-                      {count > 1 ? '随机生成并认领' : '随机生成'}
+                      随机生成
                     </Button>
                     <Input
                       aria-label="随机生成个数"
+                      title={`一次最多 ${MAX_BATCH_CLAIM} 个`}
                       inputMode="numeric"
                       autoComplete="off"
                       value={countText}
-                      disabled={batching}
+                      disabled={claiming}
                       className="h-8 w-12 px-1 text-center"
                       onChange={(event) => setCountText(event.target.value.replace(/\D/g, '').slice(0, 2))}
                       onBlur={() => setCountText(String(count))}
                       onKeyDown={(event) => {
-                        // 回车不提交表单（那会去认领前缀框里的内容），等同点击旁边的随机按钮
+                        // 回车不提交表单（那会直接认领），等同点击旁边的随机生成
                         if (event.key !== 'Enter') return;
                         event.preventDefault();
-                        if (count > 1) void claimBatch();
-                        else randomize();
+                        randomizeAll();
                       }}
                     />
                     <span className="text-sm text-ink-secondary">个</span>
                   </div>
                 </div>
-                {(count > 1 || batching) && (
-                  <p role="status" aria-live="polite" className="text-xs text-ink-tertiary">
-                    {batching
-                      ? `正在认领 ${progress}/${count}…`
-                      : `将在 @${domain} 下随机生成 ${count} 个地址并直接全部认领（最多 ${MAX_BATCH_CLAIM} 个）`}
-                  </p>
-                )}
-                <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2">
-                  <div className="relative">
-                    <Input
-                      id={inputId}
-                      aria-label="前缀"
-                      aria-describedby={statusText ? statusId : undefined}
-                      autoComplete="off"
-                      autoCapitalize="none"
-                      spellCheck={false}
-                      placeholder="例如 hello"
-                      value={localPart}
-                      invalid={Boolean(formatError || unavailable)}
-                      className="pr-8"
-                      onChange={(event) => changeLocalPart(event.target.value.trim().toLowerCase())}
-                    />
-                    <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2">
-                      {checking && <Spinner className="size-4 text-ink-tertiary" />}
-                      {showAvailable && <Check className="size-4 text-positive" />}
-                      {unavailable && <X className="size-4 text-critical" />}
-                    </span>
-                  </div>
-                  <span className="text-sm text-ink-tertiary" aria-hidden>
-                    @
-                  </span>
-                  <Select value={domain} onValueChange={setDomain}>
-                    <SelectTrigger aria-label="域名">
-                      <SelectValue placeholder="选择域名" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {domains.map((item) => (
-                        <SelectItem key={item} value={item}>
-                          {item}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <p id={statusId} role="status" aria-live="polite" className={cn('min-h-5 text-xs', statusTone)}>
-                  {statusText ?? (checking ? '正在检查是否可认领…' : '')}
+
+                <ul className={cn('flex flex-col gap-2', multiple && 'max-h-72 overflow-y-auto p-1 -m-1')}>
+                  {rows.map((row, index) => {
+                    const state = states[index]!;
+                    const errorId = `${baseId}-${index}-error`;
+                    const address = `${row.localPart}@${domain}`;
+                    return (
+                      <li key={row.id} className="flex flex-col gap-1">
+                        <div className="flex items-center gap-1.5">
+                          <div className="relative min-w-0 flex-1">
+                            <Input
+                              id={`${baseId}-${index}`}
+                              aria-label={multiple ? `前缀 ${index + 1}` : '前缀'}
+                              aria-describedby={state.error ? errorId : undefined}
+                              autoComplete="off"
+                              autoCapitalize="none"
+                              spellCheck={false}
+                              placeholder="例如 hello"
+                              value={row.localPart}
+                              invalid={state.error !== null}
+                              disabled={claiming}
+                              className="pr-8"
+                              onChange={(event) => editRow(row.id, event.target.value.trim().toLowerCase())}
+                            />
+                            <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2">
+                              {state.checking && <Spinner className="size-4 text-ink-tertiary" />}
+                              {state.available && (
+                                <>
+                                  <Check className="size-4 text-positive" aria-hidden />
+                                  <span className="sr-only">{address} 可以认领</span>
+                                </>
+                              )}
+                              {state.error && <X className="size-4 text-critical" aria-hidden />}
+                            </span>
+                          </div>
+                          <span className="max-w-[40%] shrink-0 truncate text-sm text-ink-tertiary" aria-hidden>
+                            @{domain}
+                          </span>
+                          {multiple && (
+                            <>
+                              <IconButton
+                                size="sm"
+                                aria-label={`重新随机第 ${index + 1} 个`}
+                                disabled={claiming}
+                                onClick={() => rerollRow(row.id)}
+                              >
+                                <Shuffle className="size-4" />
+                              </IconButton>
+                              <IconButton
+                                size="sm"
+                                aria-label={`移除第 ${index + 1} 个`}
+                                disabled={claiming}
+                                onClick={() => removeRow(row.id)}
+                              >
+                                <X className="size-4" />
+                              </IconButton>
+                            </>
+                          )}
+                        </div>
+                        {state.error && (
+                          <p id={errorId} className="text-xs text-critical">
+                            {state.error}
+                          </p>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+                <p role="status" aria-live="polite" className="min-h-5 text-xs text-ink-tertiary">
+                  {claiming
+                    ? `正在认领 ${progress}/${rows.length}…`
+                    : multiple
+                      ? `共 ${rows.length} 个地址，可直接修改任一个，或再点「随机生成」换一批，确认无误后点「认领 ${rows.length} 个」。`
+                      : ''}
                 </p>
               </div>
-              {error && error !== unavailable && (
+              {error && (
                 <p role="alert" className="text-sm text-critical">
                   {error}
                 </p>
               )}
             </DialogBody>
             <DialogFooter>
-              <Button type="button" variant="secondary" disabled={batching} onClick={() => onOpenChange(false)}>
+              <Button type="button" variant="secondary" disabled={claiming} onClick={close}>
                 取消
               </Button>
-              <Button
-                type="submit"
-                loading={claim.isPending}
-                disabled={batching || !localValid || !domainValid || unavailable !== null}
-              >
-                认领
+              <Button type="submit" loading={claiming} disabled={!canSubmit}>
+                {multiple ? `认领 ${rows.length} 个` : '认领'}
               </Button>
             </DialogFooter>
           </form>
