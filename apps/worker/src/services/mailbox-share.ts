@@ -8,33 +8,36 @@ import type { Env } from '../types.js';
 
 const MAX_GRANTEES = 100;
 
-function assertOwnMailbox<T extends { userId: number }>(
+function assertManageableMailbox<T extends { userId: number }>(
   box: T | undefined,
-  adminId: number,
+  actorId: number,
+  isAdmin = false,
 ): asserts box is T {
-  if (!box || box.userId !== adminId) {
+  if (!box || (!isAdmin && box.userId !== actorId)) {
     throw new AppError('forbidden', '只能共享自己已认领的地址');
   }
 }
 
-/** 当前管理员名下全部已认领邮箱，附带共享名单（含尚未分享的） */
-export async function listMailboxShares(env: Env, adminId: number): Promise<MailboxShareGrant[]> {
+/** 自有或全站已认领邮箱，附带所有者与共享名单（含尚未分享的）。 */
+export async function listMailboxShares(env: Env, actorId: number, all = false): Promise<MailboxShareGrant[]> {
   const db = createDb(env);
   const boxes = await db
-    .select()
+    .select({ box: mailboxes, ownerUsername: users.username })
     .from(mailboxes)
-    .where(eq(mailboxes.userId, adminId))
+    .innerJoin(users, eq(users.id, mailboxes.userId))
+    .where(all ? undefined : eq(mailboxes.userId, actorId))
     .orderBy(asc(mailboxes.address))
     .all();
   if (boxes.length === 0) return [];
 
   const rows = [];
-  for (const batch of chunk(boxes.map((box) => box.id))) {
+  for (const batch of chunk(boxes.map(({ box }) => box.id))) {
     const part = await db
       .select({
         mailboxId: mailboxShares.mailboxId,
         userId: mailboxShares.userId,
         username: users.username,
+        status: users.status,
         grantedAt: mailboxShares.createdAt,
       })
       .from(mailboxShares)
@@ -51,40 +54,48 @@ export async function listMailboxShares(env: Env, adminId: number): Promise<Mail
     list.push({
       userId: row.userId,
       username: row.username,
+      status: row.status,
       grantedAt: row.grantedAt.toISOString(),
     });
     byMailbox.set(row.mailboxId, list);
   }
 
-  return boxes.map((box) => ({
+  return boxes.map(({ box, ownerUsername }) => ({
     mailboxId: box.id,
     address: box.address,
     domain: box.domain,
     displayName: box.displayName,
+    ownerUserId: box.userId,
+    ownerUsername,
     grantees: byMailbox.get(box.id) ?? [],
   }));
 }
 
 /**
  * 整体替换一只邮箱的共享名单。
- * 调用者必须是该邮箱的认领管理员；被分享人必须是启用中的普通用户。
+ * 所有者可管理自己的邮箱，管理员可管理任意邮箱；被分享人必须启用。
  */
 export async function replaceMailboxShares(
   env: Env,
-  adminId: number,
+  actorId: number,
   mailboxId: number,
   userIds: number[],
+  isAdmin = false,
+  expectedOwnerId?: number,
 ): Promise<MailboxShareGrant> {
   const db = createDb(env);
   const box = await db.select().from(mailboxes).where(eq(mailboxes.id, mailboxId)).get();
-  assertOwnMailbox(box, adminId);
+  assertManageableMailbox(box, actorId, isAdmin);
+  if (expectedOwnerId !== undefined && box.userId !== expectedOwnerId) {
+    throw new AppError('conflict', '邮箱所有者已改变，请刷新后重试');
+  }
 
   const uniqueIds = [...new Set(userIds)];
   if (uniqueIds.length > MAX_GRANTEES) {
     throw new AppError('validation_failed', `一次最多共享给 ${MAX_GRANTEES} 个用户`);
   }
-  if (uniqueIds.includes(adminId)) {
-    throw new AppError('validation_failed', '不能把邮箱共享给自己');
+  if (uniqueIds.includes(box.userId)) {
+    throw new AppError('validation_failed', '邮箱所有者已经拥有访问权限，无需共享');
   }
   if (uniqueIds.length > 0) {
     const targets = [];
@@ -99,50 +110,64 @@ export async function replaceMailboxShares(
     if (targets.length !== uniqueIds.length) {
       throw new AppError('validation_failed', '包含不存在的用户');
     }
-    if (targets.some((target) => target.role !== 'user' || target.status !== 'active')) {
-      throw new AppError('validation_failed', '只能共享给启用中的普通用户');
+    if (targets.some((target) => target.status !== 'active')) {
+      throw new AppError('validation_failed', '只能共享给启用中的用户');
     }
   }
 
-  await env.db.batch([
-    env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id = ?
-      AND EXISTS (SELECT 1 FROM mailboxes WHERE id = ? AND user_id = ?)`).bind(mailboxId, mailboxId, adminId),
-    ...uniqueIds.map((userId) =>
-      env.db
-        .prepare(`INSERT INTO mailbox_shares (mailbox_id, user_id, granted_by)
-          SELECT id, ?, ? FROM mailboxes WHERE id = ? AND user_id = ?`)
-        .bind(userId, adminId, mailboxId, adminId),
-    ),
-  ]);
-  assertOwnMailbox(await db.select().from(mailboxes).where(eq(mailboxes.id, mailboxId)).get(), adminId);
+  try {
+    await env.db.batch([
+      env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id = ?
+        AND EXISTS (SELECT 1 FROM mailboxes WHERE id = ? AND user_id = ?)`).bind(mailboxId, mailboxId, box.userId),
+      ...uniqueIds.map((userId) =>
+        env.db
+          .prepare(`INSERT INTO mailbox_shares (mailbox_id, user_id, granted_by)
+          SELECT id, CASE WHEN (SELECT status FROM users WHERE id = ?) = 'active' THEN ? ELSE NULL END, ?
+          FROM mailboxes WHERE id = ? AND user_id = ?`)
+          .bind(userId, userId, actorId, mailboxId, box.userId),
+      ),
+    ]);
+  } catch (error) {
+    if (String(error).includes('NOT NULL constraint failed: mailbox_shares.user_id')) {
+      throw new AppError('conflict', '共享用户状态已改变，请刷新后重试');
+    }
+    throw error;
+  }
+  const current = await db.select().from(mailboxes).where(eq(mailboxes.id, mailboxId)).get();
+  assertManageableMailbox(current, actorId, isAdmin);
+  if (current.userId !== box.userId) throw new AppError('conflict', '邮箱所有者已改变，请刷新后重试');
+  const owner = await db.select({ username: users.username }).from(users).where(eq(users.id, box.userId)).get();
 
   return {
     mailboxId: box.id,
     address: box.address,
     domain: box.domain,
     displayName: box.displayName,
+    ownerUserId: box.userId,
+    ownerUsername: owner!.username,
     grantees: await granteesOf(env, mailboxId),
   };
 }
 
 export async function revokeMailboxShare(
   env: Env,
-  adminId: number,
+  actorId: number,
   mailboxId: number,
   userId: number,
+  isAdmin = false,
 ): Promise<void> {
   const db = createDb(env);
   const box = await db.select().from(mailboxes).where(eq(mailboxes.id, mailboxId)).get();
-  assertOwnMailbox(box, adminId);
+  assertManageableMailbox(box, actorId, isAdmin);
   const result = await db
     .delete(mailboxShares)
     .where(and(eq(mailboxShares.mailboxId, mailboxId), eq(mailboxShares.userId, userId),
-      sql`EXISTS (SELECT 1 FROM mailboxes WHERE id = ${mailboxId} AND user_id = ${adminId})`))
+      sql`EXISTS (SELECT 1 FROM mailboxes WHERE id = ${mailboxId} AND user_id = ${box.userId})`))
     .run();
   if ((result.meta.changes ?? 0) === 0) throw new AppError('not_found', '该用户不在共享名单中');
 }
 
-/** 登录用户被分享、且主人仍是启用中管理员的邮箱 */
+/** 登录用户被分享、且所有者仍启用的邮箱。 */
 export async function listSharedMailboxes(env: Env, userId: number): Promise<SharedMailboxView[]> {
   const db = createDb(env);
   const rows = await db
@@ -156,7 +181,7 @@ export async function listSharedMailboxes(env: Env, userId: number): Promise<Sha
     .from(mailboxShares)
     .innerJoin(mailboxes, eq(mailboxes.id, mailboxShares.mailboxId))
     .innerJoin(users, eq(users.id, mailboxes.userId))
-    .where(and(eq(mailboxShares.userId, userId), eq(users.role, 'admin'), eq(users.status, 'active')))
+    .where(and(eq(mailboxShares.userId, userId), eq(users.status, 'active')))
     .orderBy(asc(mailboxes.address))
     .all();
   return rows;
@@ -168,6 +193,7 @@ async function granteesOf(env: Env, mailboxId: number): Promise<MailboxShareGran
     .select({
       userId: mailboxShares.userId,
       username: users.username,
+      status: users.status,
       grantedAt: mailboxShares.createdAt,
     })
     .from(mailboxShares)
@@ -178,6 +204,7 @@ async function granteesOf(env: Env, mailboxId: number): Promise<MailboxShareGran
   return rows.map((row) => ({
     userId: row.userId,
     username: row.username,
+    status: row.status,
     grantedAt: row.grantedAt.toISOString(),
   }));
 }

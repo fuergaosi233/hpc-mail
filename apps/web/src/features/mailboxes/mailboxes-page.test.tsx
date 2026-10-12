@@ -6,7 +6,7 @@ const mocks=vi.hoisted(()=>({release:vi.fn(async()=>({success:true,deletedMessag
 vi.mock('@/api/resources',()=>({mailboxApi:{release:mocks.release}}));
 vi.mock('@/components/ui/toast',()=>({toast:mocks.toast}));
 vi.mock('@/lib/use-config',()=>({useDomains:()=>({data:['example.com']})}));
-vi.mock('./use-mailboxes',()=>({useMailboxesQuery:()=>({data:[{id:9,address:'me@example.com',domain:'example.com',displayName:'',messageCount:0,createdAt:'2026-10-05T00:00:00Z'}],isLoading:false,isError:false})}));
+vi.mock('./use-mailboxes',()=>({useSharedMailboxesQuery:()=>({data:[],isLoading:false,isError:false}),useMailboxesQuery:()=>({data:[{id:9,address:'me@example.com',domain:'example.com',displayName:'',messageCount:0,createdAt:'2026-10-05T00:00:00Z'}],isLoading:false,isError:false})}));
 import { MailboxesPage } from './mailboxes-page';
 describe('mailbox release',()=>{
   it('offers clearing history even if the cached count is zero and refreshes all ownership-dependent data',async()=>{

@@ -12,7 +12,7 @@
 | `PUT /admin/users/:id` | 至少一个 `status:active\|disabled`、`role:user\|admin`、`password`（重置密码）、`mailboxPolicy`（邮箱权限）；修改邮箱权限需带 `expectedMailboxPolicyRevision`；返回更新后的用户 |
 | `DELETE /admin/users/:id` | `{success:true}`，不可恢复；账户与其邮箱/共享/Key/星标关联撤销，邮件历史仍按地址保留 |
 
-用户含 `id,username,role,status,mailboxCount,mailboxes,mailboxPolicy,mailboxPolicyRevision,apiKeyCount,createdAt,lastLoginAt,avatarUrl`。建户/重置密码约束见鉴权参考。不能禁用或删除自己；不能移除最后一个启用中的管理员。禁用/重置密码撤销旧会话，禁用期间 Key 也被拒绝；重置密码本身不吊销 Key。降级管理员撤销其名下共享，存量邮箱仍存在，新认领/发件按当前角色校验。
+用户含 `id,username,role,status,mailboxCount,mailboxes,mailboxPolicy,mailboxPolicyRevision,apiKeyCount,createdAt,lastLoginAt,avatarUrl`。建户/重置密码约束见鉴权参考。不能禁用或删除自己；不能移除最后一个启用中的管理员。禁用/重置密码撤销旧会话，禁用期间 Key 也被拒绝；重置密码本身不吊销 Key。角色变化保留已有共享，存量邮箱仍存在，新认领/发件按当前角色校验。
 
 ## 用户专属邮箱权限
 
@@ -67,7 +67,7 @@ hpc '/messages' --get --data-urlencode 'scope=user' \
 hpc '/messages' --get --data-urlencode 'scope=unclaimed' --data-urlencode 'direction=inbound'
 ```
 
-详情/线程/raw 同样带 scope 与 userId，管理员审阅其他用户为只读，所有邮件状态变更（含星标）仅支持 `mine/unclaimed`。未认领邮件修改需显式 `scope=unclaimed`；默认列表只自己的认领邮箱。全站地址管理用 `GET /mailboxes?all=1`，编辑/释放对应 `/mailboxes/:id`；共享管理只能管理**自己的**邮箱，不是任意 owner 的共享。域名与共享完整契约见 [邮箱、多域名参考](mailboxes-and-domains.md)。
+详情/线程/raw 同样带 scope 与 userId，管理员审阅其他用户为只读，所有邮件状态变更（含星标）仅支持 `mine/unclaimed`。未认领邮件修改需显式 `scope=unclaimed`；默认列表只自己的认领邮箱。全站地址管理用 `GET /mailboxes?all=1`，编辑/释放对应 `/mailboxes/:id`；管理员共享管理可处理**全站任意已认领邮箱**，成员可为启用中的普通用户或管理员。域名与共享完整契约见 [邮箱、多域名参考](mailboxes-and-domains.md)。
 
 ## 邀请码
 

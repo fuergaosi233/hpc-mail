@@ -75,7 +75,7 @@ settings=$(curl -sS "$BASE_URL/api/admin/settings" -H "Authorization: Bearer $TO
 echo "$settings" | jq -e '.data.register_mode' >/dev/null || fail "settings 结构异常: $settings"
 
 step "邮箱与共享邮箱列表可读"
-for endpoint in mailboxes mailboxes/shared admin/mailbox-shares; do
+for endpoint in mailboxes mailboxes/shared mailboxes/shares admin/mailbox-shares; do
   curl -fsS "$BASE_URL/api/$endpoint" -H "Authorization: Bearer $TOKEN" | jq -e '.data | type == "array"' >/dev/null || fail "$endpoint 结构异常"
 done
 
@@ -140,6 +140,31 @@ curl -fsS "$BASE_URL/api/admin/users" -H "Authorization: Bearer $TOKEN" | jq -e 
     (.mailboxPolicy == null or (.mailboxPolicy | type == "object")) and
     (.mailboxPolicyRevision | type == "number") and .mailboxPolicyRevision >= 0)
 ' >/dev/null || fail "用户邮箱权限配置或版本未正确回显"
+
+step "所有者共享与管理员全站共享契约"
+curl -fsS "$BASE_URL/api/openapi.json" | jq -e '
+  .paths["/mailboxes/shares"].put.requestBody != null and
+  .paths["/mailboxes/shares/{mailboxId}/grantees/{userId}"].delete != null and
+  .paths["/mailboxes/share-users"].get != null and
+  .paths["/admin/mailbox-shares"].put["x-required-role"] == "admin" and
+  .components.schemas.MailboxShareGrant.properties.ownerUserId.type == "integer" and
+  .components.schemas.MailboxShareGrant.properties.ownerUsername.type == "string" and
+  .components.schemas.ReplaceMailboxSharesRequest.properties.expectedOwnerId.type == "integer"
+' >/dev/null || fail "共享邮箱机器契约缺失"
+curl -fsS "$BASE_URL/api/mailboxes/shares" -H "Authorization: Bearer $TOKEN" | jq --argjson ownerId "$admin_id" -e '
+  .data | type == "array" and all(.[]; .ownerUserId == $ownerId and (.ownerUsername | type == "string"))
+' >/dev/null || fail "个人共享名单越出自有邮箱范围"
+curl -fsS "$BASE_URL/api/admin/mailbox-shares" -H "Authorization: Bearer $TOKEN" | jq -e '
+  .data | type == "array" and all(.[];
+    (.ownerUserId | type == "number") and (.ownerUsername | type == "string") and
+    (.grantees | type == "array" and all(.[]; .status == "active" or .status == "disabled")))
+' >/dev/null || fail "全站共享邮箱所有者或成员状态缺失"
+curl -fsS --get "$BASE_URL/api/mailboxes/share-users" --data-urlencode "q=$ADMIN_USERNAME" \
+  -H "Authorization: Bearer $TOKEN" | jq --argjson userId "$admin_id" -e '
+    .data.items[0].id == $userId and .data.items[0].role == "admin" and
+    (.data.items | length) <= 20 and (.data.hasMore | type == "boolean") and
+    (.data.items[0] | keys | sort) == ["id", "role", "username"]
+  ' >/dev/null || fail "共享成员搜索未正确返回管理员候选"
 
 step "注册模式=closed 时注册被拒"
 if [ "$mode" = "closed" ]; then

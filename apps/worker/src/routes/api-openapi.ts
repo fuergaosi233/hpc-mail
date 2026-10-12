@@ -35,6 +35,18 @@ export function buildSessionOpenApiSpec(origin: string) {
         description: 'Claim only a domain returned by /domains. Existing history at the address becomes visible to the claimant. Ordinary users obey their effective public or dedicated domain/global/per-domain quotas and system reserved-prefix restrictions. Dedicated policies do not revoke existing owned mailboxes. Does not provision a domain or Email Routing.' }),
     },
     '/mailboxes/shared': { get: operation('List inboxes shared with the caller', array(ref('SharedMailbox')), { description: 'Read-only inbound access; no sending, deletion or owner notifications. The read state of shared mail belongs to the owner: readers cannot change it, and it is excluded from their unread count and unread=1 list filter. Stars are personal.' }) },
+    '/mailboxes/shares': {
+      get: operation('List grants on caller-owned mailboxes', array(ref('MailboxShareGrant'))),
+      put: operation('Replace grants on a caller-owned mailbox', ref('MailboxShareGrant'), { request: 'ReplaceMailboxSharesRequest',
+        description: 'Owner JWT only; cannot manage another owner through this endpoint, even as an administrator. userIds replaces the entire list; [] revokes all. At most 100 unique active users, including administrators, excluding the mailbox owner. expectedOwnerId is optional and returns 409 if ownership changed. Shares grant only existing and future non-deleted inbound mail; no send/delete/read-state/notification rights. Use administrator endpoints to manage any owner.' }),
+    },
+    '/mailboxes/shares/{mailboxId}/grantees/{userId}': { delete: operation('Revoke one grantee on a caller-owned mailbox', success) },
+    '/mailboxes/share-users': { get: operation('Search active users for mailbox sharing', ref('UserSearchResults'), {
+      parameters: [query('q', { type: 'string', minLength: 1, maxLength: 32 }, 'Required username substring; trimmed and case-insensitive.', true),
+        query('excludeUserId', { type: 'integer', minimum: 1 }, 'Exclude the mailbox owner.'),
+        query('limit', { type: 'integer', minimum: 1, maximum: 20, default: 20 })],
+      description: 'JWT only. Returns only id, username and role for active candidates; no account details or mailbox lists. hasMore means refine the search.'
+    }) },
     '/mailboxes/availability': { get: operation('Check mailbox availability', ref('MailboxAvailability'), { parameters: [query('localPart', str, undefined, true), query('domain', str, undefined, true)],
       description: 'Advisory only, not a reservation. Same rules as claiming; when available=false, reason is taken, reserved, quota, domain_limit or domain_unavailable. Claim still re-checks everything.' }) },
     '/mailboxes/{id}': {
@@ -105,7 +117,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     }) },
     '/admin/users/{id}': {
       put: operation('Change user role/status/password or mailbox policy', ref('AdminUser'), { ...admin, request: 'UpdateUserRequest',
-        description: 'At least one field. Cannot disable self or remove the last active administrator. Password reset/disable revokes prior JWT epochs. Downgrading an administrator revokes their mailbox shares. mailboxPolicy=null restores public rules; a dedicated policy contains perUserLimit and domains:[{domain,perUserLimit}], with 0 meaning unlimited and an empty domain list blocking new claims. Only configured system domains may be granted, including private ones. Changing mailboxPolicy requires expectedMailboxPolicyRevision from GET /admin/users; a stale revision returns 409. Existing mailboxes retain read/send access and count toward quotas. Administrators are exempt. Role changes also increment mailboxPolicyRevision.' }),
+        description: 'At least one field. Cannot disable self or remove the last active administrator. Password reset/disable revokes prior JWT epochs. Role changes preserve mailbox shares. mailboxPolicy=null restores public rules; a dedicated policy contains perUserLimit and domains:[{domain,perUserLimit}], with 0 meaning unlimited and an empty domain list blocking new claims. Only configured system domains may be granted, including private ones. Changing mailboxPolicy requires expectedMailboxPolicyRevision from GET /admin/users; a stale revision returns 409. Existing mailboxes retain read/send access and count toward quotas. Administrators are exempt. Role changes also increment mailboxPolicyRevision.' }),
       delete: operation('Delete a user', success, { ...admin, description: 'Cannot delete self or last active administrator. Releases owned mailboxes and revokes keys/shares; message history remains address-owned and may be inherited by later claimants.' }),
     },
     '/admin/mailboxes/{id}/transfer': { post: operation('Transfer any existing mailbox to an active user', ref('MailboxTransferResult'), {
@@ -121,9 +133,9 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/admin/settings/domain-status': { get: operation('Check public domain DNS onboarding', ref('DomainStatus'), { ...admin, parameters: [query('domain', str, undefined, true)],
       description: 'Checks MX/SPF via public DNS. Cannot prove the private Cloudflare catch-all target or end-to-end email delivery.' }) },
     '/admin/mailbox-shares': {
-      get: operation('List grants on this administrator’s mailboxes', array(ref('MailboxShareGrant')), admin),
-      put: operation('Replace grants on an owned mailbox', ref('MailboxShareGrant'), { ...admin, request: 'ReplaceMailboxSharesRequest',
-        description: 'Only this administrator’s own mailboxes may be shared. Empty userIds revokes all shares. New grantees must be active ordinary users. Grants are read-only incoming mail; disable/downgrade changes remove effective access.' }),
+      get: operation('List grants on all claimed mailboxes', array(ref('MailboxShareGrant')), admin),
+      put: operation('Replace grants on any claimed mailbox', ref('MailboxShareGrant'), { ...admin, request: 'ReplaceMailboxSharesRequest',
+        description: 'Administrator JWT can share any claimed mailbox, including other users’ mailboxes, with any active user or administrator except the owner. Empty userIds revokes all shares. At most 100 grantees. expectedOwnerId optionally detects stale ownership with 409. The write also rechecks ownership and recipient status atomically. Owner metadata and grantee status are returned. Grants are read-only incoming mail; owner disable hides shares, role changes preserve them, and release/transfer/deletion revoke them.' }),
     },
     '/admin/mailbox-shares/{mailboxId}/grantees/{userId}': { delete: operation('Revoke one mailbox grantee', success, admin) },
     '/admin/invites': {

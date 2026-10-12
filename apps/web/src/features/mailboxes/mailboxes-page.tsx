@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { AtSign, Inbox, MoreHorizontal, Pencil, Plus, Trash2 } from 'lucide-react';
+import { AtSign, Inbox, MoreHorizontal, Pencil, Plus, Share2, Trash2 } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import type { Mailbox } from '@hpc-mail/shared';
@@ -29,7 +29,8 @@ import { formatDateTime } from '@/lib/format';
 import { useDomains } from '@/lib/use-config';
 import { useIsMobile } from '@/lib/use-media-query';
 import { ClaimDialog } from './claim-dialog';
-import { useMailboxesQuery } from './use-mailboxes';
+import { useMailboxesQuery, useSharedMailboxesQuery } from './use-mailboxes';
+import { OwnMailboxShareDialog } from './mailbox-share-dialog';
 
 function EditMailboxDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onClose: () => void }) {
   const queryClient = useQueryClient();
@@ -185,10 +186,12 @@ function MailboxCards({
   items,
   onEdit,
   onRelease,
+  onShare,
 }: {
   items: Mailbox[];
   onEdit: (mailbox: Mailbox) => void;
   onRelease: (mailbox: Mailbox) => void;
+  onShare: (mailbox: Mailbox) => void;
 }) {
   const navigate = useNavigate();
   return (
@@ -216,6 +219,10 @@ function MailboxCards({
                   <Inbox className="size-4 text-ink-tertiary" />
                   查看邮件
                 </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => onShare(mailbox)}>
+                  <Share2 className="size-4 text-ink-tertiary" />
+                  共享邮箱
+                </DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => onEdit(mailbox)}>
                   <Pencil className="size-4 text-ink-tertiary" />
                   编辑备注
@@ -240,10 +247,12 @@ export function MailboxesPage() {
   const domainsQuery = useDomains();
   const { data: visibleDomains } = domainsQuery;
   const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(false);
+  const shared = useSharedMailboxesQuery();
   const [searchParams, setSearchParams] = useSearchParams();
   const [claimOpen, setClaimOpen] = useState(false);
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
   const [editing, setEditing] = useState<Mailbox | null>(null);
+  const [sharing, setSharing] = useState<Mailbox | null>(null);
 
   const invalidateMailboxes = () =>
     invalidateMailboxOwnership(queryClient);
@@ -270,7 +279,7 @@ export function MailboxesPage() {
     <div className="mx-auto max-w-4xl">
       <PageHeader
         title="我的邮箱"
-        description="认领任意前缀 + 系统域名的地址，全局唯一占用。"
+        description="认领邮箱地址收发邮件，也可把来信只读共享给其他用户。"
         actions={
           <Button disabled={!visibleDomains?.length} onClick={() => setClaimOpen(true)}>
             <Plus className="size-4" />
@@ -293,7 +302,7 @@ export function MailboxesPage() {
           className="rounded-lg border border-line bg-surface"
         />
       ) : isMobile ? (
-        <MailboxCards items={items} onEdit={setEditing} onRelease={setReleasing} />
+        <MailboxCards items={items} onEdit={setEditing} onRelease={setReleasing} onShare={setSharing} />
       ) : (
         <Table>
           <TableHeader>
@@ -316,6 +325,9 @@ export function MailboxesPage() {
                 <TableCell className="text-ink-tertiary">{formatDateTime(mailbox.createdAt)}</TableCell>
                 <TableCell>
                   <div className="flex items-center justify-end gap-1">
+                    <IconButton size="sm" aria-label={`共享 ${mailbox.address}`} onClick={() => setSharing(mailbox)}>
+                      <Share2 className="size-4" />
+                    </IconButton>
                     <IconButton size="sm" aria-label="编辑备注" onClick={() => setEditing(mailbox)}>
                       <Pencil className="size-4" />
                     </IconButton>
@@ -330,8 +342,25 @@ export function MailboxesPage() {
         </Table>
       )}
 
+      <section className="mt-8" aria-label="共享给我的邮箱">
+        <h2 className="text-base font-semibold text-ink">共享给我的邮箱</h2>
+        <p className="mb-3 mt-1 text-sm text-ink-secondary">可查看历史和新来信、验证码与附件；只读共享不提供发信或删除权限。</p>
+        {shared.isLoading ? <Skeleton className="h-24 w-full rounded-lg" />
+          : shared.isError ? <QueryErrorState error={shared.error} onRetry={() => void shared.refetch()} />
+          : !shared.data?.length ? <p className="text-sm text-ink-tertiary">暂无共享给你的邮箱。</p>
+          : <CardList>
+            {shared.data.map((mailbox) => <CardListItem key={mailbox.mailboxId}
+              title={<AddressCell address={mailbox.address} />}
+              subtitle={`所有者：${mailbox.ownerUsername}`}
+              meta={<span>只读共享{mailbox.displayName ? ` · ${mailbox.displayName}` : ''}</span>}
+              actions={<Button asChild size="sm" variant="secondary"><Link to={inboxHref(mailbox.address)}>查看来信</Link></Button>}
+            />)}
+          </CardList>}
+      </section>
+
       <ClaimDialog open={claimOpen} onOpenChange={setClaimOpen} domains={visibleDomains ?? []} />
       <EditMailboxDialog mailbox={editing} onClose={() => setEditing(null)} />
+      {sharing && <OwnMailboxShareDialog key={sharing.id} mailbox={sharing} onClose={() => setSharing(null)} />}
       <ReleaseDialog
         mailbox={releasing}
         onClose={() => setReleasing(null)}

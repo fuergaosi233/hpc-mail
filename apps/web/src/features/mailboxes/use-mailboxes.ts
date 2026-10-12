@@ -8,7 +8,7 @@ export const mailboxesQueryOptions = (all = false) =>
     queryFn: () => mailboxApi.list(all),
   });
 
-/** 分享给我的管理员邮箱。只用于收件筛选，不进入发件身份。 */
+/** 分享给我的邮箱。只用于收件筛选，不进入发件身份。 */
 export const sharedMailboxesQueryOptions = () =>
   queryOptions({
     queryKey: queryKeys.mailboxes.shared,

@@ -161,14 +161,14 @@ function domainCondition(scope: Scope, domain: string): SQL {
   return scope === 'unclaimed' ? eq(messages.domain, domain) : sql`+${messages.domain} = ${domain}`;
 }
 
-/** 分享给 userId、且认领人仍是启用中管理员的地址 */
+/** 分享给 userId、且认领人仍启用的地址 */
 function sharedAddressQuery(db: Db, userId: number) {
   return db
     .select({ address: mailboxes.address })
     .from(mailboxShares)
     .innerJoin(mailboxes, eq(mailboxes.id, mailboxShares.mailboxId))
     .innerJoin(users, eq(users.id, mailboxes.userId))
-    .where(and(eq(mailboxShares.userId, userId), eq(users.role, 'admin'), eq(users.status, 'active')));
+    .where(and(eq(mailboxShares.userId, userId), eq(users.status, 'active')));
 }
 
 /**
@@ -606,7 +606,6 @@ async function assertVisible(db: Db, viewer: Viewer, row: VisibilityRow): Promis
         and(
           eq(mailboxShares.userId, scope.ownerId),
           eq(mailboxes.address, row.address),
-          eq(users.role, 'admin'),
           eq(users.status, 'active'),
         ),
       )

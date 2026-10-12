@@ -57,6 +57,7 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 - **延迟主因是 Worker 到 D1 的往返次数**（D1 主库单区域，SQL 本身亚毫秒）。`requireAuth` 把会话、用户、security 设置和两条限流计数合成一个 `db.batch`；`/v1` 鉴权写入同样批量，审计日志走 `waitUntil`。新增中间件或热路径时别再加串行 D1/KV 往返；会话与用户状态不得加 TTL 缓存（改密即时踢线）。settings 有 15 秒 isolate 缓存，域名认领等强一致校验用 `getSettingsFresh`。
 - **Placement 由 CI 按 GitHub Variable `PLACEMENT_REGION` 注入**（模板不写死，各部署 D1 位置不同）；placement 只作用于 fetch，email/scheduled 不受影响。**不能从 `run_worker_first` 删掉 `/assets/*`**：数组形式下缺失路径会 SPA 回退为 200 HTML（线上实测）；部署时 `scripts/inject-asset-routes.mjs` 为现存文件注入 `!/assets/<文件>` 排除规则走边缘直出，缺失文件仍进 Worker 返回 404（总条目上限 100）。
 - **D1 没有 STAT4，规划器常选错索引**（ANALYZE 无效）。可见性条件不要写成 `owned OR shared`，用地址集合 `UNION`；需要时用 `INDEXED BY`（通知补录）或一元 `+domain` 压掉错误索引；改索引前对所有 messages 查询跑 EXPLAIN 回归（见 `test/perf-optimizations.test.ts`）。
+- **邮箱共享**：用户可通过 `/api/mailboxes/shares` 共享自己的邮箱，管理员通过 `/api/admin/mailbox-shares` 管理全站任意已认领邮箱；接收人可为启用中的用户或管理员，不能包含所有者。共享只授权未删除来信，所有者禁用时隐藏，角色变化保留，释放/过户时撤销；不参与通知归属。
 - **共享邮件的已读状态属于所有者**：成员的已读/未读操作、全部已读都不生效，未读数与 `unread=1` 筛选也不含共享邮件；前端按已读样式显示共享邮件。
 - **验证链接**：入站时由 `services/link-extract.ts` 提取到 `messages.verification_link`（宁缺毋滥，与提码同一开关，不回填历史）；前端比对链接域名与发件域，不一致时提示。
 - **AI 只走管理后台配置的 OpenAI 兼容模型**（`settings.ai_model`，如 DeepSeek），不再使用 Workers AI binding。验证码兜底（仅在命中验证码关键词且正则未识别时调用）与邮件翻译共用 `services/ai-provider.ts`；DeepSeek 必须带 `thinking: {type: 'disabled'}`（否则慢且贵）；workerd 的 fetch 不支持 `redirect: 'error'`，用 `manual` 并把 3xx 当失败。apiKey 回显为 `SECRET_MASK`，审计不记录。译文缓存在 `message_translations`，必须随 `purgeStatements` 一起删除（永久删除、保留期清理、释放并清空历史共用这条路径）。

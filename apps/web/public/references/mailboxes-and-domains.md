@@ -1,6 +1,6 @@
 # 邮箱、共享与多域名
 
-shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD 在 JWT `/api` 与 Key `/v1` 均可用；强制过户、域名/共享管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
+shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD 在 JWT `/api` 与 Key `/v1` 均可用；共享管理只用 JWT `/api`；强制过户、全站共享和域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
 
 ## 发现域名与邮箱
 
@@ -49,17 +49,23 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 
 选择动作时复用已有用户意图：只要释放可用默认行为；要求删邮箱及历史时带 deleteHistory。缺失且会影响隐私/保留正确性的关键选择才需要澄清，不能把接口的二选一说明变成每次重复批准流程。结果 `deletedMessages` 是被清除的记录数量；释放不停止域名 catch-all，后来到该地址的新邮件仍可能入库。
 
-共享只公开管理员自己认领邮箱的**全部现有及未来未删除收件**，不是自共享时刻起的新信，不包括发件或回收站。grantee 必须是启用中的普通用户，最多 100 人。共享不能当发件身份/回复引用/附件转发来源，不能删除、恢复、purge、重命名或释放邮箱；允许查看详情/线程/附件/raw、设置自己独立的星标。共享邮件的已读状态属于所有者：成员逐封标记计 0、全部已读不包含共享邮件；成员的未读数和 `unread=1` 筛选只统计自己认领的地址。仅被分享人的通知偏好不会因共享自动收到推送，通知按收信时实际 owner 结算。
+所有者可以共享自己认领的邮箱，管理员可以共享全站任意已认领邮箱。共享公开邮箱的**全部现有及未来未删除收件**，不是自共享时刻起的新信，不包括发件或回收站。grantee 可以是启用中的普通用户或管理员，最多 100 人；邮箱所有者已经有访问权，无需加入名单。共享不能当发件身份/回复引用/附件转发来源，不能删除、恢复、purge、重命名或释放邮箱；允许查看详情/线程/附件/raw、设置自己独立的星标。共享邮件的已读状态属于所有者：成员逐封标记计 0、全部已读不包含共享邮件；成员的未读数和 `unread=1` 筛选只统计自己认领的地址。仅被分享人的通知偏好不会因共享自动收到推送，通知按收信时实际 owner 结算。
 
-管理员 JWT 接口：
+共享管理 JWT 接口（`/admin` 路径需要管理员）：
 
 | 方法与 `/api` 路径 | 契约 |
 |---|---|
-| `GET /admin/mailbox-shares` | 当前管理员自有邮箱与 `grantees:[{userId,username,grantedAt}]`，包含尚未共享邮箱 |
-| `PUT /admin/mailbox-shares` | `{mailboxId,userIds:[...]}` **整体替换**名单，`[]` 撤销全部；返回更新后的共享邮箱 |
+| `GET /mailboxes/shares` | 当前用户自有邮箱与共享名单，包含尚未共享邮箱；JWT 专用 |
+| `PUT /mailboxes/shares` | `{mailboxId,userIds:[...],expectedOwnerId?}` 整体替换自己邮箱的名单；管理员通过此入口也只能修改自己邮箱 |
+| `DELETE /mailboxes/shares/:mailboxId/grantees/:userId` | 所有者撤销一个成员；`{success:true}` |
+| `GET /mailboxes/share-users?q=...&excludeUserId=...&limit=20` | JWT 专用；搜索启用用户，仅返回 `{items:[{id,username,role}],hasMore}`，不含账户隐私或邮箱列表 |
+| `GET /admin/mailbox-shares` | 管理员查看全站已认领邮箱与 `grantees:[{userId,username,status,grantedAt}]`，包含尚未共享邮箱 |
+| `PUT /admin/mailbox-shares` | `{mailboxId,userIds:[...],expectedOwnerId?}` **整体替换任意已认领邮箱**的名单，`[]` 撤销全部；返回更新后的共享邮箱 |
 | `DELETE /admin/mailbox-shares/:mailboxId/grantees/:userId` | 只撤销一人；`{success:true}` |
 
-更新前读回完整名单，保留仍需授权的人，避免把新增一个人当整体替换。已禁用或升级为管理员的成员不能重新出现在 PUT 名单中，应移除失效成员；DELETE 单人撤销可处理失效成员。共享 owner 被禁用时共享立即不可见；降级为普通用户/释放邮箱/删除用户时相关共享撤销，重新认领不会恢复旧名单。
+共享管理视图还包含 `ownerUserId,ownerUsername`。保存时建议带 `expectedOwnerId=ownerUserId`，所有者已变化返回 409；写入时再次校验归属，防止并发过户覆盖新共享。
+
+更新前读回完整名单，保留仍需授权的人，避免把新增一个人当整体替换。已禁用的成员不能重新出现在 PUT 名单中，应移除失效成员；DELETE 单人撤销可处理失效成员。共享 owner 被禁用时共享立即不可见；角色升降级保留共享；释放邮箱/过户/删除用户时相关共享撤销，重新认领不会恢复旧名单。
 
 ## 域名新增、关闭公开和删除
 

@@ -66,10 +66,11 @@ export interface MailboxTransferResult {
   revokedShares: number;
 }
 
-/** 管理员替换某只自己认领的邮箱的共享名单。空数组表示全部撤销。 */
+/** 所有者或管理员替换邮箱共享名单。空数组表示全部撤销。 */
 export const replaceMailboxSharesRequestSchema = z.object({
   mailboxId: z.number().int().positive(),
   userIds: z.array(z.number().int().positive()).max(100),
+  expectedOwnerId: z.number().int().positive().optional(),
 });
 export type ReplaceMailboxSharesRequest = z.infer<typeof replaceMailboxSharesRequestSchema>;
 
@@ -77,18 +78,21 @@ export interface MailboxShareGrantee {
   userId: number;
   username: string;
   grantedAt: string;
+  status: 'active' | 'disabled';
 }
 
-/** 管理员视角：自己认领的一只邮箱及其共享名单 */
+/** 所有者或管理员视角：邮箱及其共享名单 */
 export interface MailboxShareGrant {
   mailboxId: number;
   address: string;
   domain: string;
   displayName: string;
+  ownerUserId: number;
+  ownerUsername: string;
   grantees: MailboxShareGrantee[];
 }
 
-/** 被分享人视角：只读可见的管理员邮箱，不能当发件身份 */
+/** 被分享人视角：只读可见的邮箱，不能当发件身份 */
 export interface SharedMailboxView {
   mailboxId: number;
   address: string;

@@ -1,4 +1,4 @@
-import { claimMailboxRequestSchema, updateMailboxRequestSchema } from '@hpc-mail/shared';
+import { claimMailboxRequestSchema, replaceMailboxSharesRequestSchema, searchUsersQuerySchema, updateMailboxRequestSchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../lib/http.js';
 import { AppError } from '../lib/errors.js';
@@ -10,7 +10,8 @@ import {
   releaseMailbox,
   updateMailbox,
 } from '../services/mailbox.js';
-import { listSharedMailboxes } from '../services/mailbox-share.js';
+import { listMailboxShares, listSharedMailboxes, replaceMailboxShares, revokeMailboxShare } from '../services/mailbox-share.js';
+import { searchUsers } from '../services/user.js';
 import type { AppContext } from '../types.js';
 
 const app = new Hono<AppContext>();
@@ -25,10 +26,28 @@ app.get('/', async (c) => {
   return ok(c, list);
 });
 
-/** 分享给我的管理员邮箱（只读，不能当发件身份） */
+/** 分享给我的邮箱（只读，不能当发件身份） */
 app.get('/shared', async (c) => {
   const user = c.get('user')!;
   return ok(c, await listSharedMailboxes(c.env, user.id));
+});
+
+/** 普通会话只能管理自己名下邮箱；全站管理使用管理员接口。 */
+app.get('/shares', async (c) => ok(c, await listMailboxShares(c.env, c.get('user')!.id)));
+
+app.get('/share-users', async (c) => {
+  const req = parseQuery(c, searchUsersQuerySchema);
+  return ok(c, await searchUsers(c.env, req));
+});
+
+app.put('/shares', async (c) => {
+  const req = await parseBody(c, replaceMailboxSharesRequestSchema);
+  return ok(c, await replaceMailboxShares(c.env, c.get('user')!.id, req.mailboxId, req.userIds, false, req.expectedOwnerId));
+});
+
+app.delete('/shares/:mailboxId/grantees/:userId', async (c) => {
+  await revokeMailboxShare(c.env, c.get('user')!.id, parseId(c.req.param('mailboxId')), parseId(c.req.param('userId')));
+  return ok(c, { success: true });
 });
 
 app.get('/availability', async (c) => {

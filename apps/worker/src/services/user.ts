@@ -86,7 +86,7 @@ export async function listUsers(env: Env): Promise<AdminUser[]> {
   return rows.map((r) => serialize(r.user, byUser.get(r.user.id) ?? [], Number(r.apiKeyCount)));
 }
 
-/** 过户候选搜索：只读必要字段，限制结果数，不扫描/返回用户的全部邮箱及 Key 统计。 */
+/** 过户和共享候选搜索：只读必要字段，限制结果数，不扫描/返回用户的全部邮箱及 Key 统计。 */
 export async function searchUsers(env: Env, req: SearchUsersQuery): Promise<UserSearchResults> {
   const rows = await createDb(env).select({ id: users.id, username: users.username, role: users.role })
     .from(users)
@@ -179,13 +179,6 @@ export async function updateUser(
   }
   if (!row) throw new AppError('conflict', '用户或域名配置已改变，请刷新后重试');
   if (bumpEpoch && row) await mirrorUserEpoch(env, id, row.authVersion);
-  // 管理员降为普通用户后，名下邮箱不再是「管理员邮箱」，已有分享立即失效
-  if (req.role === 'user' && target.role === 'admin') {
-    await env.db
-      .prepare('DELETE FROM mailbox_shares WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE user_id = ?)')
-      .bind(id)
-      .run();
-  }
 
   const count = await db
     .select({ apiKeyCount: apiKeyCountSql })

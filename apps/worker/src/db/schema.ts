@@ -204,7 +204,7 @@ export const draftAttachments = sqliteTable(
 );
 
 /**
- * 共享邮箱：管理员把自己已认领的地址只读分享给普通用户。
+ * 共享邮箱：所有者分享自己的地址，管理员可分享任意已认领地址。
  * 不改变 mailboxes.user_id（唯一认领人），也不参与通知归属。
  */
 export const mailboxShares = sqliteTable(

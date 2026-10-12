@@ -11,13 +11,13 @@ app.use('*', requireAuth, requireAdmin);
 
 app.get('/', async (c) => {
   const acting = c.get('user')!;
-  return ok(c, await listMailboxShares(c.env, acting.id));
+  return ok(c, await listMailboxShares(c.env, acting.id, true));
 });
 
 app.put('/', async (c) => {
   const acting = c.get('user')!;
   const req = await parseBody(c, replaceMailboxSharesRequestSchema);
-  const updated = await replaceMailboxShares(c.env, acting.id, req.mailboxId, req.userIds);
+  const updated = await replaceMailboxShares(c.env, acting.id, req.mailboxId, req.userIds, true, req.expectedOwnerId);
   await logAdminAction(
     c.env,
     acting,
@@ -33,7 +33,7 @@ app.delete('/:mailboxId/grantees/:userId', async (c) => {
   const acting = c.get('user')!;
   const mailboxId = parseId(c.req.param('mailboxId'));
   const userId = parseId(c.req.param('userId'));
-  await revokeMailboxShare(c.env, acting.id, mailboxId, userId);
+  await revokeMailboxShare(c.env, acting.id, mailboxId, userId, true);
   await logAdminAction(c.env, acting, 'mailbox.unshare', `mailbox#${mailboxId}`, `user#${userId}`, clientIp(c));
   return ok(c, { success: true });
 });

@@ -16,6 +16,8 @@ export const queryKeys = {
     availability: (localPart: string, domain: string) =>
       ['mailboxes', 'availability', domain, localPart] as const,
     shared: ['mailboxes', 'shared'] as const,
+    shares: ['mailboxes', 'shares'] as const,
+    shareUsers: (q: string, excludeUserId?: number) => ['mailboxes', 'share-users', q, excludeUserId] as const,
   },
 
   messages: {

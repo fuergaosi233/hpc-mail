@@ -105,6 +105,11 @@ export const mailboxApi = {
   availability: (localPart: string, domain: string) =>
     api.get<MailboxAvailability>('/mailboxes/availability', { query: { localPart, domain } }),
   shared: () => api.get<SharedMailboxView[]>('/mailboxes/shared'),
+  listShares: () => api.get<MailboxShareGrant[]>('/mailboxes/shares'),
+  replaceShares: (body: ReplaceMailboxSharesRequest) =>
+    api.put<MailboxShareGrant, ReplaceMailboxSharesRequest>('/mailboxes/shares', body),
+  searchShareUsers: (q: string, excludeUserId?: number, signal?: AbortSignal) =>
+    api.get<UserSearchResults>('/mailboxes/share-users', { query: { q, excludeUserId }, signal }),
 };
 
 // ---- 邮件 ----

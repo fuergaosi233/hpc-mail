@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('@/api/resources', () => ({ mailboxApi: { availability: vi.fn(async () => ({ available: true })) } }));
 vi.mock('@/lib/use-config', () => ({ useDomains: () => ({ data: ['example.com'] }) }));
 vi.mock('./use-mailboxes', () => ({
+  useSharedMailboxesQuery: () => ({ data: [{ mailboxId: 10, address: 'shared@example.com', domain: 'example.com', ownerUsername: 'other-owner', displayName: '' }], isLoading: false, isError: false }),
   useMailboxesQuery: () => ({
     data: [{ id: 9, address: 'me+tag@example.com', domain: 'example.com', displayName: '', messageCount: 3, createdAt: '2026-10-05T00:00:00Z' }],
     isLoading: false,
@@ -40,6 +41,9 @@ describe('我的邮箱', () => {
       '/inbox?address=me%2Btag%40example.com',
     );
     expect(screen.getByRole('button', { name: '复制 me+tag@example.com' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: '共享给我的邮箱' })).toHaveTextContent('所有者：other-owner');
+    expect(screen.getByRole('link', { name: '查看来信' })).toHaveAttribute('href', '/inbox?address=shared%40example.com');
+    expect(screen.queryByRole('button', { name: '共享 shared@example.com' })).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
     client.clear();
   });

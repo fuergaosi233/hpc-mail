@@ -717,7 +717,7 @@ describe('共享邮箱', () => {
     ).rejects.toMatchObject({ code: 'forbidden' });
   });
 
-  it('只能把自己认领的邮箱共享给启用中的普通用户', async () => {
+  it('所有者可共享给启用用户和管理员，不能共享给所有者或禁用账户', async () => {
     await setDomains();
     const adminId = await seedUser('share-rule-admin', 'admin');
     const otherAdmin = await seedUser('share-rule-admin2', 'admin');
@@ -734,9 +734,7 @@ describe('共享邮箱', () => {
     await expect(replaceMailboxShares(env, adminId, adminBox.id, [adminId])).rejects.toMatchObject({
       code: 'validation_failed',
     });
-    await expect(replaceMailboxShares(env, adminId, adminBox.id, [otherAdmin])).rejects.toMatchObject({
-      code: 'validation_failed',
-    });
+    expect((await replaceMailboxShares(env, adminId, adminBox.id, [otherAdmin])).grantees.map((item) => item.userId)).toEqual([otherAdmin]);
 
     const db = createDb(env);
     await db.update(users).set({ status: 'disabled' }).where(eq(users.id, userId));
@@ -751,7 +749,7 @@ describe('共享邮箱', () => {
     expect(cleared.grantees).toEqual([]);
   });
 
-  it('释放、降级、禁用主人和删除被分享人都会让共享失效', async () => {
+  it('释放、禁用主人和删除被分享人让共享失效，角色变化保留共享', async () => {
     const { adminId, shareeId, box, address, localPart, inboundId } = await setup();
     const keeper = await seedUser('share-keeper-admin', 'admin');
     await replaceMailboxShares(env, adminId, box.id, [shareeId]);
@@ -769,9 +767,9 @@ describe('共享邮箱', () => {
     expect((await listSharedMailboxes(env, shareeId)).map((item) => item.address)).toEqual([address]);
 
     await updateUser(env, keeper, adminId, { role: 'user' });
-    expect(await listSharedMailboxes(env, shareeId)).toEqual([]);
+    expect((await listSharedMailboxes(env, shareeId)).map((item) => item.address)).toEqual([address]);
     await updateUser(env, keeper, adminId, { role: 'admin' });
-    expect(await listSharedMailboxes(env, shareeId)).toEqual([]);
+    expect((await listSharedMailboxes(env, shareeId)).map((item) => item.address)).toEqual([address]);
 
     await replaceMailboxShares(env, adminId, box.id, [shareeId]);
     await revokeMailboxShare(env, adminId, box.id, shareeId);

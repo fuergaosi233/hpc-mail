@@ -21,7 +21,8 @@ description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和�
 | 登录/注册/登出、密码、头像、两步验证 | `/api/auth…`；JWT，登录/注册除外 | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
 | 创建/更新/禁用/吊销 Key、自己的调用审计 | `/api/api-keys…`；JWT | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
 | 个人飞书/PushDeer/Webhook/邮箱转发、健康与重试 | `/api/me/notify-prefs…`；JWT | [通知与转发](references/notifications.md) |
-| 用户专属邮箱权限、强制过户邮箱、共享名单、域名增删/公开性/配额、接入检查 | `/api/admin…`；管理员 JWT | [管理员参考](references/administration.md)、[邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 管理自己邮箱的共享名单、搜索共享成员 | `/api/mailboxes/shares…`、`/api/mailboxes/share-users`；用户 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 用户专属邮箱权限、强制过户邮箱、全站任意邮箱共享名单、域名增删/公开性/配额、接入检查 | `/api/admin…`；管理员 JWT | [管理员参考](references/administration.md)、[邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 用户、邀请码、系统设置、全站 Key 与管理审计、审阅其他用户邮件 | `/api/admin…` 及邮件的管理员 `scope`；管理员 JWT | [管理员功能](references/administration.md) |
 
 完整机器可读规格：[API Key API](https://hpc.email/v1/openapi.json)、[JWT API](https://hpc.email/api/openapi.json)。两份规格公开可读；业务接口仍逐项鉴权。安装本指南时保留 `references/` 的相对目录；只拿到了本文时，可从 `https://hpc.email/references/<文件名>` 读取对应参考。
@@ -59,7 +60,7 @@ hpc '/mailboxes'
 
 - 登录用户名不是邮箱地址。`alice` 账户可以认领多个 `localPart@domain`；新账户通常没有邮箱，先查询域名再认领。
 - 邮件按完整地址归属，不按账户创建时间归属。认领可能获得该地址已有历史；默认释放保留历史，下一个认领者可能继承。需要清除时使用明确的 `deleteHistory=1`，先核对后果。
-- 普通用户可看自己认领的邮件，以及管理员共享给自己的未删除收件。共享不能作为发件身份，不能删除邮件或改/释放邮箱；可设置自己独立的星标。共享邮件的已读状态属于所有者：成员逐封标已读/未读不生效（计数 0），全部已读只处理自己认领的地址；未读数与 `unread=1` 筛选只统计你认领的地址，全部/搜索/星标视图仍显示共享邮件。
+- 普通用户可看自己认领的邮件，以及其他用户或管理员共享给自己的未删除收件。共享不能作为发件身份，不能删除邮件或改/释放邮箱；可设置自己独立的星标。共享邮件的已读状态属于所有者：成员逐封标已读/未读不生效（计数 0），全部已读只处理自己认领的地址；未读数与 `unread=1` 筛选只统计你认领的地址，全部/搜索/星标视图仍显示共享邮件。
 - 管理员邮件列表默认也是自己的邮箱。未认领邮件用 `scope=unclaimed`；只读审阅指定用户用 `scope=user&userId=…`。所有邮件变更（含星标）仅支持 `mine/unclaimed`，审阅其他用户时不能变更状态。
 - 普通用户发件身份必须自己认领。管理员可使用有效系统域或保留旧邮箱域的地址发件，但不能推断任意外部域可用。域名列表缩小不删除已有邮箱或历史，也不撤销已有邮箱的站内投递与发件能力。
 

@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
 const mocks = vi.hoisted(() => ({replace:vi.fn(async () => ({grantees:[{userId:3}]})),toast:vi.fn()}));
 vi.mock('@/api/resources', () => ({adminApi:{
-  listMailboxShares:vi.fn(async () => [{mailboxId:1,address:'shared@example.com',domain:'example.com',displayName:'',grantees:[{userId:2,username:'disabled-old',grantedAt:'2026-10-01'}]}]),
+  listMailboxShares:vi.fn(async () => [{mailboxId:1,address:'shared@example.com',domain:'example.com',displayName:'',ownerUserId:99,ownerUsername:'other-owner',grantees:[{userId:2,username:'disabled-old',status:'disabled',grantedAt:'2026-10-01'}]}]),
   listUsers:vi.fn(async () => [{id:2,username:'disabled-old',role:'user',status:'disabled'},{id:3,username:'active-new',role:'user',status:'active'}]),
   replaceMailboxShares:mocks.replace,
 }}));
@@ -22,7 +22,7 @@ describe('sharing to a formerly active user', () => {
     fireEvent.click(screen.getByRole('checkbox',{name:/disabled-old/}));
     fireEvent.click(screen.getByRole('checkbox',{name:'active-new'}));
     fireEvent.click(screen.getByRole('button',{name:'保存'}));
-    await waitFor(() => expect(mocks.replace).toHaveBeenCalledWith({mailboxId:1,userIds:[3]}));
+    await waitFor(() => expect(mocks.replace).toHaveBeenCalledWith({mailboxId:1,userIds:[3],expectedOwnerId:99}));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     client.clear();
   });
