@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { createMemoryRouter, MemoryRouter, RouterProvider, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/errors';
 import { AddressesPage } from './addresses-page';
@@ -128,5 +128,24 @@ describe('全站地址邮箱过户', () => {
     fireEvent.click(screen.getByRole('button', { name: '确认过户' }));
     await waitFor(() => expect(mocks.transfer).toHaveBeenCalledWith(42, { userId: 20, expectedOwnerId: 10 }));
     view.unmount(); client.clear();
+  });
+
+  it('每个地址都有进入该邮箱收发件的入口：图标按钮与地址链接指向同一页面', async () => {
+    function Where() {
+      return <p data-testid="where">{useLocation().pathname}</p>;
+    }
+    const client = new QueryClient();
+    const router = createMemoryRouter(
+      [
+        { path: '/admin/addresses', element: <AddressesPage /> },
+        { path: '/admin/addresses/:mailboxId/mail', element: <Where /> },
+      ],
+      { initialEntries: ['/admin/addresses'] },
+    );
+    render(<QueryClientProvider client={client}><RouterProvider router={router} /></QueryClientProvider>);
+    expect(screen.getByRole('link', { name: box.address })).toHaveAttribute('href', '/admin/addresses/42/mail');
+    fireEvent.click(screen.getByRole('button', { name: `查看邮件 ${box.address}` }));
+    expect(await screen.findByTestId('where')).toHaveTextContent('/admin/addresses/42/mail');
+    client.clear();
   });
 });

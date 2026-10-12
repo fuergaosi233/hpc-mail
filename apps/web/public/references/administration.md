@@ -67,7 +67,7 @@ hpc '/messages' --get --data-urlencode 'scope=user' \
 hpc '/messages' --get --data-urlencode 'scope=unclaimed' --data-urlencode 'direction=inbound'
 ```
 
-详情/线程/raw 同样带 scope 与 userId，管理员审阅其他用户为只读，所有邮件状态变更（含星标）仅支持 `mine/unclaimed`。未认领邮件修改需显式 `scope=unclaimed`；默认列表只自己的认领邮箱。全站地址管理用 `GET /mailboxes?all=1`，编辑/释放对应 `/mailboxes/:id`；管理员共享管理可处理**全站任意已认领邮箱**，成员可为启用中的普通用户或管理员。域名与共享完整契约见 [邮箱、多域名参考](mailboxes-and-domains.md)。
+详情/线程/raw 同样带 scope 与 userId，管理员审阅其他用户为只读，所有邮件状态变更（含星标）仅支持 `mine/unclaimed`。未认领邮件修改需显式 `scope=unclaimed`；默认列表只自己的认领邮箱。要查看某个已认领邮箱自己的收件或发件，用 `scope=user&userId=<归属人>&address=<完整地址>`，再以 `direction=inbound|outbound` 区分。全站地址管理用 `GET /mailboxes?all=1`，编辑/释放对应 `/mailboxes/:id`；管理员共享管理可处理**全站任意已认领邮箱**，成员可为启用中的普通用户或管理员。域名与共享完整契约见 [邮箱、多域名参考](mailboxes-and-domains.md)。
 
 ## 邀请码
 
