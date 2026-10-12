@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowRightLeft, AtSign, MoreHorizontal, Search, Trash2 } from 'lucide-react';
+import { ArrowRightLeft, AtSign, Mail, MoreHorizontal, Search, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import type { Mailbox } from '@hpc-mail/shared';
 import { invalidateMailboxOwnership } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
@@ -90,8 +91,19 @@ function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onC
   );
 }
 
+const mailPath = (mailbox: Mailbox) => `/admin/addresses/${mailbox.id}/mail`;
+
+function AddressLink({ mailbox }: { mailbox: Mailbox }) {
+  return (
+    <Link to={mailPath(mailbox)} className="truncate hover:text-accent hover:underline">
+      {mailbox.address}
+    </Link>
+  );
+}
+
 export function AddressesPage() {
   const isMobile = useIsMobile();
+  const navigate = useNavigate();
   const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(true);
   const [q, setQ] = useState('');
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
@@ -108,7 +120,7 @@ export function AddressesPage() {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <PageHeader title="全站地址" description="查看所有已认领地址，可过户给指定用户或强制释放。" />
+      <PageHeader title="全站地址" description="查看所有已认领地址及其收发件，可过户给指定用户或强制释放。" />
       <div className="relative mb-4">
         <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-ink-tertiary" />
         <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索地址或用户名" className="pl-9" />
@@ -129,7 +141,7 @@ export function AddressesPage() {
           {filtered.map((mailbox) => (
             <CardListItem
               key={mailbox.id}
-              title={<span className="truncate">{mailbox.address}</span>}
+              title={<AddressLink mailbox={mailbox} />}
               subtitle={`归属 ${mailbox.ownerUsername || '—'}`}
               meta={
                 <>
@@ -145,6 +157,10 @@ export function AddressesPage() {
                     </IconButton>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent>
+                    <DropdownMenuItem onSelect={() => navigate(mailPath(mailbox))}>
+                      <Mail className="size-4 text-ink-tertiary" />
+                      查看邮件
+                    </DropdownMenuItem>
                     <DropdownMenuItem onSelect={() => setTransferring(mailbox)}>
                       <ArrowRightLeft className="size-4 text-ink-tertiary" />
                       过户给其他用户
@@ -173,12 +189,17 @@ export function AddressesPage() {
           <TableBody>
             {filtered.map((mailbox) => (
               <TableRow key={mailbox.id}>
-                <TableCell className="font-medium">{mailbox.address}</TableCell>
+                <TableCell className="font-medium">
+                  <AddressLink mailbox={mailbox} />
+                </TableCell>
                 <TableCell className="text-ink-secondary">{mailbox.ownerUsername || '—'}</TableCell>
                 <TableCell className="text-ink-secondary">{mailbox.messageCount}</TableCell>
                 <TableCell className="text-ink-tertiary">{formatDateTime(mailbox.createdAt)}</TableCell>
                 <TableCell>
                   <div className="flex justify-end gap-1">
+                    <IconButton size="sm" aria-label={`查看邮件 ${mailbox.address}`} onClick={() => navigate(mailPath(mailbox))}>
+                      <Mail className="size-4" />
+                    </IconButton>
                     <IconButton size="sm" aria-label={`过户 ${mailbox.address}`} onClick={() => setTransferring(mailbox)}>
                       <ArrowRightLeft className="size-4" />
                     </IconButton>

@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { createMemoryRouter, MemoryRouter, RouterProvider, useLocation } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 
 const box = { id: 42, address: 'existing@example.com', domain: 'example.com', userId: 10, ownerUsername: 'old-owner',
@@ -23,6 +23,26 @@ describe('全站地址窄屏卡片', () => {
     fireEvent.keyDown(screen.getByRole('button', { name: '更多操作' }), { key: 'Enter' });
     fireEvent.click(await screen.findByRole('menuitem', { name: '强制释放' }));
     expect(await screen.findByRole('dialog', { name: '强制释放地址' })).toBeInTheDocument();
+    client.clear();
+  });
+
+  it('窄屏更多菜单与地址链接都能进入该邮箱的收发件', async () => {
+    function Where() {
+      return <p data-testid="where">{useLocation().pathname}</p>;
+    }
+    const client = new QueryClient();
+    const router = createMemoryRouter(
+      [
+        { path: '/admin/addresses', element: <AddressesPage /> },
+        { path: '/admin/addresses/:mailboxId/mail', element: <Where /> },
+      ],
+      { initialEntries: ['/admin/addresses'] },
+    );
+    render(<QueryClientProvider client={client}><RouterProvider router={router} /></QueryClientProvider>);
+    expect(screen.getByRole('link', { name: 'existing@example.com' })).toHaveAttribute('href', '/admin/addresses/42/mail');
+    fireEvent.keyDown(screen.getByRole('button', { name: '更多操作' }), { key: 'Enter' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: '查看邮件' }));
+    expect(await screen.findByTestId('where')).toHaveTextContent('/admin/addresses/42/mail');
     client.clear();
   });
 });

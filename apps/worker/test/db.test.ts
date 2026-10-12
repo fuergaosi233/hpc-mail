@@ -227,6 +227,46 @@ describe('message 可见性 user vs admin', () => {
     expect(asUser.address).toBe('detail-bob@inbox.test');
   });
 
+  it('admin 按 scope=user + address 只看某个邮箱的收件与发件，不混入同一用户的其他邮箱', async () => {
+    const adminId = await seedUser('addr-admin', 'admin');
+    const uid = await seedUser('addr-owner', 'user');
+    const otherUid = await seedUser('addr-stranger', 'user');
+    await claimMailbox(env, uid, 'user', { localPart: 'addr-a', domain: 'inbox.test' });
+    await claimMailbox(env, uid, 'user', { localPart: 'addr-b', domain: 'inbox.test' });
+    await claimMailbox(env, otherUid, 'user', { localPart: 'addr-c', domain: 'inbox.test' });
+    const db = createDb(env);
+    const seedOutbound = (address: string, subject: string) =>
+      db.insert(messages).values({
+        direction: 'outbound',
+        address,
+        domain: 'inbox.test',
+        fromAddress: address,
+        recipients: { to: ['pal@example.com'], cc: [], bcc: [] },
+        subject,
+        status: 'sent',
+        isRead: true,
+        createdAt: new Date(),
+      });
+    await seedInbound('addr-a@inbox.test', 'a in');
+    await seedInbound('addr-b@inbox.test', 'b in');
+    await seedInbound('addr-c@inbox.test', 'c in');
+    await seedOutbound('addr-a@inbox.test', 'a out');
+    await seedOutbound('addr-b@inbox.test', 'b out');
+    await seedOutbound('addr-c@inbox.test', 'c out');
+
+    const view = { userId: adminId, role: 'admin' as const, scope: 'user' as const, targetUserId: uid };
+    const subjects = async (direction: 'inbound' | 'outbound', address: string) =>
+      (await listMessages(env, view, { direction, address, limit: 30 } as never)).items.map((m) => m.subject);
+
+    expect(await subjects('inbound', 'addr-a@inbox.test')).toEqual(['a in']);
+    expect(await subjects('outbound', 'addr-a@inbox.test')).toEqual(['a out']);
+    expect(await subjects('inbound', 'addr-b@inbox.test')).toEqual(['b in']);
+    expect(await subjects('outbound', 'addr-b@inbox.test')).toEqual(['b out']);
+    // 别人的邮箱即使把 address 填成它，也不会越过 userId 限定的地址集合
+    expect(await subjects('inbound', 'addr-c@inbox.test')).toEqual([]);
+    expect(await subjects('outbound', 'addr-c@inbox.test')).toEqual([]);
+  });
+
   it('普通用户不能使用 unclaimed/user 范围', async () => {
     const uid = await seedUser('scope-user', 'user');
     await expect(

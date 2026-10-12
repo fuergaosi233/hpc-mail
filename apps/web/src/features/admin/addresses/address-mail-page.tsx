@@ -1,0 +1,134 @@
+import { ArrowLeft } from 'lucide-react';
+import { Link, useParams } from 'react-router-dom';
+import { PageHeader } from '@/components/page-header';
+import { QueryErrorState } from '@/components/query-error-state';
+import { Button } from '@/components/ui/button';
+import { EmptyState } from '@/components/ui/empty-state';
+import { SegmentedControl } from '@/components/ui/segmented-control';
+import { Skeleton } from '@/components/ui/skeleton';
+import { useAdminMailDirection } from '@/features/admin/mail/admin-mail-page';
+import { FilterBar } from '@/features/inbox/filter-bar';
+import { MailList } from '@/features/inbox/mail-list';
+import { useInboxFilters } from '@/features/inbox/use-inbox-filters';
+import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
+
+const DIRECTION_OPTIONS = [
+  { value: 'inbound', label: '收件箱' },
+  { value: 'outbound', label: '已发送' },
+] as const;
+
+const noop = () => {};
+
+function BackToAddresses() {
+  return (
+    <Button asChild variant="secondary" size="sm">
+      <Link to="/admin/addresses">
+        <ArrowLeft className="size-4" />
+        返回全站地址
+      </Link>
+    </Button>
+  );
+}
+
+/** 管理员只读查看某个已认领地址的全部收件与发件；地址固定，不随 URL 中的 domain/address 变化 */
+export function AdminAddressMailPage() {
+  const { mailboxId: rawId } = useParams();
+  const mailboxId = Number(rawId);
+  const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(true);
+  const { filters, setUnread, setQuery, reset } = useInboxFilters();
+  const { direction, setDirection } = useAdminMailDirection();
+
+  if (!Number.isInteger(mailboxId) || mailboxId <= 0) {
+    return (
+      <div className="mx-auto max-w-4xl">
+        <EmptyState title="地址不存在" description="无效的地址 id。" className="rounded-lg border border-line bg-surface" />
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="mx-auto max-w-4xl">
+        <Skeleton className="h-48 w-full rounded-lg" />
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="mx-auto max-w-4xl">
+        <QueryErrorState error={error} onRetry={() => void refetch()} />
+      </div>
+    );
+  }
+
+  const mailbox = mailboxes?.find((item) => item.id === mailboxId);
+  if (!mailbox) {
+    return (
+      <div className="mx-auto max-w-4xl">
+        <PageHeader title="地址不存在" actions={<BackToAddresses />} />
+        <EmptyState
+          title="没有找到这个地址"
+          description="它可能已被释放，回到全站地址列表重新查找。"
+          className="rounded-lg border border-line bg-surface"
+        />
+      </div>
+    );
+  }
+
+  const isInbound = direction === 'inbound';
+  const hasActiveFilters = Boolean((isInbound && filters.unread) || filters.q);
+  const query = {
+    direction,
+    scope: 'user' as const,
+    userId: mailbox.userId,
+    address: mailbox.address,
+    unread: (isInbound && filters.unread) || undefined,
+    q: filters.q || undefined,
+  };
+
+  return (
+    <div className="mx-auto max-w-4xl">
+      <PageHeader
+        title={<span className="break-all">{mailbox.address}</span>}
+        description={
+          <>
+            归属{' '}
+            <Link to={`/admin/users/${mailbox.userId}/mail`} className="text-accent hover:underline">
+              {mailbox.ownerUsername || '未知用户'}
+            </Link>
+            ，共 {mailbox.messageCount} 封邮件。只读查看，删除请让用户自己操作，或先强制释放地址。
+          </>
+        }
+        actions={<BackToAddresses />}
+      />
+      <div className="flex flex-col gap-4">
+        <SegmentedControl
+          aria-label="邮件方向"
+          value={direction}
+          onValueChange={setDirection}
+          options={DIRECTION_OPTIONS}
+          className="self-start"
+        />
+        <FilterBar
+          filters={{ ...filters, domain: null, address: null }}
+          domains={[]}
+          addressOptions={[]}
+          showUnread={isInbound}
+          onDomainChange={noop}
+          onAddressChange={noop}
+          onUnreadChange={setUnread}
+          onQueryChange={setQuery}
+        />
+        <MailList
+          query={query}
+          readOnly
+          hasActiveFilters={hasActiveFilters}
+          onClearFilters={reset}
+          emptyTitle={isInbound ? '该地址还没有收到邮件' : '该地址还没有发送记录'}
+          emptyDescription={isInbound ? '发送到这个地址的邮件会显示在这里。' : '从这个地址发出的邮件会显示在这里。'}
+        />
+      </div>
+    </div>
+  );
+}
