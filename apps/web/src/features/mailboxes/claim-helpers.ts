@@ -44,47 +44,68 @@ export function parseBatchCount(text: string): number {
   return Math.min(value, MAX_BATCH_CLAIM);
 }
 
-/** 一次生成 count 个互不相同的随机前缀 */
-export function randomLocalParts(count: number, random: () => string = randomLocalPart): string[] {
+/** 一个待认领的地址：前缀 + 域名 */
+export interface AddressDraft {
+  localPart: string;
+  domain: string;
+}
+
+/** 从候选里随机取一个 */
+export function randomPick<T>(list: readonly T[], random: (n: number) => Uint32Array = randomValues): T {
+  return list[random(1)[0]! % list.length]!;
+}
+
+/** 一次生成 count 个互不相同的随机地址；域名由 pickDomain 决定（固定一个，或每次从候选里随机） */
+export function randomAddresses(
+  count: number,
+  pickDomain: () => string,
+  random: () => string = randomLocalPart,
+): AddressDraft[] {
   const seen = new Set<string>();
-  while (seen.size < count) seen.add(random());
-  return [...seen];
+  const drafts: AddressDraft[] = [];
+  while (drafts.length < count) {
+    const draft = { localPart: random(), domain: pickDomain() };
+    const key = `${draft.localPart}@${draft.domain}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    drafts.push(draft);
+  }
+  return drafts;
 }
 
 export interface ClaimListResult {
   claimed: string[];
-  /** 没能认领的前缀（被占用的 + 因中途停止而没试的），保持用户给出的顺序 */
-  remaining: string[];
+  /** 没能认领的地址（被占用的 + 因中途停止而没试的），保持用户给出的顺序 */
+  remaining: AddressDraft[];
   /** 中途因配额、权限、网络等停止时的原因；仅「被占用」导致的未认领不算 */
   stoppedBy: string | null;
 }
 
 /**
- * 按用户确认的前缀列表顺序认领。逐个调用单个认领接口，配额、域名与权限校验沿用后端那一份：
- * 前缀恰好被别人占用只跳过这一个（不替用户改名），其余错误立即停止并保留已认领的，不再硬撞。
+ * 按用户确认的地址列表顺序认领。逐个调用单个认领接口，配额、域名与权限校验沿用后端那一份：
+ * 地址恰好被别人占用只跳过这一个（不替用户改名），其余错误立即停止并保留已认领的，不再硬撞。
  */
 export async function claimList(
-  localParts: string[],
-  domain: string,
+  drafts: AddressDraft[],
   claim: (body: ClaimMailboxRequest) => Promise<Pick<Mailbox, 'address'> | undefined>,
   onProgress: (done: number) => void = () => {},
 ): Promise<ClaimListResult> {
   const claimed: string[] = [];
-  const remaining: string[] = [];
-  for (let i = 0; i < localParts.length; i++) {
-    const localPart = localParts[i]!;
+  const remaining: AddressDraft[] = [];
+  for (let i = 0; i < drafts.length; i++) {
+    const draft = drafts[i]!;
     try {
-      const created = await claim({ localPart, domain });
-      claimed.push(created?.address ?? `${localPart}@${domain}`);
+      const created = await claim({ localPart: draft.localPart, domain: draft.domain });
+      claimed.push(created?.address ?? `${draft.localPart}@${draft.domain}`);
       onProgress(claimed.length);
     } catch (error) {
       if (error instanceof ApiError && error.code === 'address_taken') {
-        remaining.push(localPart);
+        remaining.push(draft);
         continue;
       }
       return {
         claimed,
-        remaining: [...remaining, ...localParts.slice(i)],
+        remaining: [...remaining, ...drafts.slice(i)],
         stoppedBy: error instanceof ApiError ? error.message : '认领失败，请重试',
       };
     }
