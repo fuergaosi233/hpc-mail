@@ -103,12 +103,16 @@ export function MailboxShareDialog({
     <Dialog open={grant !== null} onOpenChange={(next) => !next && !save.isPending && onClose()}>
       <DialogContent className="max-w-md">
         <DialogHeader
-          title="分配共享"
+          title="共享邮箱"
           description="成员可查看全部历史来信和新来信、验证码及附件，已读状态由邮箱所有者管理。共享不授予发信、删除权限，也不触发成员通知；撤销后立即失去访问权限。"
         />
         <DialogBody className="flex flex-col gap-3">
           <p className="text-sm text-ink-secondary">邮箱所有者：{current?.ownerUsername}</p>
-          <Select
+          {grants.length === 1 ? (
+            <p className="break-all rounded-md border border-line bg-canvas px-3 py-2 text-sm font-medium text-ink">
+              {current?.address}
+            </p>
+          ) : <Select
             disabled={save.isPending || grants.length === 1}
             value={mailboxId ? String(mailboxId) : undefined}
             onValueChange={(value) => {
@@ -129,7 +133,7 @@ export function MailboxShareDialog({
                 </SelectItem>
               ))}
             </SelectContent>
-          </Select>
+          </Select>}
           <Input
             aria-label="搜索共享用户"
             disabled={save.isPending}
