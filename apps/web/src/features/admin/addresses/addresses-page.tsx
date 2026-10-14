@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowRightLeft, AtSign, Mail, MoreHorizontal, Search, Trash2 } from 'lucide-react';
+import { ArrowRightLeft, AtSign, Mail, MoreHorizontal, Search, Share2, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import type { Mailbox } from '@hpc-mail/shared';
 import { invalidateMailboxOwnership } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
@@ -9,7 +9,7 @@ import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
 import { CardList, CardListItem } from '@/components/ui/card-list';
-import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
+import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTrigger } from '@/components/ui/dialog';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -26,6 +26,7 @@ import { formatDateTime } from '@/lib/format';
 import { useIsMobile } from '@/lib/use-media-query';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 import { TransferMailboxDialog } from './transfer-mailbox-dialog';
+import { SharedMailboxesDialog } from './shared-mailboxes-dialog';
 
 function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onClose: () => void }) {
   const queryClient = useQueryClient();
@@ -104,10 +105,21 @@ function AddressLink({ mailbox }: { mailbox: Mailbox }) {
 export function AddressesPage() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const sharingOpen = searchParams.get('sharing') === '1';
   const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(true);
   const [q, setQ] = useState('');
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
   const [transferring, setTransferring] = useState<Mailbox | null>(null);
+
+  const setSharingOpen = (open: boolean) => {
+    setSearchParams((previous) => {
+      const next = new URLSearchParams(previous);
+      if (open) next.set('sharing', '1');
+      else next.delete('sharing');
+      return next;
+    }, { replace: true });
+  };
 
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
@@ -120,7 +132,21 @@ export function AddressesPage() {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <PageHeader title="全站地址" description="查看所有已认领地址及其收发件，可过户给指定用户或强制释放。" />
+      <Dialog open={sharingOpen} onOpenChange={setSharingOpen}>
+        <PageHeader
+          title="全站地址"
+          description="查看所有已认领地址及其收发件，管理共享、过户或强制释放。"
+          actions={
+            <DialogTrigger asChild>
+              <Button variant="secondary">
+                <Share2 className="size-4" aria-hidden="true" />
+                共享邮箱
+              </Button>
+            </DialogTrigger>
+          }
+        />
+        {sharingOpen && <SharedMailboxesDialog />}
+      </Dialog>
       <div className="relative mb-4">
         <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-ink-tertiary" />
         <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索地址或用户名" className="pl-9" />

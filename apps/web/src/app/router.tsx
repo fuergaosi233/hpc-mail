@@ -57,10 +57,6 @@ const AdminAddressMailPage = page(
   preloadable(() => import('@/features/admin/addresses/address-mail-page')),
   (m) => m.AdminAddressMailPage,
 );
-const SharedMailboxesPage = page(
-  preloadable(() => import('@/features/admin/shared-mailboxes/shared-mailboxes-page')),
-  (m) => m.SharedMailboxesPage,
-);
 
 export const router = createBrowserRouter([
   {
@@ -96,7 +92,7 @@ export const router = createBrowserRouter([
           { path: 'domains', element: <DomainsPage />, handle: title('收件域名') },
           { path: 'addresses', element: <AddressesPage />, handle: title('全站地址') },
           { path: 'addresses/:mailboxId/mail', element: <AdminAddressMailPage />, handle: title('地址邮件') },
-          { path: 'shared-mailboxes', element: <SharedMailboxesPage />, handle: title('共享邮箱') },
+          { path: 'shared-mailboxes', element: <Navigate to="/admin/addresses?sharing=1" replace /> },
           { path: 'settings', element: <SettingsPage />, handle: title('系统设置') },
           { path: 'audit', element: <AuditPage />, handle: title('操作审计') },
         ],
