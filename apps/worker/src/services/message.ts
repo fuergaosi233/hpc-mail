@@ -8,7 +8,7 @@ import type {
   Page,
   Role,
 } from '@hpc-mail/shared';
-import { UNREAD_COUNT_CAP } from '@hpc-mail/shared';
+import { MESSAGE_DIRECTIONS, UNREAD_COUNT_CAP } from '@hpc-mail/shared';
 import {
   and,
   asc,
@@ -211,9 +211,10 @@ function inboxScopeCondition(db: Db, scope: Scope, access: ScopeAccess): SQL {
  * 默认视图（全部/收件/未读/已发送/按地址/翻页/联系人）强制按地址取数。
  * 无统计信息时规划器为省掉排序，会沿 idx_messages_live 按 id 倒扫全站未删除邮件，
  * 自己的邮件凑不满 LIMIT 的稀疏用户要扫到底；改为逐个可见地址按 id 倒序取，再合并排序，
- * 读取量只随自己的邮件量增长。
+ * 读取量只随自己的邮件量增长。按视图选索引见 addressIndexSource。
  */
 const MESSAGES_BY_ADDRESS = sql`${messages} INDEXED BY idx_messages_address_deleted_id`;
+const MESSAGES_BY_VISIBLE = sql`${messages} INDEXED BY idx_messages_visible`;
 const MESSAGES = sql`${messages}`;
 
 type ColumnValue<C extends Column> = C['_']['notNull'] extends true ? C['_']['data'] : C['_']['data'] | null;
@@ -250,6 +251,23 @@ function addressIndexScope(db: Db, ownerId: number, access: ScopeAccess): SQL {
   ) as SQL;
 }
 
+/**
+ * 按视图选地址索引：
+ * - 带 direction 或未读筛选（收件/未读/已发送）走 idx_messages_visible(address, deleted_at, direction, is_read)。
+ *   address_deleted_id 不含这两列，每封都要回表判断；主人邮件很多、匹配很少时（10 万封基准：主人 5.5 万封、
+ *   3 封未读或 5 封已发送）要回表 5 万多次、本地 D1 约 90ms。visible 在索引内判断，未给出的 direction/is_read
+ *   补成取遍全部取值的 IN（两列非空，只有 inbound/outbound 与 0/1，不改结果），等值前缀补齐后每个
+ *  （地址, 方向, 已读）区间按 rowid 即 id 有序，取够 LIMIT 即停。
+ * - 其余（全部/翻页/联系人）没有要回表的筛选，走 idx_messages_address_deleted_id，逐地址按 id 倒序取。
+ */
+function addressIndexSource(query: { direction?: string; unread?: boolean }): { from: SQL; prefix: SQL[] } {
+  if (!query.direction && !query.unread) return { from: MESSAGES_BY_ADDRESS, prefix: [] };
+  const prefix: SQL[] = [];
+  if (!query.direction) prefix.push(inArray(messages.direction, [...MESSAGE_DIRECTIONS]));
+  if (!query.unread) prefix.push(inArray(messages.isRead, [false, true]));
+  return { from: MESSAGES_BY_VISIBLE, prefix };
+}
+
 export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isStarred: boolean): MessageSummary {
   const verificationCode = resolveVerificationCode(
     row.subject,
@@ -279,32 +297,26 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
   };
 }
 
-async function attachmentFlags(db: Db, ids: number[]): Promise<Set<number>> {
-  const out = new Set<number>();
+/** 给定邮件集合的附件标记与当前用户的星标标记，合成一次 batch 往返 */
+async function messageFlags(db: Db, userId: number, ids: number[]): Promise<{ attachments: Set<number>; starred: Set<number> }> {
+  const attachments = new Set<number>();
+  const starred = new Set<number>();
   // 一页最多 MAX_PAGE_SIZE=100 个 id，正好顶到 D1 绑定参数上限，必须分批
-  for (const batch of chunk(ids)) {
-    const rows = await db
-      .select({ messageId: attachmentsTable.messageId })
-      .from(attachmentsTable)
-      .where(inArray(attachmentsTable.messageId, batch))
-      .all();
-    for (const r of rows) out.add(r.messageId);
-  }
-  return out;
-}
-
-/** 当前用户对给定邮件集合的星标标记 */
-async function starFlags(db: Db, userId: number, ids: number[]): Promise<Set<number>> {
-  const out = new Set<number>();
-  for (const batch of chunk(ids)) {
-    const rows = await db
-      .select({ messageId: stars.messageId })
-      .from(stars)
-      .where(and(eq(stars.userId, userId), inArray(stars.messageId, batch)))
-      .all();
-    for (const r of rows) out.add(r.messageId);
-  }
-  return out;
+  const batches = chunk(ids);
+  const statements = [
+    ...batches.map((batch) => db.select({ messageId: attachmentsTable.messageId }).from(attachmentsTable)
+      .where(inArray(attachmentsTable.messageId, batch))),
+    ...batches.map((batch) => db.select({ messageId: stars.messageId }).from(stars)
+      .where(and(eq(stars.userId, userId), inArray(stars.messageId, batch)))),
+  ];
+  const [first, ...rest] = statements;
+  if (!first) return { attachments, starred };
+  const results = await db.batch([first, ...rest]);
+  results.forEach((rows, index) => {
+    const target = index < batches.length ? attachments : starred;
+    for (const row of rows) target.add(row.messageId);
+  });
+  return { attachments, starred };
 }
 
 /** 列表搜索语义（主题/发件地址/发件名/文本正文/收件人子串）；全部已读按同一语义收窄 */
@@ -328,6 +340,7 @@ function messagePageQuery(db: Db, viewer: Viewer, query: ListMessagesQuery) {
   const scope = resolveScope(viewer);
   const access = listAccess(viewer, scope, query);
   const ownerId = addressIndexOwner(viewer, scope, query);
+  const source = ownerId === null ? { from: MESSAGES, prefix: [] } : addressIndexSource(query);
 
   const conds: (SQL | undefined)[] = [ownerId === null ? scopeCondition(db, scope, access) : addressIndexScope(db, ownerId, access)];
   // 回收站视图看软删除的，普通视图排除软删除的
@@ -348,42 +361,21 @@ function messagePageQuery(db: Db, viewer: Viewer, query: ListMessagesQuery) {
   const cursorId = decodeCursor(query.cursor);
   if (cursorId) conds.push(lt(messages.id, cursorId));
   if (query.afterId) conds.push(gt(messages.id, query.afterId));
+  conds.push(...source.prefix);
 
   const where = and(...conds.filter((x): x is SQL => x !== undefined));
   return db
     .select(pageColumns)
-    .from(ownerId === null ? MESSAGES : MESSAGES_BY_ADDRESS)
+    .from(source.from)
     .where(where)
     .orderBy(desc(messages.id))
     .limit(query.limit + 1);
 }
 
-/** 附件与星标标记合成一次 batch 往返 */
-async function pageFlags(db: Db, userId: number, ids: number[]): Promise<{ attachments: Set<number>; starred: Set<number> }> {
-  const attachments = new Set<number>();
-  const starred = new Set<number>();
-  // 一页最多 MAX_PAGE_SIZE=100 个 id，正好顶到 D1 绑定参数上限，必须分批
-  const batches = chunk(ids);
-  const statements = [
-    ...batches.map((batch) => db.select({ messageId: attachmentsTable.messageId }).from(attachmentsTable)
-      .where(inArray(attachmentsTable.messageId, batch))),
-    ...batches.map((batch) => db.select({ messageId: stars.messageId }).from(stars)
-      .where(and(eq(stars.userId, userId), inArray(stars.messageId, batch)))),
-  ];
-  const [first, ...rest] = statements;
-  if (!first) return { attachments, starred };
-  const results = await db.batch([first, ...rest]);
-  results.forEach((rows, index) => {
-    const target = index < batches.length ? attachments : starred;
-    for (const row of rows) target.add(row.messageId);
-  });
-  return { attachments, starred };
-}
-
 async function toPage(db: Db, viewer: Viewer, query: ListMessagesQuery, rows: PageRow[]): Promise<Page<MessageSummary>> {
   const hasMore = rows.length > query.limit;
   const page = hasMore ? rows.slice(0, query.limit) : rows;
-  const flags = await pageFlags(db, viewer.userId, page.map((r) => r.id));
+  const flags = await messageFlags(db, viewer.userId, page.map((r) => r.id));
   return {
     items: page.map((r) => {
       const summary = summarize(r, flags.attachments.has(r.id), flags.starred.has(r.id));
@@ -478,11 +470,8 @@ export async function findNextMessage(
       scannedThroughId = row.id;
       continue;
     }
-    const [attSet, starSet] = await Promise.all([
-      attachmentFlags(db, [row.id]),
-      starFlags(db, viewer.userId, [row.id]),
-    ]);
-    return { message: { ...summary, hasAttachments: attSet.has(row.id), isStarred: starSet.has(row.id) }, scannedThroughId: row.id };
+    const flags = await messageFlags(db, viewer.userId, [row.id]);
+    return { message: { ...summary, hasAttachments: flags.attachments.has(row.id), isStarred: flags.starred.has(row.id) }, scannedThroughId: row.id };
   }
   return { message: null, scannedThroughId };
 }
@@ -573,12 +562,8 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
   if (!target) throw new AppError('not_found', '邮件不存在');
   await assertVisible(db, viewer, target);
   const summarizeRows = async (rows: ThreadRow[]) => {
-    const ids = rows.map((r) => r.id);
-    const [attSet, starSet] = await Promise.all([
-      attachmentFlags(db, ids),
-      starFlags(db, viewer.userId, ids),
-    ]);
-    return rows.map((r) => summarize(r, attSet.has(r.id), starSet.has(r.id)));
+    const flags = await messageFlags(db, viewer.userId, rows.map((r) => r.id));
+    return rows.map((r) => summarize(r, flags.attachments.has(r.id), flags.starred.has(r.id)));
   };
   const scope = await threadScope(db, viewer, target);
   const access = shareAccess(viewer, scope);
@@ -772,9 +757,10 @@ export async function getMessageDetail(
   const bodyText = body.bodyText;
   let bodyHtml = body.bodyHtml;
 
-  const [attRows, starSet] = await Promise.all([
-    db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)).all(),
-    starFlags(db, viewer.userId, [id]),
+  // 附件全行与星标同一次 batch 往返
+  const [attRows, starRows] = await db.batch([
+    db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)),
+    db.select({ messageId: stars.messageId }).from(stars).where(and(eq(stars.userId, viewer.userId), eq(stars.messageId, id))),
   ]);
 
   const attachmentMetas = await Promise.all(
@@ -798,7 +784,7 @@ export async function getMessageDetail(
   );
 
   return {
-    ...summarize(row, attRows.length > 0, starSet.has(id)),
+    ...summarize(row, attRows.length > 0, starRows.length > 0),
     // 只看正文前 16KB：验证码总在开头附近，超长营销邮件不必每次打开都全文扫描
     verificationCode: resolveVerificationCode(
       row.subject,

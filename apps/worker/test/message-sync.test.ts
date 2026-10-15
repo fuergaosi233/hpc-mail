@@ -7,7 +7,9 @@ import { createDb } from '../src/db/client.js';
 import { attachments as attachmentsTable, mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
 import { createApiKey } from '../src/services/api-key.js';
-import { countUnread, listMessages, syncMessages, UNREAD_COUNT_CAP } from '../src/services/message.js';
+import {
+  countUnread, findNextMessage, getMessageDetail, getThread, listMessages, syncMessages, UNREAD_COUNT_CAP,
+} from '../src/services/message.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 
@@ -178,6 +180,27 @@ describe('GET /api/messages/sync 与列表首页 head', () => {
       expect(page.items.length, query).toBeGreaterThan(0);
       expect(await sync(admin.jwt, query), query).toEqual({ unread: adminUnread, head: page.head });
     }
+  });
+
+  it('线程、等信与详情共用同一套附件/星标标记，两种标记互不串位', async () => {
+    const user = await account('sync-flag-callers');
+    const viewer = { userId: user.id, role: 'user' as const };
+    const withAttachment = await mail(user.address, { subject: 'topic', messageId: '<flag-root@sync>' });
+    const starredOnly = await mail(user.address, { subject: 'Re: topic', inReplyTo: '<flag-root@sync>' });
+    await createDb(env).insert(attachmentsTable).values({ messageId: withAttachment, r2Key: `att/${withAttachment}/a` });
+    await data(await request('/api/messages/star', post(user.jwt, { ids: [starredOnly], starred: true })));
+    const flags = (items: { id: number; hasAttachments: boolean; isStarred: boolean }[]) =>
+      items.map(({ id, hasAttachments, isStarred }) => ({ id, hasAttachments, isStarred }));
+    const expected = [
+      { id: withAttachment, hasAttachments: true, isStarred: false },
+      { id: starredOnly, hasAttachments: false, isStarred: true },
+    ];
+    expect(flags(await getThread(env, viewer, starredOnly))).toEqual(expected);
+    const first = await findNextMessage(env, viewer, { afterId: withAttachment - 1 });
+    const second = await findNextMessage(env, viewer, { afterId: withAttachment });
+    expect(flags([first.message!, second.message!])).toEqual(expected);
+    const details = [await getMessageDetail(env, viewer, withAttachment), await getMessageDetail(env, viewer, starredOnly)];
+    expect(flags(details)).toEqual(expected);
   });
 
   it('整页 100 封时附件与星标标记按 D1 参数上限分批，仍在一次 batch 里合并正确', async () => {
