@@ -25,4 +25,26 @@ describe('useStarMutation', () => {
     );
     expect(starMock).toHaveBeenCalledWith([7], true, undefined);
   });
+
+  it('乐观更新改写了首页条目时去掉首页 head，下一轮 sync 按有变化对齐', async () => {
+    const queryClient = new QueryClient();
+    const listKey = queryKeys.messages.list({ scope: 'mine' });
+    const row = (id: number) => ({ id, isStarred: false });
+    queryClient.setQueryData(listKey, {
+      pages: [{ items: [row(9), row(8)], nextCursor: 'c8', head: 'h1' }, { items: [row(7)], nextCursor: null }],
+      pageParams: ['', 'c8'],
+    });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    const { result } = renderHook(() => useStarMutation(), { wrapper });
+    result.current.mutate({ id: 8, starred: true });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const data = queryClient.getQueryData<{ pages: Array<{ head?: string; items: Array<{ id: number; isStarred: boolean }> }> }>(listKey);
+    expect(data?.pages[0]?.items[1]?.isStarred).toBe(true);
+    expect(data?.pages[0]?.head).toBeUndefined();
+    queryClient.clear();
+  });
 });

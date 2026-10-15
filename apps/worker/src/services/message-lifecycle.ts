@@ -1,8 +1,8 @@
 import { sql, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { messages } from '../db/schema.js';
-import type { Env } from '../types.js';
-import { processStorageCleanup } from './storage-cleanup.js';
+import type { Env, ExecCtx } from '../types.js';
+import { scheduleStorageCleanup } from './storage-cleanup.js';
 
 /** purgeStatements 里删除 messages 行那条语句的下标；调用方据此读取实际删除条数 */
 export const PURGE_MESSAGES_INDEX = 4;
@@ -23,7 +23,8 @@ export function purgeStatements(env: Env, token: string): D1PreparedStatement[] 
   ];
 }
 
-export async function purgeMatchingMessages(env: Env, condition: SQL, limit = 1000): Promise<number> {
+/** 传入 ctx 时 R2 清理放进 waitUntil，不阻塞响应；不传时同步完成（cron 等没有请求的路径）。 */
+export async function purgeMatchingMessages(env: Env, condition: SQL, limit = 1000, ctx?: ExecCtx | null): Promise<number> {
   const db = createDb(env);
   const token = crypto.randomUUID();
   // UPDATE re-evaluates ownership/retention/deleted state at the write boundary.
@@ -33,6 +34,6 @@ export async function purgeMatchingMessages(env: Env, condition: SQL, limit = 10
     env.db.prepare(reservation.sql).bind(...reservation.params), ...purgeStatements(env, token),
   ]);
   const deleted = results[1 + PURGE_MESSAGES_INDEX]?.meta.changes ?? 0;
-  await processStorageCleanup(env, 100);
+  await scheduleStorageCleanup(env, ctx, 100);
   return deleted;
 }

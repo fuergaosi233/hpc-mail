@@ -203,10 +203,13 @@ interface AiCodeInput {
   subject: string;
   text: string;
   html: string;
+  /** 调用方已算好的 `text || htmlToText(html)`（收件链路复用同一份转换结果） */
+  plain?: string;
 }
 
 function aiCorpus(input: AiCodeInput): { subject: string; body: string } {
-  return { subject: input.subject || '', body: (input.text || htmlToText(input.html)).slice(0, AI_CODE_BODY_CHARS) };
+  const body = input.plain ?? (input.text || htmlToText(input.html));
+  return { subject: input.subject || '', body: body.slice(0, AI_CODE_BODY_CHARS) };
 }
 
 /** 值得交给模型兜底：有内容、出现验证码相关词，且不是只让点链接的邮件 */

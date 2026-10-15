@@ -231,23 +231,32 @@ describe('全部已读按筛选执行', () => {
     }
   });
 
-  it('列表带 domain 时认领/共享范围的执行计划与不带 domain 相同，不改走 idx_messages_domain', async () => {
+  it('列表带 domain 时认领/共享范围不改走 idx_messages_domain；非默认视图的计划与不带 domain 相同', async () => {
     await baseSettings();
     const admin = await account('w2-list-plan-admin', 'admin');
     const user = await account('w2-list-plan');
     await own(user.id, `w2-list-plan-${rand()}@hpc.email`);
     const viewer = { userId: user.id, role: 'user' as const };
-    const views: [Parameters<typeof listMessages>[1], Partial<ListMessagesQuery>][] = [
-      [viewer, {}], [viewer, { direction: 'inbound' }], [viewer, { q: 'x' }], [viewer, { unread: true }],
-      [viewer, { trash: true }], [viewer, { direction: 'outbound' }],
-      [{ userId: admin.id, role: 'admin', scope: 'user', targetUserId: user.id }, {}],
+    // 默认视图不带 domain 时按地址索引取数（带方向/未读筛选的走 idx_messages_visible），
+    // 带 domain 回到原计划（逐地址回表判断 domain 读取量反而更大）
+    const views: [Parameters<typeof listMessages>[1], Partial<ListMessagesQuery>, string | null][] = [
+      [viewer, {}, 'idx_messages_address_deleted_id'], [viewer, { direction: 'inbound' }, 'idx_messages_visible'],
+      [viewer, { q: 'x' }, null], [viewer, { unread: true }, 'idx_messages_visible'],
+      [viewer, { trash: true }, null], [viewer, { direction: 'outbound' }, 'idx_messages_visible'],
+      [{ userId: admin.id, role: 'admin', scope: 'user', targetUserId: user.id }, {}, null],
     ];
-    for (const [who, query] of views) {
+    for (const [who, query, byAddress] of views) {
       const list = (extra: Partial<ListMessagesQuery>) => lastPlan('select', (db) =>
         listMessages(db, who, { limit: 30, ...query, ...extra } as ListMessagesQuery));
       const withDomain = await list({ domain: 'hpc.email' });
       expect(withDomain, JSON.stringify(query)).not.toContain('idx_messages_domain');
-      expect(withDomain, JSON.stringify(query)).toBe(await list({}));
+      if (byAddress) {
+        const plain = await list({});
+        expect(plain, JSON.stringify(query)).toContain(`SEARCH messages USING INDEX ${byAddress} (address=?`);
+        expect(plain, JSON.stringify(query)).not.toContain('idx_messages_live');
+      } else {
+        expect(withDomain, JSON.stringify(query)).toBe(await list({}));
+      }
     }
     // 未认领范围没有地址集合可走，仍由规划器按域名索引收窄
     expect(await lastPlan('select', (db) => listMessages(db, { userId: admin.id, role: 'admin', scope: 'unclaimed' },

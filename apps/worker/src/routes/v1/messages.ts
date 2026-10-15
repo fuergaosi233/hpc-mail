@@ -132,7 +132,7 @@ app.post('/restore', async (c) => {
 app.post('/purge', async (c) => {
   requireScope(c, 'mail.write');
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, mutationViewer(c, c.get('apiKey')!, req.scope), req.ids);
+  const purged = await purgeMessages(c.env, mutationViewer(c, c.get('apiKey')!, req.scope), req.ids, execCtx(c));
   return ok(c, { purged, changed: purged });
 });
 

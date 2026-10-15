@@ -29,14 +29,20 @@ export async function getPublicDomains(env: Env, settings?: Settings): Promise<s
   return s.domains.list.filter((e) => e.public).map((e) => e.domain);
 }
 
-/** 当前用户可以新增认领的域名；用户专属配置与认领校验使用同一解析器。 */
+/**
+ * 当前用户可以新增认领的域名；用户专属配置与认领校验使用同一解析器。
+ * 直读 D1（与用户策略并行，不多一层往返）：认领弹窗以它为前端闸门，管理员增删域名后必须立即可见。
+ */
 export async function getVisibleDomains(
   env: Env,
   userId: number,
   settings?: Settings,
 ): Promise<string[]> {
-  const user = await loadMailboxPolicyUser(createDb(env), userId);
-  return resolveMailboxPolicy(settings ?? await getSettingsFresh(env), user).domains.map(({ domain }) => domain);
+  const [user, resolved] = await Promise.all([
+    loadMailboxPolicyUser(createDb(env), userId),
+    settings ?? getSettingsFresh(env),
+  ]);
+  return resolveMailboxPolicy(resolved, user).domains.map(({ domain }) => domain);
 }
 
 /** 域名是否对普通用户公开。 */

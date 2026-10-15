@@ -9,7 +9,6 @@ import type { Context, MiddlewareHandler } from 'hono';
 import { createDb } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
-import { execCtx } from '../lib/http.js';
 import { verifyToken, type JwtClaims } from '../lib/jwt.js';
 import { getUserEpoch, sessionValidFor } from '../services/session.js';
 import { getSettings } from '../services/setting.js';
@@ -182,7 +181,7 @@ async function slowAuth(c: Context<AppContext>, claims: JwtClaims): Promise<Auth
     twoFactorEnabled: !!row.totpEnabledAt,
   };
   await assertTwoFactorSatisfied(c, authUser, async () =>
-    (await getSettings(c.env, execCtx(c))).security.require2fa);
+    (await getSettings(c.env)).security.require2fa);
   return authUser;
 }
 

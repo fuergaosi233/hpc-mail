@@ -8,17 +8,23 @@ import { createDb } from '../db/client.js';
 import { attachments as attachmentsTable, messages } from '../db/schema.js';
 import { getEmailDomain, getNameFromEmail, normalizeEmail } from '../lib/email-address.js';
 import { sha256Hex } from '../lib/crypto.js';
-import { htmlToText, makePreview } from '../lib/text.js';
+import { mailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { isAiModelConfigured } from './ai-provider.js';
 import { extractCodeByAi, extractCodeByRegex, wantsAiCode } from './code-extract.js';
 import { extractVerificationLink } from './link-extract.js';
-import { resolveNotifyOwnerIds } from './mailbox.js';
-import { loadNotifyOwners, type NotifyOwner } from './notify-prefs.js';
+import {
+  LEGACY_NOTIFY_KEYS,
+  loadNotifyOwners,
+  notifyOwnersFromRows,
+  type NotifyOwner,
+  type NotifyOwnerRawRow,
+} from './notify-prefs.js';
 import { bumpCounter, dayWindow } from './rate-counter.js';
 import { getSettings } from './setting.js';
-import { bodyBytes, storeMailBody } from './mail-body.js';
+import { bodyBytes, D1_BODY_LIMIT, storeMailBody } from './mail-body.js';
 import { forwardReceivedMail } from './forwarding.js';
+import { NOTIFY_OWNER_IDS_SQL } from './mailbox.js';
 import { enqueueMailNotifications } from './notification-jobs.js';
 import { attachmentKey, getExt, putObject, sha256Hex16 } from './storage.js';
 import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
@@ -51,16 +57,76 @@ interface ParsedAttachment {
   size: number;
 }
 
+const duplicateColumns = {
+  id: messages.id,
+  status: messages.status,
+  errorDetail: messages.errorDetail,
+  rawR2Key: messages.rawR2Key,
+  bodyR2Key: messages.bodyR2Key,
+  deletedAt: messages.deletedAt,
+  notifyOwnerIds: messages.notifyOwnerIds,
+};
+
+/** 同一 ingestKey 已落库的那一行（合批读取时按原始列名映射，并发竞争时由 drizzle 重读） */
+interface DuplicateRow {
+  id: number;
+  status: string;
+  errorDetail: string;
+  rawR2Key: string | null;
+  bodyR2Key: string | null;
+  deletedAt: unknown;
+  notifyOwnerIds: number[] | null;
+}
+
+interface InboundLookup {
+  duplicate: DuplicateRow | undefined;
+  ownerIds: number[];
+  ownerRows: NotifyOwnerRawRow[];
+  legacyRows: { key: string; value: string }[];
+}
+
 /**
- * 收件链路：解析 → 提码 → 正文分层/附件落 R2 → 落库 → 同步邮箱转发（原生 forward 优先，
- * 未验证目标降级中转）→ waitUntil(AI 兜底 + 通知队列)。正文/附件未完整保存则 SMTP 重试。
+ * Ack 前唯一一次 D1 读：去重行、收信当时的归属人、归属人的状态与偏好、旧全局通知设置，
+ * 合成一个 batch 往返。偏好行只在邮件完整落库后才解析。
+ * 全部是原生 SQL、各自显式绑定：归属人子查询复用 NOTIFY_OWNER_IDS_SQL（?1 = 收件地址），
+ * 不能与 drizzle 生成的匿名 ? 混在同一条语句里，否则新增条件会和 ?1 撞到同一槽位而静默绑错。
+ */
+async function lookupInbound(env: Env, ingestKey: string, address: string): Promise<InboundLookup> {
+  const [dup, owners, ownerUserRows, legacy] = await env.db.batch([
+    env.db.prepare(`SELECT id, status, error_detail, raw_r2_key, body_r2_key, deleted_at, notify_owner_ids
+      FROM messages WHERE ingest_key = ?1`).bind(ingestKey),
+    env.db.prepare(NOTIFY_OWNER_IDS_SQL).bind(address),
+    env.db.prepare(`select "id", "status", "role", "notify_prefs" from "users" where "id" in (${NOTIFY_OWNER_IDS_SQL})`).bind(address),
+    env.db.prepare(`SELECT key, value FROM settings WHERE key IN (${LEGACY_NOTIFY_KEYS.map((_, i) => `?${i + 1}`).join(', ')})`)
+      .bind(...LEGACY_NOTIFY_KEYS),
+  ]);
+  const row = dup?.results[0] as {
+    id: number; status: string; error_detail: string; raw_r2_key: string | null; body_r2_key: string | null;
+    deleted_at: number | null; notify_owner_ids: string | null;
+  } | undefined;
+  return {
+    duplicate: row && {
+      id: Number(row.id), status: row.status, errorDetail: row.error_detail ?? '',
+      rawR2Key: row.raw_r2_key, bodyR2Key: row.body_r2_key, deletedAt: row.deleted_at,
+      notifyOwnerIds: row.notify_owner_ids === null ? null : JSON.parse(row.notify_owner_ids) as number[],
+    },
+    ownerIds: (owners?.results ?? []).map((item) => Number((item as { id: number }).id)),
+    ownerRows: (ownerUserRows?.results ?? []) as NotifyOwnerRawRow[],
+    legacyRows: (legacy?.results ?? []) as { key: string; value: string }[],
+  };
+}
+
+/**
+ * 收件链路：解析 → 去重 + 归属人 + 偏好的 D1 batch（往返期间完成提码与摘要）→ 非重复时原文/大正文并行写 R2
+ * → 落库 → 附件落 R2 → waitUntil(邮箱转发、AI 兜底 + 通知队列)。原文/正文/附件未完整保存则 SMTP 重试。
  */
 export async function handleInbound(
   message: ForwardableEmailMessage,
   env: Env,
   ctx: ExecCtx,
 ): Promise<void> {
-  const settings = await getSettings(env, ctx);
+  // 设置读取（isolate 内存缓存未命中时直读 D1）与原文缓冲、解析重叠，提码前才等待
+  const settingsReady = getSettings(env, ctx);
 
   // 先缓冲原始 .eml（stream 只能读一次），解析与幂等摘要共用这一份字节。
   const rawBytes = new Uint8Array(await new Response(message.raw).arrayBuffer());
@@ -105,36 +171,24 @@ export async function handleInbound(
   const sourceReferences = (email.references || '').slice(0, 4096);
   const ingestKey = await sha256Hex(`${toAddress}\n${sourceMessageId}\n${rawDigest}`);
   const db = createDb(env);
-  const duplicateColumns = {
-    id: messages.id,
-    status: messages.status,
-    errorDetail: messages.errorDetail,
-    rawR2Key: messages.rawR2Key,
-    bodyR2Key: messages.bodyR2Key,
-    deletedAt: messages.deletedAt,
-    notifyOwnerIds: messages.notifyOwnerIds,
-  };
-  let duplicate = await db
-    .select(duplicateColumns)
-    .from(messages)
-    .where(eq(messages.ingestKey, ingestKey))
-    .get();
-  if (duplicate?.deletedAt) return;
-  if (duplicate && (duplicate.status === 'received' ||
-    (duplicate.status === 'degraded' && !duplicate.errorDetail.includes('保存失败'))) && duplicate.rawR2Key &&
-    (bodyBytes(text, html) <= 256 * 1024 || duplicate.bodyR2Key)) return;
+  const bodySize = bodyBytes(text, html);
 
-  // 接受 SMTP 投递前必须保存原文；存储故障由 SMTP 重投恢复，不能接受丢失正文。
-  const rawR2Key = `raw/${ingestKey}.eml`;
-  await env.r2.put(rawR2Key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } });
+  // 去重读先发出，往返期间完成 CPU 部分；R2 写入等去重结果出来、确认不是重复投递之后才开始。
+  const lookupReady = lookupInbound(env, ingestKey, toAddress);
+  // 下方 CPU 部分若抛错，lookupReady 的失败不能成为未处理的 rejection
+  lookupReady.catch(() => {});
 
+  // HTML → 纯文本只转换一次，提码、摘要、AI 兜底、通知与转发共用。
+  const settings = await settingsReady;
+  const body = mailText(text, html);
   // 同步正则提码 + 验证链接识别（同受「自动提取」开关控制）
   let code = '';
   let verificationLink = '';
   if (settings.code_extract.enabled) {
-    code = extractCodeByRegex(subject, text || htmlToText(html));
+    code = extractCodeByRegex(subject, body.plain);
     verificationLink = extractVerificationLink({ subject, text, html, fromAddress });
   }
+  const preview = body.preview();
 
   // 附件落 R2 前先算内容
   let attachmentBytes = 0;
@@ -162,12 +216,26 @@ export async function handleInbound(
     });
   }
   const attachmentsSize = parsedAttachments.reduce((sum, a) => sum + a.size, 0);
+  const attachmentHashes = await Promise.all(parsedAttachments.map((att) => sha256Hex16(att.content)));
 
-  const { bodyText, bodyHtml, bodyR2Key } = await storeMailBody(env, text, html, ingestKey);
+  const lookup = await lookupReady;
+  let duplicate = lookup.duplicate;
+  // 已删除或已完整的重复投递：在任何 R2 写入之前返回
+  if (duplicate?.deletedAt || (duplicate && (duplicate.status === 'received' ||
+    (duplicate.status === 'degraded' && !duplicate.errorDetail.includes('保存失败'))) && duplicate.rawR2Key &&
+    (bodySize <= D1_BODY_LIMIT || duplicate.bodyR2Key))) return;
 
-  const preview = makePreview(text, html);
-  const size = bodyBytes(text, html) + attachmentsSize;
-  const ownerIds = duplicate?.notifyOwnerIds ?? await resolveNotifyOwnerIds(env, toAddress);
+  // 接受 SMTP 投递前必须保存原文与完整正文；存储故障由 SMTP 重投恢复，不能接受丢失正文。
+  // 两次写入并行；rawBytes 只作为实参直接传给 put，不被任何闭包捕获——否则会随 waitUntil
+  // 后处理一直持有整封原始 .eml。
+  const rawR2Key = `raw/${ingestKey}.eml`;
+  const [, { bodyText, bodyHtml, bodyR2Key }] = await Promise.all([
+    env.r2.put(rawR2Key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } }),
+    storeMailBody(env, text, html, ingestKey, bodySize),
+  ]);
+
+  const size = bodySize + attachmentsSize;
+  const ownerIds = duplicate?.notifyOwnerIds ?? lookup.ownerIds;
 
   const finalState = {
     status: attachmentsDropped ? 'degraded' : 'received',
@@ -177,7 +245,8 @@ export async function handleInbound(
   // 有附件时仍先写 pending，附件保存成功后再原子转为完整状态。
   const completeOnInsert = !duplicate && parsedAttachments.length === 0;
 
-  // 消息落库：失败向上抛出触发 SMTP 重试
+  // 消息落库：失败向上抛出触发 SMTP 重试。
+  // 补投修复先单独提交字段回写（上传附件之前），附件失败时刚写入的原文/正文也已被这一行引用。
   let inserted: { id: number } | undefined;
   if (duplicate) {
     await db.update(messages).set({ bodyText, bodyHtml, bodyR2Key, rawR2Key, replyTo, notifyOwnerIds: ownerIds })
@@ -237,19 +306,15 @@ export async function handleInbound(
     completed = true;
   } else if (parsedAttachments.length) {
     try {
-      const rows: typeof attachmentsTable.$inferInsert[] = [];
-      for (const att of parsedAttachments) {
-        const hash16 = await sha256Hex16(att.content);
-        rows.push({
-          messageId,
-          r2Key: attachmentKey(messageId, att.seq, hash16, getExt(att.filename)),
-          filename: att.filename,
-          mimeType: att.mimeType,
-          size: att.size,
-          contentId: att.contentId,
-          disposition: att.disposition,
-        });
-      }
+      const rows: typeof attachmentsTable.$inferInsert[] = parsedAttachments.map((att, index) => ({
+        messageId,
+        r2Key: attachmentKey(messageId, att.seq, attachmentHashes[index]!, getExt(att.filename)),
+        filename: att.filename,
+        mimeType: att.mimeType,
+        size: att.size,
+        contentId: att.contentId,
+        disposition: att.disposition,
+      }));
       await runLimited(rows.map((row, index) => ({ row, att: parsedAttachments[index]! })), ATTACHMENT_UPLOAD_CONCURRENCY,
         ({ row, att }) => putObject(env, row.r2Key, att.content, att.mimeType));
       // 补偿重投不重复增加附件行：(message_id, r2_key) 唯一索引去重，每个已保存对象有稳定 key。
@@ -276,40 +341,47 @@ export async function handleInbound(
   // 旧完整消息补存原文时不重复转发；pending 消息从未进入后处理，恢复后正常通知。
   if (duplicate && duplicate.status !== 'pending') return;
 
-  // 转发偏好来自收件时保存的 owner 快照；偏好读取失败不影响已经可靠落库的邮件。
-  // 状态与偏好只读一次，转发、入队与即时投递共用。
-  let owners: Map<number, NotifyOwner> | undefined;
-  let ownerPrefs: NotifyOwner['prefs'][] = [];
-  try {
-    owners = await loadNotifyOwners(env, ownerIds);
-    ownerPrefs = ownerIds.map((id) => owners!.get(id)?.prefs ?? DEFAULT_USER_NOTIFY_PREFS);
-  } catch (e) {
-    console.error('通知偏好解析失败，跳过转发（邮件与归属快照已入库）:', e);
-  }
+  // 转发偏好来自收件时保存的 owner 快照：状态与偏好已随去重查询读出，转发、入队与即时投递共用；
+  // 修复投递的快照里有当时不再是归属人的用户时补读一次。偏好读取失败不影响已经可靠落库的邮件。
+  const resolvedOwners = new Set(lookup.ownerIds);
+  const ownersReady = (async (): Promise<Map<number, NotifyOwner> | undefined> => {
+    try {
+      return ownerIds.every((id) => resolvedOwners.has(id))
+        ? notifyOwnersFromRows(lookup.ownerRows, lookup.legacyRows)
+        : await loadNotifyOwners(env, ownerIds);
+    } catch (e) {
+      console.error('通知偏好解析失败，跳过转发（邮件与归属快照已入库）:', e);
+      return undefined;
+    }
+  })();
 
-  ctx.waitUntil(forwardReceivedMail(env, {
+  ctx.waitUntil(ownersReady.then((owners) => forwardReceivedMail(env, {
     messageId, ownerIds,
     fromAddress, fromName, toAddress, domain, subject, text, html, replyTo,
-    attachments: parsedAttachments,
-  }, ownerPrefs, message).catch(error => console.error('入站转发后处理失败:', error)));
+    attachments: parsedAttachments, mailText: body,
+  }, owners ? ownerIds.map((id) => owners.get(id)?.prefs ?? DEFAULT_USER_NOTIFY_PREFS) : [], message))
+    .catch(error => console.error('入站转发后处理失败:', error)));
 
   // 异步后处理：AI 兜底提码 + 按 owner 个人偏好的飞书/通用 webhook（各自 try/catch 隔离）
   ctx.waitUntil(
     (async () => {
       let finalCode = code;
+      let codeSaved: Promise<void> | undefined;
       // 模型未配置、或邮件里没有验证码相关词时不外发、也不占每域额度
       if (!finalCode && settings.code_extract.enabled && settings.code_extract.aiEnabled
-        && isAiModelConfigured(settings.ai_model) && wantsAiCode({ subject, text, html })) {
+        && isAiModelConfigured(settings.ai_model) && wantsAiCode({ subject, text, html, plain: body.plain })) {
         try {
           const usage = await bumpCounter(env, 'ai-extract', domain, dayWindow(), 1);
           if (usage.count <= DAILY_AI_EXTRACT_LIMIT) {
-            const aiCode = await extractCodeByAi(settings.ai_model, { subject, text, html });
+            const aiCode = await extractCodeByAi(settings.ai_model, { subject, text, html, plain: body.plain });
             if (aiCode) {
               finalCode = aiCode;
-              await db
+              // 回写验证码与通知入队并行，各自失败互不影响
+              codeSaved = Promise.resolve(db
                 .update(messages)
                 .set({ verificationCode: aiCode })
-                .where(eq(messages.id, messageId));
+                .where(eq(messages.id, messageId)))
+                .then(() => undefined, (e: unknown) => console.error('AI 提码失败:', e));
             }
           } else {
             console.warn(`域名 ${domain} 今日 AI 提码额度已用尽，跳过兜底识别`);
@@ -318,13 +390,13 @@ export async function handleInbound(
           console.error('AI 提码失败:', e);
         }
       }
-      await enqueueMailNotifications(env, ctx, {
+      await Promise.all([codeSaved, enqueueMailNotifications(env, ctx, {
         ownerIds,
-        owners,
+        owners: await ownersReady,
         message: { id: messageId, address: toAddress, fromAddress, fromName, subject,
           verificationCode: finalCode, verificationLink, preview, createdAt: new Date().toISOString() },
-        text, html,
-      });
+        text, html, mailText: body,
+      })]);
     })(),
   );
 }

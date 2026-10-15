@@ -137,8 +137,9 @@ async function verifyLoginTwoFactor(
   throw new AppError('bad_credentials', '两步验证码错误');
 }
 
-async function issueToken(env: Env, user: typeof users.$inferSelect): Promise<string> {
-  const sid = await createSession(env, user.id, user);
+/** 签发会话令牌；ctx 用于把会话 KV 兼容写放进 waitUntil，不阻塞响应 */
+async function issueToken(env: Env, user: typeof users.$inferSelect, ctx?: ExecCtx | null): Promise<string> {
+  const sid = await createSession(env, user.id, user, ctx);
   return signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: user.authVersion });
 }
 
@@ -146,7 +147,7 @@ export async function login(
   env: Env,
   req: LoginRequest,
   ip: string,
-  ctx?: ExecCtx,
+  ctx?: ExecCtx | null,
 ): Promise<LoginResponse> {
   await assertLoginAllowed(env, req.username, ip);
   const db = createDb(env);
@@ -172,7 +173,7 @@ export async function login(
     throw e;
   }
 
-  const token = await issueToken(env, user);
+  const token = await issueToken(env, user, ctx);
   await resetLoginFailures(env, req.username, ip);
   const previousIp = user.lastLoginIp;
   await db
@@ -221,7 +222,7 @@ export async function login(
   return { token, user: toSessionUser(user) };
 }
 
-export async function register(env: Env, req: RegisterRequest, ip: string): Promise<LoginResponse> {
+export async function register(env: Env, req: RegisterRequest, ip: string, ctx?: ExecCtx | null): Promise<LoginResponse> {
   await assertRegisterAllowed(env, ip);
   await recordRegisterAttempt(env, ip);
   const settings = await getSettings(env);
@@ -279,7 +280,7 @@ export async function register(env: Env, req: RegisterRequest, ip: string): Prom
       .returning();
   }
   if (!row) throw new AppError('internal', '用户创建失败');
-  const token = await issueToken(env, row!);
+  const token = await issueToken(env, row!, ctx);
   return { token, user: toSessionUser(row!) };
 }
 
@@ -287,6 +288,7 @@ export async function changePassword(
   env: Env,
   user: AuthUser,
   req: ChangePasswordRequest,
+  ctx?: ExecCtx | null,
 ): Promise<LoginResponse> {
   const db = createDb(env);
   const row = await db.select().from(users).where(eq(users.id, user.id)).get();
@@ -300,11 +302,11 @@ export async function changePassword(
     .where(and(eq(users.id, user.id), eq(users.passwordHash, row.passwordHash), eq(users.authVersion, row.authVersion)))
     .returning().get();
   if (!updated) throw new AppError('conflict', '密码已在另一请求中修改，请重新登录');
-  await mirrorUserEpoch(env, user.id, updated.authVersion);
-  const token = await issueToken(env, updated);
+  await mirrorUserEpoch(env, user.id, updated.authVersion, ctx);
+  const token = await issueToken(env, updated, ctx);
   return { token, user: toSessionUser(updated) };
 }
 
-export async function logout(env: Env, sid: string): Promise<void> {
-  await destroySession(env, sid);
+export async function logout(env: Env, sid: string, ctx?: ExecCtx | null): Promise<void> {
+  await destroySession(env, sid, ctx);
 }

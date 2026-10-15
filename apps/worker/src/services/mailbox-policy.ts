@@ -1,10 +1,12 @@
 import { userMailboxPolicySchema, type Settings, type UserMailboxPolicy } from '@hpc-mail/shared';
-import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 
 export type MailboxPolicyUser = Pick<typeof users.$inferSelect, 'id' | 'role' | 'status' | 'mailboxPolicy' | 'mailboxPolicyRevision'>;
+
+/** 认领规则只依赖这两项设置 */
+export type ClaimSettings = Pick<Settings, 'domains' | 'mailbox_policy'>;
 
 export interface EffectiveMailboxPolicy {
   perUserLimit: number;
@@ -13,7 +15,7 @@ export interface EffectiveMailboxPolicy {
 }
 
 /** 唯一的权限解析：专属配置替代公共域名及额度，但仍需域名存在于系统中。 */
-export function resolveMailboxPolicy(settings: Settings, user: MailboxPolicyUser): EffectiveMailboxPolicy {
+export function resolveMailboxPolicy(settings: ClaimSettings, user: MailboxPolicyUser): EffectiveMailboxPolicy {
   if (user.role === 'admin') {
     return { perUserLimit: 0, domains: settings.domains.list.map(({ domain }) => ({ domain, perUserLimit: 0 })), reservedLocalParts: [] };
   }
@@ -30,11 +32,39 @@ export function resolveMailboxPolicy(settings: Settings, user: MailboxPolicyUser
     reservedLocalParts: settings.mailbox_policy.reservedLocalParts };
 }
 
+// 单独读取与合进 D1 batch 的读取共用同一条语句与同一个行解码，避免两条路径判定漂移。
+
+interface PolicyUserRow {
+  id: number;
+  role: MailboxPolicyUser['role'];
+  status: MailboxPolicyUser['status'];
+  mailbox_policy: string | null;
+  mailbox_policy_revision: number;
+}
+
+export function mailboxPolicyUserStatement(db: D1Database, userId: number): D1PreparedStatement {
+  return db.prepare('SELECT id, role, status, mailbox_policy, mailbox_policy_revision FROM users WHERE id = ?').bind(userId);
+}
+
+/** 行解码与校验：用户缺失 → not_found，禁用 → user_disabled */
+export function mailboxPolicyUserFromResult(result: D1Result | undefined): MailboxPolicyUser {
+  const row = result?.results?.[0] as PolicyUserRow | undefined;
+  if (!row) throw new AppError('not_found', '用户不存在');
+  if (row.status !== 'active') throw new AppError('user_disabled', '用户已被禁用');
+  return {
+    id: Number(row.id),
+    role: row.role,
+    status: row.status,
+    mailboxPolicy: row.mailbox_policy === null ? null : JSON.parse(row.mailbox_policy) as UserMailboxPolicy,
+    mailboxPolicyRevision: Number(row.mailbox_policy_revision),
+  };
+}
+
 export async function loadMailboxPolicyUser(db: Db, userId: number): Promise<MailboxPolicyUser> {
-  const user = await db.select({ id: users.id, role: users.role, status: users.status,
-    mailboxPolicy: users.mailboxPolicy, mailboxPolicyRevision: users.mailboxPolicyRevision })
-    .from(users).where(eq(users.id, userId)).get();
-  if (!user) throw new AppError('not_found', '用户不存在');
-  if (user.status !== 'active') throw new AppError('user_disabled', '用户已被禁用');
-  return user;
+  return mailboxPolicyUserFromResult(await mailboxPolicyUserStatement(db.$client, userId).all());
+}
+
+/** 认领只需这两项设置；直读 D1（强一致），解析交给 setting.ts 的 mergeSettingRows */
+export function claimSettingsStatement(db: D1Database): D1PreparedStatement {
+  return db.prepare(`SELECT key, value FROM settings WHERE key IN ('domains', 'mailbox_policy')`);
 }

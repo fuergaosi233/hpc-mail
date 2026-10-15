@@ -1,6 +1,6 @@
 import { InfiniteQueryObserver, QueryClient, QueryObserver } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ListMessagesQuery, MessageSummary, Page } from '@hpc-mail/shared';
+import type { ListMessagesQuery, MessageListPage, MessageSummary, Page } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import {
   mergeHeadPage,
@@ -10,6 +10,7 @@ import {
   snapshotListMembership,
   syncRemovedMessages,
   syncRestoredMessages,
+  syncSentMessage,
   syncStarState,
 } from './message-cache';
 
@@ -19,7 +20,7 @@ const page = (ids: number[], nextCursor: string | null, extra: Partial<MessageSu
   items: ids.map((id) => mail(id, extra)),
   nextCursor,
 });
-const data = (...pages: Page<MessageSummary>[]): MessageListData => ({
+const data = (...pages: MessageListPage[]): MessageListData => ({
   pages,
   pageParams: pages.map((_, index) => (index === 0 ? '' : `c${index}`)),
 });
@@ -47,6 +48,17 @@ describe('mergeHeadPage', () => {
 
   it('returns the same reference when nothing changed', () => {
     expect(mergeHeadPage(loaded, page([10, 9, 8], 'c8'))).toBe(loaded);
+  });
+
+  it('carries the head fingerprint of the probe into the first page', () => {
+    const merged = mergeHeadPage(loaded, { ...page([12, 11, 10], 'c10'), head: 'h2' });
+    expect(merged.pages[0]?.head).toBe('h2');
+    // 条目没变、只有指纹不同：条目与后续页沿用原引用
+    const sameItems = mergeHeadPage(loaded, { ...page([10, 9, 8], 'c8'), head: 'h3' });
+    expect(sameItems.pages[0]?.head).toBe('h3');
+    expect(sameItems.pages[0]?.items).toBe(loaded.pages[0]?.items);
+    expect(sameItems.pages[1]).toBe(loaded.pages[1]);
+    expect(mergeHeadPage(sameItems, { ...page([10, 9, 8], 'c8'), head: 'h3' })).toBe(sameItems);
   });
 
   it('keeps only the head when it cannot be spliced onto the loaded pages', () => {
@@ -200,6 +212,60 @@ describe('cache sync after mutations', () => {
     syncAllRead(client, { q: 'invoice' });
     expect(list(inbox)?.pages[0]?.items.map((m) => m.isRead)).toEqual([true, false, false]);
     expect(listState(inbox)?.isInvalidated).toBe(true);
+  });
+
+  it('a sent mail refreshes the active single-page list and leaves starred, trash, details and unread alone', async () => {
+    const { client, fetchList, fetchUnread, seedList, observeList, listState } = setup();
+    const sent = { direction: 'outbound' as const, scope: 'mine' as const };
+    const inbox = { direction: 'inbound' as const, scope: 'mine' as const };
+    const starred = { scope: 'mine' as const, starred: true };
+    const trash = { scope: 'mine' as const, trash: true };
+    for (const filters of [sent, inbox, starred, trash]) seedList(filters, data(page([3, 2], null)));
+    client.setQueryData(queryKeys.messages.detail(2), mail(2));
+    const stop = observeList(sent);
+
+    syncSentMessage(client, { sourceIds: [], selfDelivered: false });
+
+    await vi.waitFor(() => expect(fetchList).toHaveBeenCalledTimes(1));
+    expect(listState(inbox)?.isInvalidated).toBe(true);
+    expect([listState(starred)?.isInvalidated, listState(trash)?.isInvalidated]).toEqual([false, false]);
+    expect(client.getQueryState(queryKeys.messages.detail(2))?.isInvalidated).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(fetchList).toHaveBeenCalledTimes(1);
+    expect(fetchUnread).not.toHaveBeenCalled();
+    stop();
+  });
+
+  it('drops the head of a first page edited in place, and keeps it when only later pages change', () => {
+    const { client, seedList, list } = setup();
+    const inbox = { scope: 'mine' as const };
+    seedList(inbox, data({ ...page([3, 2], 'c2'), head: 'h1' }, page([1], null)));
+
+    syncReadState(client, [1], true);
+    expect(list(inbox)?.pages[0]?.head).toBe('h1');
+    syncStarState(client, [2], true, { refetchActive: false });
+    expect(list(inbox)?.pages[0]?.head).toBeUndefined();
+    expect(list(inbox)?.pages[0]?.items[1]?.isStarred).toBe(true);
+  });
+
+  it('drops the head when undo inserts mail back into the first page', () => {
+    const { client, seedList, list } = setup();
+    const inbox = { scope: 'mine' as const };
+    const later = { scope: 'mine' as const, direction: 'inbound' as const };
+    seedList(inbox, data({ ...page([9, 8], 'c8'), head: 'h1' }, page([6], null)));
+    seedList(later, data({ ...page([9, 8], 'c8'), head: 'h2' }, page([6], null)));
+    const membership = snapshotListMembership(client, [9]).concat({ queryKey: queryKeys.messages.list(later), items: [mail(5)] });
+    syncRemovedMessages(client, [9], 'live');
+    // 删除后又经轮询对齐过：两份列表都带着服务端的 head
+    seedList(inbox, data({ ...page([8], 'c8'), head: 'h1' }, page([6], null)));
+    seedList(later, data({ ...page([9, 8], 'c8'), head: 'h2' }, page([6], null)));
+
+    syncRestoredMessages(client, [9, 5], membership);
+    expect(ids(list(inbox))).toEqual([[9, 8], [6]]);
+    expect(list(inbox)?.pages[0]?.head).toBeUndefined();
+    // 只插回了后续页：首页未变，head 保留
+    expect(ids(list(later))).toEqual([[9, 8], [6, 5]]);
+    expect(list(later)?.pages[0]?.head).toBe('h2');
   });
 
   it('undo puts deleted mail back into the lists it came from, in order', () => {

@@ -7,7 +7,7 @@ export type { NotificationHealth, NotificationDeliveryView } from '@hpc-mail/sha
 import { createDb } from '../db/client.js';
 import { mailboxes, messages, notificationJobs, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
-import { htmlToText } from '../lib/text.js';
+import { htmlToText, type MailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { getDomains } from './domain.js';
 import { sendFeishuNotification } from './feishu.js';
@@ -29,6 +29,8 @@ export interface MailNotificationInput {
   message: WebhookMailPayload['message'];
   text?: string;
   html?: string;
+  /** 收件链路的正文视图：通知正文复用同一份 HTML → 纯文本转换结果 */
+  mailText?: MailText;
 }
 interface Payload {
   message: WebhookMailPayload['message'];
@@ -55,12 +57,13 @@ export async function enqueueMailNotifications(
       ? ownerIds.map((id) => ({ status: 'fulfilled', value: owners.get(id)?.prefs ?? DEFAULT_USER_NOTIFY_PREFS }))
       : await Promise.allSettled(ownerIds.map(id => getUserNotifyPrefs(env, id)));
     const now = new Date();
-    const fullBody = input.text || htmlToText(input.html || '');
-    const payload = {
-      message: input.message,
-      body: fullBody.slice(0, 4000),
-      bodyTruncated: fullBody.length > 4000,
-    } satisfies Payload;
+    // 正文只在确有通道启用时才转换（未开通知的收件不必整段转换大 HTML）
+    let payload: Payload | undefined;
+    const payloadOf = (): Payload => {
+      if (payload) return payload;
+      const fullBody = input.mailText?.plain ?? (input.text || htmlToText(input.html || ''));
+      return payload = { message: input.message, body: fullBody.slice(0, 4000), bodyTruncated: fullBody.length > 4000 };
+    };
     const rows: typeof notificationJobs.$inferInsert[] = [];
     for (let i = 0; i < ownerIds.length; i++) {
       const result = prefs[i]!;
@@ -72,7 +75,7 @@ export async function enqueueMailNotifications(
         if (!result.value[channel].enabled) continue;
         rows.push({
           userId: ownerIds[i]!, messageId: input.message.id, channel,
-          payload: payload as unknown as Record<string, unknown>,
+          payload: payloadOf() as unknown as Record<string, unknown>,
           maxAttempts: channel === 'webhook' ? 1 : 3,
           nextAttemptAt: now, createdAt: now, updatedAt: now,
           dedupeKey: `mail:${input.message.id}:${ownerIds[i]}:${channel}`,
@@ -214,6 +217,7 @@ export async function processNotificationJobs(
   const workers = await Promise.allSettled(Array.from({ length: Math.min(concurrency, candidates.length) }, async () => {
     while (index < candidates.length) {
       const candidate = candidates[index++]!;
+      // 逐条认领：轮到投递时才转为 processing，waitUntil 被截断时未开始的任务仍是 pending，由 cron 接着投递
       const claimed = await db.update(notificationJobs).set({
         status: 'processing', attempts: sql`${notificationJobs.attempts} + 1`,
         lastAttemptAt: new Date(), updatedAt: new Date(),
