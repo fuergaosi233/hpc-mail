@@ -11,6 +11,9 @@ vi.mock('@/features/mailboxes/use-mailboxes', () => ({ useMailboxesQuery: () => 
 
 import { AddressesPage } from './addresses-page';
 
+// jsdom 未实现 scrollTo：窗口虚拟列表挂载时会把滚动位置同步一次
+window.scrollTo = vi.fn() as typeof window.scrollTo;
+
 describe('全站地址窄屏卡片', () => {
   it('窄屏渲染卡片而非表格，操作收进更多菜单', async () => {
     const client = new QueryClient();

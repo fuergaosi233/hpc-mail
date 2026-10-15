@@ -2,9 +2,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '@/api/errors';
+import { queryKeys } from '@/api/query-keys';
 
 const mocks = vi.hoisted(() => ({
-  mailboxes: vi.fn(),
+  getMailbox: vi.fn(),
   lastQuery: { current: null as Record<string, unknown> | null },
   lastProps: { current: null as { readOnly?: boolean; hasActiveFilters?: boolean } | null },
 }));
@@ -18,7 +20,7 @@ const box = {
   messageCount: 12,
   createdAt: '2026-10-06T00:00:00Z',
 };
-vi.mock('@/features/mailboxes/use-mailboxes', () => ({ useMailboxesQuery: () => mocks.mailboxes() }));
+vi.mock('@/api/resources', () => ({ adminApi: { getMailbox: mocks.getMailbox } }));
 vi.mock('@/features/inbox/mail-list', () => ({
   MailList: (props: { query: Record<string, unknown>; readOnly?: boolean; hasActiveFilters?: boolean; emptyTitle: string }) => {
     mocks.lastQuery.current = props.query;
@@ -34,8 +36,9 @@ function Probe() {
   return <p data-testid="where">{location.pathname + location.search}</p>;
 }
 
-function mount(initial: string) {
+function mount(initial: string, seed?: (client: QueryClient) => void) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  seed?.(client);
   const router = createMemoryRouter(
     [
       { path: '/admin/addresses', element: <Probe /> },
@@ -56,13 +59,18 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.lastQuery.current = null;
   mocks.lastProps.current = null;
-  mocks.mailboxes.mockReturnValue({ data: [box], isLoading: false, isError: false, refetch: vi.fn() });
+  mocks.getMailbox.mockImplementation(async (id: number) => {
+    if (id === box.id) return box;
+    throw new ApiError('邮箱不存在', { code: 'not_found', httpStatus: 404 });
+  });
 });
 
 describe('管理员查看单个地址的收发件', () => {
-  it('以只读方式按归属人 + 固定地址查询收件箱，并展示归属与邮件数', () => {
+  it('以只读方式按归属人 + 固定地址查询收件箱，并展示归属与邮件数', async () => {
     const { client } = mount('/admin/addresses/42/mail');
-    expect(screen.getByRole('heading', { name: 'existing@example.com' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'existing@example.com' })).toBeInTheDocument();
+    expect(mocks.getMailbox).toHaveBeenCalledWith(42);
+    expect(client.getQueryData(queryKeys.mailboxes.adminDetail(42))).toEqual(box);
     expect(screen.getByRole('link', { name: 'old-owner' })).toHaveAttribute('href', '/admin/users/10/mail');
     expect(screen.getByText(/共 12 封邮件/)).toBeInTheDocument();
     expect(mocks.lastQuery.current).toEqual({
@@ -77,8 +85,9 @@ describe('管理员查看单个地址的收发件', () => {
     client.clear();
   });
 
-  it('切到已发送后只换方向，仍锁定同一地址，并清掉对发件无意义的未读筛选', () => {
+  it('切到已发送后只换方向，仍锁定同一地址，并清掉对发件无意义的未读筛选', async () => {
     const { client, router } = mount('/admin/addresses/42/mail?unread=1');
+    await screen.findByRole('heading', { name: 'existing@example.com' });
     expect(mocks.lastQuery.current).toMatchObject({ direction: 'inbound', unread: true });
     fireEvent.click(screen.getByRole('radio', { name: '已发送' }));
     expect(router.state.location.search).toContain('direction=outbound');
@@ -93,8 +102,9 @@ describe('管理员查看单个地址的收发件', () => {
     client.clear();
   });
 
-  it('URL 里的 address/domain 不能改变被查看的地址', () => {
+  it('URL 里的 address/domain 不能改变被查看的地址', async () => {
     const { client } = mount('/admin/addresses/42/mail?address=other@example.com&domain=other.test&q=验证码');
+    await screen.findByRole('heading', { name: 'existing@example.com' });
     expect(mocks.lastQuery.current).toMatchObject({
       address: 'existing@example.com',
       userId: 10,
@@ -107,9 +117,11 @@ describe('管理员查看单个地址的收发件', () => {
     client.clear();
   });
 
-  it('地址已释放或不存在时给出空态，并能回到全站地址', async () => {
+  it('地址已释放或不存在（404）时给出空态，并能回到全站地址', async () => {
     const { client, router } = mount('/admin/addresses/999/mail');
-    expect(screen.getByText('没有找到这个地址')).toBeInTheDocument();
+    expect(await screen.findByText('没有找到这个地址')).toBeInTheDocument();
+    expect(mocks.getMailbox).toHaveBeenCalledWith(999);
+    expect(screen.queryByRole('button', { name: '重新加载' })).toBeNull();
     expect(screen.queryByTestId('mail-list')).toBeNull();
     fireEvent.click(screen.getByRole('link', { name: /返回全站地址/ }));
     expect(await screen.findByTestId('where')).toHaveTextContent('/admin/addresses');
@@ -117,20 +129,43 @@ describe('管理员查看单个地址的收发件', () => {
     client.clear();
   });
 
-  it('地址 id 非法时不请求邮件列表', () => {
+  it('地址 id 非法时不请求邮箱与邮件列表', () => {
     const { client } = mount('/admin/addresses/abc/mail');
     expect(screen.getByText('无效的地址 id。')).toBeInTheDocument();
+    expect(mocks.getMailbox).not.toHaveBeenCalled();
     expect(mocks.lastQuery.current).toBeNull();
     client.clear();
   });
 
-  it('地址列表加载失败时展示错误并可重试，不渲染邮件列表', () => {
-    const refetch = vi.fn();
-    mocks.mailboxes.mockReturnValue({ data: undefined, isLoading: false, isError: true, error: new Error('boom'), refetch });
+  it('邮箱加载失败（非 404）时展示错误并可重试，不渲染邮件列表', async () => {
+    mocks.getMailbox.mockRejectedValueOnce(new ApiError('服务暂不可用', { code: 'internal', httpStatus: 500 }));
     const { client } = mount('/admin/addresses/42/mail');
+    fireEvent.click(await screen.findByRole('button', { name: '重新加载' }));
     expect(mocks.lastQuery.current).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
-    expect(refetch).toHaveBeenCalled();
+    expect(await screen.findByRole('heading', { name: 'existing@example.com' })).toBeInTheDocument();
+    expect(mocks.getMailbox).toHaveBeenCalledTimes(2);
+    client.clear();
+  });
+
+  it('全站地址列表已在缓存里时先用列表里的这一行渲染，单个邮箱返回后再更新', async () => {
+    let resolve!: (value: typeof box) => void;
+    mocks.getMailbox.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+    const { client } = mount('/admin/addresses/42/mail', (c) => c.setQueryData(queryKeys.mailboxes.list('all'), [box]));
+    expect(screen.getByRole('heading', { name: 'existing@example.com' })).toBeInTheDocument();
+    expect(screen.getByText(/共 12 封邮件/)).toBeInTheDocument();
+    expect(mocks.lastQuery.current).toMatchObject({ userId: 10, address: 'existing@example.com' });
+    expect(mocks.getMailbox).toHaveBeenCalledWith(42);
+    resolve({ ...box, messageCount: 13 });
+    expect(await screen.findByText(/共 13 封邮件/)).toBeInTheDocument();
+    client.clear();
+  });
+
+  it('列表缓存里还在、但单个邮箱已释放（404）时转为空态', async () => {
+    const { client } = mount('/admin/addresses/999/mail', (c) =>
+      c.setQueryData(queryKeys.mailboxes.list('all'), [{ ...box, id: 999 }]));
+    expect(screen.getByRole('heading', { name: 'existing@example.com' })).toBeInTheDocument();
+    expect(await screen.findByText('没有找到这个地址')).toBeInTheDocument();
+    expect(screen.queryByTestId('mail-list')).toBeNull();
     client.clear();
   });
 });

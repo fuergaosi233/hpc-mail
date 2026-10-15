@@ -6,7 +6,8 @@ export function CardList({ className, ...props }: ComponentProps<'ul'>) {
   return <ul className={cn('divide-y divide-line overflow-hidden rounded-lg border border-line bg-surface', className)} {...props} />;
 }
 
-export interface CardListItemProps {
+/** 其余 li 属性（ref、data-*、aria-*）原样透传，供虚拟列表测量行高等用途 */
+export interface CardListItemProps extends Omit<ComponentProps<'li'>, 'title'> {
   /** 主行：地址 / 用户名等识别信息 */
   title: ReactNode;
   /** 副行：次要说明（备注、归属人等） */
@@ -18,9 +19,9 @@ export interface CardListItemProps {
   className?: string;
 }
 
-export function CardListItem({ title, subtitle, meta, actions, className }: CardListItemProps) {
+export function CardListItem({ title, subtitle, meta, actions, className, ...props }: CardListItemProps) {
   return (
-    <li className={cn('flex items-start gap-3 px-4 py-3', className)}>
+    <li className={cn('flex items-start gap-3 px-4 py-3', className)} {...props}>
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-center gap-2 text-sm font-medium text-ink">{title}</div>
         {subtitle && <div className="mt-0.5 truncate text-[13px] text-ink-secondary">{subtitle}</div>}
