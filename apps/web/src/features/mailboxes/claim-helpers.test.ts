@@ -208,6 +208,25 @@ describe('fromBatchResult', () => {
       stoppedBy: { code: 'forbidden', message: '已达上限' },
     })).toEqual({ claimed: ['a@a.test'], remaining: [d('b'), d('c'), d('d'), d('e')], stoppedBy: '已达上限' });
   });
+
+  it('业务错误停止时结果确定；后端中途非业务错误（internal）停止时，出错那项可能已提交，按结果未知处理', () => {
+    const drafts = [d('a'), d('b'), d('c')];
+    const business = fromBatchResult(drafts, {
+      claimed: [], taken: [], notAttempted: drafts, stoppedBy: { code: 'forbidden', message: '已达上限' },
+    });
+    expect(business.uncertain).toBeUndefined();
+    expect(fromBatchResult(drafts, {
+      claimed: [{ address: 'a@a.test' }] as never,
+      taken: [],
+      notAttempted: [d('b'), d('c')],
+      stoppedBy: { code: 'internal', message: '认领中断，部分地址可能已认领，请以邮箱列表为准' },
+    })).toEqual({
+      claimed: ['a@a.test'],
+      remaining: [d('b'), d('c')],
+      stoppedBy: '认领中断，部分地址可能已认领，请以邮箱列表为准',
+      uncertain: true,
+    });
+  });
 });
 
 describe('createAvailabilityLoader', () => {
@@ -249,11 +268,36 @@ describe('createAvailabilityLoader', () => {
     expect(many.mock.calls.map(([items]) => items.length)).toEqual([MAX_BATCH_CLAIM, 2]);
   });
 
-  it('批量请求失败或结果数量不符时，这一批的每个查询都失败', async () => {
+  it('批量请求失败后整批重试一次（仍是一次批量请求），成功则各自拿到结果', async () => {
+    const one = vi.fn();
+    const many = vi.fn()
+      .mockRejectedValueOnce(new ApiError('网络连接失败', { code: 'network' }))
+      .mockImplementation(async (items: Draft[]) => items.map(free));
+    const load = createAvailabilityLoader({ one, many }, { retryDelayMs: 0 });
+    expect(await Promise.all([load(d('one')), load(d('two'))])).toEqual([free(d('one')), free(d('two'))]);
+    expect(many).toHaveBeenCalledTimes(2);
+    expect(many.mock.calls[1]![0]).toEqual([d('one'), d('two')]);
+    expect(one).not.toHaveBeenCalled();
+  });
+
+  it('4xx 不重试；单个查询失败同样只整体重试一次', async () => {
+    const rejected = vi.fn().mockRejectedValue(new ApiError('请求过于频繁', { code: 'rate_limited', httpStatus: 429 }));
+    const limited = createAvailabilityLoader({ one: vi.fn(), many: rejected }, { retryDelayMs: 0 });
+    await expect(Promise.all([limited(d('one')), limited(d('two'))])).rejects.toThrow('请求过于频繁');
+    expect(rejected).toHaveBeenCalledTimes(1);
+    const one = vi.fn().mockRejectedValue(new ApiError('服务器内部错误', { code: 'internal', httpStatus: 500 }));
+    const single = createAvailabilityLoader({ one, many: vi.fn() }, { retryDelayMs: 0 });
+    await expect(single(d('one'))).rejects.toThrow('服务器内部错误');
+    expect(one).toHaveBeenCalledTimes(2);
+  });
+
+  it('批量请求重试后仍失败或结果数量不符时，这一批的每个查询都失败', async () => {
     const error = new ApiError('网络连接失败', { code: 'network' });
-    const failing = createAvailabilityLoader({ one: vi.fn(), many: vi.fn().mockRejectedValue(error) });
+    const many = vi.fn().mockRejectedValue(error);
+    const failing = createAvailabilityLoader({ one: vi.fn(), many }, { retryDelayMs: 0 });
     const settled = await Promise.allSettled([failing(d('one')), failing(d('two'))]);
     expect(settled).toEqual([{ status: 'rejected', reason: error }, { status: 'rejected', reason: error }]);
+    expect(many).toHaveBeenCalledTimes(2);
     const short = createAvailabilityLoader({ one: vi.fn(), many: vi.fn(async () => [free(d('one'))]) });
     const mismatched = await Promise.allSettled([short(d('one')), short(d('two'))]);
     expect(mismatched.map((item) => item.status)).toEqual(['rejected', 'rejected']);

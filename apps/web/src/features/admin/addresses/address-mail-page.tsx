@@ -54,7 +54,7 @@ export function AdminAddressMailPage() {
   const { mailboxId: rawId } = useParams();
   const mailboxId = Number(rawId);
   const validId = Number.isInteger(mailboxId) && mailboxId > 0;
-  const { data: mailbox, isLoading, isError, error, refetch } = useAdminMailbox(mailboxId, validId);
+  const { data: mailbox, isLoading, isPlaceholderData, isError, error, refetch } = useAdminMailbox(mailboxId, validId);
   const { filters, setUnread, setQuery, reset } = useInboxFilters();
   const { direction, setDirection } = useAdminMailDirection();
 
@@ -140,14 +140,20 @@ export function AdminAddressMailPage() {
           onUnreadChange={setUnread}
           onQueryChange={setQuery}
         />
-        <MailList
-          query={query}
-          readOnly
-          hasActiveFilters={hasActiveFilters}
-          onClearFilters={reset}
-          emptyTitle={isInbound ? '该地址还没有收到邮件' : '该地址还没有发送记录'}
-          emptyDescription={isInbound ? '发送到这个地址的邮件会显示在这里。' : '从这个地址发出的邮件会显示在这里。'}
-        />
+        {/* 列表缓存里的这一行可能已过期（过户、释放后只标记了 stale）：只拿来先显示头部，
+            邮件列表按归属人查询，等真实数据返回再挂载，免得用旧 userId 发请求、闪出错误结果 */}
+        {isPlaceholderData ? (
+          <Skeleton className="h-48 w-full rounded-lg" />
+        ) : (
+          <MailList
+            query={query}
+            readOnly
+            hasActiveFilters={hasActiveFilters}
+            onClearFilters={reset}
+            emptyTitle={isInbound ? '该地址还没有收到邮件' : '该地址还没有发送记录'}
+            emptyDescription={isInbound ? '发送到这个地址的邮件会显示在这里。' : '从这个地址发出的邮件会显示在这里。'}
+          />
+        )}
       </div>
     </div>
   );
