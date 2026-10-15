@@ -10,3 +10,9 @@
 
 /sw.js
   Cache-Control: no-cache
+
+/favicon.png
+  Cache-Control: public, max-age=86400
+
+/apple-touch-icon.png
+  Cache-Control: public, max-age=86400

@@ -12,6 +12,7 @@ import { ComposePage } from './compose-page';
 import { draftKeyForUser, identityKeyForUser, lastIdentityKeyForUser, legacyDraftKeyForUser } from './compose-draft';
 import { sendAttemptKeyForUser } from './send-attempt';
 import { ApiError, NETWORK_ERROR_MESSAGE, toApiError } from '@/api/errors';
+import { queryKeys } from '@/api/query-keys';
 vi.stubGlobal('ResizeObserver',class {observe() {} unobserve() {} disconnect() {}});
 function routerFor(state?: import('./compose-init').ComposeInitial) {return createMemoryRouter([{path:'/compose',element:<ComposePage/>},{path:'/sent',element:<p>sent page</p>},{path:'/inbox',element:<p>inbox page</p>},{path:'/mail/:id',element:<p>mail page</p>}],{initialEntries:[{pathname:'/compose',state}]})}
 function show(state?: import('./compose-init').ComposeInitial) {const client=new QueryClient({defaultOptions:{queries:{retry:false}}});render(<QueryClientProvider client={client}><RouterProvider router={routerFor(state)}/></QueryClientProvider>);return client}
@@ -80,6 +81,25 @@ describe('ComposePage complete delivery',()=>{
     fireEvent.click(screen.getByRole('button',{name:'发送'}));
     await waitFor(()=>expect(mocks.send).toHaveBeenCalledOnce());
     expect(mocks.send.mock.calls[0]![0].from).toEqual({mailboxId:10});
+    client.clear();
+  });
+  it('after sending only marks affected lists and the replied thread stale, keeping every detail cache',async()=>{
+    const client=show({fromAddress:'first@one.example',to:['First@one.example'],subject:'Re: hi',body:'body',mode:'reply',replyToMessageId:5,sourceMessageId:5});
+    const emptyList={pages:[{items:[],nextCursor:null}],pageParams:['']};
+    const sent=queryKeys.messages.list({direction:'outbound',scope:'mine'});const starred=queryKeys.messages.list({scope:'mine',starred:true});
+    client.setQueryData(sent,emptyList);client.setQueryData(starred,emptyList);
+    client.setQueryData(queryKeys.messages.detail(5),{id:5});client.setQueryData(queryKeys.messages.detail(8,{scope:'unclaimed'}),{id:8});
+    client.setQueryData(queryKeys.messages.thread(5),{items:[{id:5}]});client.setQueryData(queryKeys.messages.thread(8),{items:[{id:8},{id:5}]});client.setQueryData(queryKeys.messages.thread(9),{items:[{id:9}]});
+    client.setQueryData(queryKeys.messages.unreadCount,{unread:0});
+    fireEvent.click(screen.getByRole('button',{name:'发送'}));
+    expect(await screen.findByText('sent page')).toBeInTheDocument();
+    const invalidated=(key:readonly unknown[])=>client.getQueryState(key)?.isInvalidated;
+    expect(invalidated(queryKeys.messages.detail(5))).toBe(false);
+    expect(invalidated(queryKeys.messages.detail(8,{scope:'unclaimed'}))).toBe(false);
+    expect([invalidated(queryKeys.messages.thread(5)),invalidated(queryKeys.messages.thread(8)),invalidated(queryKeys.messages.thread(9))]).toEqual([true,true,false]);
+    expect([invalidated(sent),invalidated(starred)]).toEqual([true,false]);
+    // 发给自己认领的地址：站内投递进收件箱，未读数随之刷新
+    expect(invalidated(queryKeys.messages.unreadCount)).toBe(true);
     client.clear();
   });
   it('partial recipient failure reports an error instead of a successful delivery toast',async()=>{
