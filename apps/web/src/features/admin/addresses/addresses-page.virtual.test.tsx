@@ -92,6 +92,44 @@ describe('全站地址：大量地址时只渲染视口附近的行', () => {
     view.unmount(); client.clear();
   });
 
+  it('行高按邮箱缓存：搜索过滤后同一下标换了邮箱，不沿用别的邮箱量出的高度', async () => {
+    // user0..user99 的行高 200，其余 57
+    vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      if (!this.hasAttribute('data-index')) return 0;
+      return Number(this.querySelector('a')?.textContent?.match(/\d+/)?.[0]) < 100 ? 200 : 57;
+    });
+    const { client, view } = mount();
+    // 先滚到中段再回顶部：下标 0..36 附近都量过（200）
+    scrollWindowTo(200 * 20);
+    scrollWindowTo(0);
+    // 滚动中新挂载的行不即时测量（线上由 ResizeObserver 补量）：等滚动状态结束
+    await act(() => new Promise((resolve) => setTimeout(resolve, 200)));
+    // 过滤后：user6、user60..69 高 200，下标 11 起是 user600..624（57），未渲染部分不能套用旧下标的 200
+    fireEvent.change(screen.getByPlaceholderText('搜索地址或用户名'), { target: { value: 'user6' } });
+    await screen.findByRole('link', { name: 'user600@example.com' });
+    const rendered = renderedAddresses();
+    expect(rendered.slice(0, 2)).toEqual(['user6@example.com', 'user60@example.com']);
+    const spacer = view.container.querySelector<HTMLElement>('tbody tr[aria-hidden="true"]:last-child td')!;
+    expect(spacer.style.height).toBe(`${(36 - rendered.length) * 57}px`);
+    view.unmount(); client.clear();
+  });
+
+  it('列表上方布局变化（没有 resize 事件）后，过滤结果变化时重测列表起点，滚动定位不偏移', async () => {
+    let listTop = 0;
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      const top = this.tagName === 'TBODY' ? listTop : 0;
+      return { top, bottom: top, left: 0, right: 0, width: 0, height: 0, x: 0, y: top, toJSON: () => ({}) } as DOMRect;
+    });
+    const { client, view } = mount();
+    // 例如上方说明文字换行把列表推下去 5700px，但没有触发 resize
+    listTop = 5700;
+    fireEvent.change(screen.getByPlaceholderText('搜索地址或用户名'), { target: { value: 'user' } });
+    await screen.findByRole('link', { name: 'user0@example.com' });
+    scrollWindowTo(5700 + ROW_HEIGHT * 300);
+    expect(renderedAddresses()).toContain('user300@example.com');
+    view.unmount(); client.clear();
+  });
+
   it('滚动后渲染新位置附近的行，离开视口的行被回收', () => {
     const { client, view } = mount();
     scrollWindowTo(ROW_HEIGHT * 300);

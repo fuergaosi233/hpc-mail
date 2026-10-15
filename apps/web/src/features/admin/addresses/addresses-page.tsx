@@ -128,11 +128,12 @@ interface AddressListProps {
 
 /**
  * 跟随窗口滚动的行虚拟化：只渲染视口附近的行，前后用占位撑出总高度。
- * 行留在正常文档流里，表格列与分隔线照常排版；行高逐行实测。
+ * 行留在正常文档流里，表格列与分隔线照常排版；行高逐行实测，按邮箱 id 缓存。
  */
-function useWindowRows<T extends HTMLElement>(count: number, estimateSize: number) {
+function useWindowRows<T extends HTMLElement>(mailboxes: Mailbox[], estimateSize: number) {
   const listRef = useRef<T>(null);
   const [scrollMargin, setScrollMargin] = useState(0);
+  // 列表上方的布局（说明文字换行、字体就绪等）可能变化而没有 resize 事件：数据或过滤结果变化时也重测
   useLayoutEffect(() => {
     const measure = () => {
       const list = listRef.current;
@@ -141,12 +142,16 @@ function useWindowRows<T extends HTMLElement>(count: number, estimateSize: numbe
     measure();
     window.addEventListener('resize', measure);
     return () => window.removeEventListener('resize', measure);
-  }, []);
+  }, [mailboxes]);
+
+  // 行高按邮箱 id 缓存：搜索过滤后同一下标换了邮箱，不能沿用别的邮箱量出的高度
+  const getItemKey = useCallback((index: number) => mailboxes[index]?.id ?? index, [mailboxes]);
 
   // 未渲染的行按最近实测的行高估算：行高随屏宽变化（如认领时间折行）时总高度也准，按 End 能直达底部
   const typicalSize = useRef(estimateSize);
   const virtualizer = useWindowVirtualizer({
-    count,
+    count: mailboxes.length,
+    getItemKey,
     estimateSize: () => typicalSize.current,
     measureElement: (element, entry, instance) => {
       const size = measureSize(element, entry, instance);
@@ -226,7 +231,7 @@ function SpacerRow({ height }: { height: number }) {
 
 const AddressTable = memo(function AddressTable({ mailboxes, actions }: AddressListProps) {
   const navigate = useNavigate();
-  const { listRef, rows, measureElement, before, after } = useWindowRows<HTMLTableSectionElement>(mailboxes.length, 57);
+  const { listRef, rows, measureElement, before, after } = useWindowRows<HTMLTableSectionElement>(mailboxes, 57);
   return (
     // 只渲染部分行时列宽不能随可见内容跳动：固定表格布局，地址列占剩余宽度，超长截断并用 title 显示全文
     <Table className="table-fixed" aria-rowcount={mailboxes.length + 1}>
@@ -324,7 +329,7 @@ const AddressCard = memo(function AddressCard({
 
 const AddressCards = memo(function AddressCards({ mailboxes, actions }: AddressListProps) {
   const navigate = useNavigate();
-  const { listRef, rows, measureElement, before, after } = useWindowRows<HTMLUListElement>(mailboxes.length, 90);
+  const { listRef, rows, measureElement, before, after } = useWindowRows<HTMLUListElement>(mailboxes, 90);
   return (
     <CardList ref={listRef}>
       {before > 0 && <li aria-hidden="true" style={{ height: before }} />}
