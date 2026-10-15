@@ -204,8 +204,11 @@ describe('管理员按 id 读邮箱与按邮箱读共享', () => {
     const f = await fixture();
     const earlier = (await db.insert(mailboxes).values({ address: f.box.address.replace('@', '-a@'),
       domain: f.box.domain, userId: f.owner.id }).returning().get())!;
-    await replaceMailboxShares(env, f.owner.id, f.box.id, [f.stranger.id, f.member.id, f.admin.id]);
-    const expectedGrantees = [f.admin, f.member, f.stranger].map((user) => user.username).sort();
+    // 最后创建（id 最大）但用户名排最前，区分按用户名与按 id 排序
+    const first = (await db.insert(users).values({ username: f.owner.username.replace(/owner$/, 'aaa'), passwordHash: 'test' }).returning().get())!;
+    await replaceMailboxShares(env, f.owner.id, f.box.id, [f.stranger.id, first.id, f.member.id, f.admin.id]);
+    const expectedGrantees = [first, f.admin, f.member, f.stranger].map((user) => user.username).sort();
+    expect(expectedGrantees[0]).toBe(first.username);
     let probe = counting();
     const owned = await listMailboxShares(probe.env, f.owner.id);
     expect(probe.trips()).toBe(1);
