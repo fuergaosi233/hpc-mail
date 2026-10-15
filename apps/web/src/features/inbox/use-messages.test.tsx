@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider, focusManager } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, focusManager, onlineManager } from '@tanstack/react-query';
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -41,6 +41,13 @@ let nextTimerId = -1;
 const tick = () => act(() => {
   [...pollTimers.values()].forEach((callback) => callback());
 });
+// 失败后的静默重试延迟（2.5 秒）同样接管，由 fireRetry() 手动推进
+const retryTimers = new Map<number, () => void>();
+const fireRetry = () => act(() => {
+  const callbacks = [...retryTimers.values()];
+  retryTimers.clear();
+  callbacks.forEach((callback) => callback());
+});
 /** 让已发出的请求与随后的缓存写入落定 */
 const settle = () => act(() => new Promise((resolve) => setTimeout(resolve, 20)));
 
@@ -56,13 +63,26 @@ beforeEach(() => {
   vi.spyOn(globalThis, 'clearInterval').mockImplementation(((id?: number) => {
     if (id === undefined || !pollTimers.delete(id)) realClearInterval(id);
   }) as typeof clearInterval);
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay?: number, ...args: unknown[]) => {
+    if (delay !== 2_500) return realSetTimeout(callback, delay, ...args);
+    const id = nextTimerId--;
+    retryTimers.set(id, callback);
+    return id;
+  }) as typeof setTimeout);
+  vi.spyOn(globalThis, 'clearTimeout').mockImplementation(((id?: number) => {
+    if (id === undefined || !retryTimers.delete(id)) realClearTimeout(id);
+  }) as typeof clearTimeout);
 });
 afterEach(() => {
   cleanup();
   clients.splice(0).forEach((client) => client.clear());
   vi.restoreAllMocks();
   pollTimers.clear();
+  retryTimers.clear();
   focusManager.setFocused(undefined);
+  onlineManager.setOnline(true);
   Object.values(api).forEach((mock) => mock.mockReset());
 });
 
@@ -209,20 +229,80 @@ describe('list polling via /messages/sync', () => {
     visibility.mockRestore();
   });
 
-  it('reports a failed sync and clears the error on the next successful round', async () => {
+  it('retries a single failed sync quietly after a short delay without overlapping the next round', async () => {
     api.list.mockResolvedValue(page([3], null, 'h1'));
-    api.sync.mockRejectedValueOnce(new Error('网络异常')).mockResolvedValue({ unread: 0, head: 'h1' });
+    api.sync.mockRejectedValueOnce(new Error('网络异常')).mockResolvedValue({ unread: 2, head: 'h1' });
     const client = createClient();
     const { result } = renderList(client);
     await waitFor(() => expect(result.current.data).toBeDefined());
 
     await tick();
+    await waitFor(() => expect(retryTimers.size).toBe(1));
+    expect(result.current.isError).toBe(false);
+    // 重试等待期间定时器到点：沿用 pending，不并发再发一次
+    await tick();
+    await settle();
+    expect(api.sync).toHaveBeenCalledTimes(1);
+
+    await fireRetry();
+    await waitFor(() => expect(client.getQueryData(queryKeys.messages.unreadCount)).toEqual({ unread: 2 }));
+    expect(api.sync).toHaveBeenCalledTimes(2);
+    expect(result.current.isError).toBe(false);
+  });
+
+  it('reports two consecutive failures and clears the error on the next successful round', async () => {
+    api.list.mockResolvedValue(page([3], null, 'h1'));
+    api.sync
+      .mockRejectedValueOnce(new Error('网络异常'))
+      .mockRejectedValueOnce(new Error('网络异常'))
+      .mockResolvedValue({ unread: 0, head: 'h1' });
+    const client = createClient();
+    const { result } = renderList(client);
+    await waitFor(() => expect(result.current.data).toBeDefined());
+
+    await tick();
+    await waitFor(() => expect(retryTimers.size).toBe(1));
+    await fireRetry();
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error?.message).toBe('网络异常');
     expect(result.current.data?.pages[0]?.items).toHaveLength(1);
 
     await tick();
     await waitFor(() => expect(result.current.isError).toBe(false));
+    expect(api.sync).toHaveBeenCalledTimes(3);
+  });
+
+  it('skips rounds while offline and checks once the connection is back', async () => {
+    api.list.mockResolvedValue(page([3], null, 'h1'));
+    api.sync.mockResolvedValue({ unread: 0, head: 'h1' });
+    const client = createClient();
+    const { result } = renderList(client);
+    await waitFor(() => expect(result.current.data).toBeDefined());
+
+    act(() => onlineManager.setOnline(false));
+    await tick();
+    await settle();
+    expect(api.sync).not.toHaveBeenCalled();
+    expect(result.current.isError).toBe(false);
+
+    act(() => onlineManager.setOnline(true));
+    await waitFor(() => expect(api.sync).toHaveBeenCalledTimes(1));
+  });
+
+  it('retries the head probe of a stale multi-page list the same way', async () => {
+    api.list.mockRejectedValueOnce(new Error('网络异常')).mockResolvedValue(page([4, 3], 'older', 'h2'));
+    const client = createClient();
+    client.setQueryData<MessageListData>(listKey, { pages: [page([3], 'older', 'h1'), page([2], null)], pageParams: ['', 'older'] });
+    await client.invalidateQueries({ queryKey: queryKeys.messages.lists, refetchType: 'none' });
+    const { result } = renderList(client);
+    await waitFor(() => expect(retryTimers.size).toBe(1));
+    expect(result.current.isError).toBe(false);
+
+    await fireRetry();
+    await waitFor(() => expect(ids(result.current.data)).toEqual([[4, 3], [2]]));
+    expect(api.list.mock.calls.map(([params]) => params.cursor)).toEqual([undefined, undefined]);
+    expect(api.sync).not.toHaveBeenCalled();
+    expect(result.current.isError).toBe(false);
   });
 
   it('probes the head once when a stale multi-page list mounts, then checks sync on focus', async () => {

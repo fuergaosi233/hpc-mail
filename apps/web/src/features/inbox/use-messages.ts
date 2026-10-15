@@ -8,6 +8,7 @@ import { messageListQueryOptions } from './message-queries';
 import { pauseUnreadCountPolling } from './use-unread-count';
 
 const POLL_INTERVAL_MS = 20_000;
+const RETRY_DELAY_MS = 2_500;
 type ListQuery = { state: { data?: MessageListData } };
 const singlePage = (query: ListQuery) => (query.state.data?.pages.length ?? 0) <= 1;
 const withoutData = (query: ListQuery) => query.state.data === undefined;
@@ -42,38 +43,61 @@ export function useMessagesQuery(query: Partial<ListMessagesQuery>) {
       const latest = queryClient.getQueryState(queryKey);
       return latest?.fetchStatus === 'idle' && latest.dataUpdatedAt === since && queryClient.isMutating() === 0;
     };
-    const check = async ({ probeOnly = false } = {}) => {
+    /** One round: sync, then refetch or merge the head when it changed. Throws when a request fails. */
+    const round = async (probeOnly: boolean) => {
       const state = queryClient.getQueryState<MessageListData>(queryKey);
-      if (pending || document.visibilityState === 'hidden' || !state?.data || state.fetchStatus !== 'idle') return;
-      pending = true;
+      if (!state?.data || state.fetchStatus !== 'idle') return;
       const since = state.dataUpdatedAt;
-      try {
-        if (!probeOnly) {
-          const unreadSince = queryClient.getQueryState(queryKeys.messages.unreadCount)?.dataUpdatedAt;
-          const sync = await messageApi.sync(latestQuery.current, controller.signal);
-          if (controller.signal.aborted) return;
-          setPollError(null);
-          if (!untouched(since)) return;
-          const unread = queryClient.getQueryState(queryKeys.messages.unreadCount);
-          if (unread?.dataUpdatedAt === unreadSince && unread?.fetchStatus !== 'fetching') {
-            queryClient.setQueryData(queryKeys.messages.unreadCount, { unread: sync.unread });
-          }
-          const latest = queryClient.getQueryState<MessageListData>(queryKey);
-          // A first page without head (persisted by an older build) or a failed refetch counts as changed.
-          if (!latest?.data || (latest.status !== 'error' && latest.data.pages[0]?.head === sync.head)) return;
-          if (latest.data.pages.length <= 1) {
-            await queryClient.refetchQueries({ queryKey, exact: true });
-            return;
-          }
-        }
-        // Multi-page lists fetch only the head page and merge it in place instead of refetching every cursor.
-        const head = await messageApi.list(latestQuery.current, controller.signal);
+      if (!probeOnly) {
+        const unreadSince = queryClient.getQueryState(queryKeys.messages.unreadCount)?.dataUpdatedAt;
+        const sync = await messageApi.sync(latestQuery.current, controller.signal);
         if (controller.signal.aborted) return;
         setPollError(null);
         if (!untouched(since)) return;
-        queryClient.setQueryData<MessageListData>(queryKey, (current) => current && mergeHeadPage(current, head));
-      } catch (pollFailure) {
-        if (!controller.signal.aborted) setPollError(pollFailure instanceof Error ? pollFailure : new Error('刷新邮件失败'));
+        const unread = queryClient.getQueryState(queryKeys.messages.unreadCount);
+        if (unread?.dataUpdatedAt === unreadSince && unread?.fetchStatus !== 'fetching') {
+          queryClient.setQueryData(queryKeys.messages.unreadCount, { unread: sync.unread });
+        }
+        const latest = queryClient.getQueryState<MessageListData>(queryKey);
+        // A first page without head (persisted by an older build) or a failed refetch counts as changed.
+        if (!latest?.data || (latest.status !== 'error' && latest.data.pages[0]?.head === sync.head)) return;
+        if (latest.data.pages.length <= 1) {
+          await queryClient.refetchQueries({ queryKey, exact: true });
+          return;
+        }
+      }
+      // Multi-page lists fetch only the head page and merge it in place instead of refetching every cursor.
+      const head = await messageApi.list(latestQuery.current, controller.signal);
+      if (controller.signal.aborted) return;
+      setPollError(null);
+      if (!untouched(since)) return;
+      queryClient.setQueryData<MessageListData>(queryKey, (current) => current && mergeHeadPage(current, head));
+    };
+    const skipped = () => document.visibilityState === 'hidden' || !onlineManager.isOnline();
+    const retryDelay = () =>
+      new Promise<void>((resolve) => {
+        const timeout = globalThis.setTimeout(resolve, RETRY_DELAY_MS);
+        controller.signal.addEventListener('abort', () => {
+          globalThis.clearTimeout(timeout);
+          resolve();
+        }, { once: true });
+      });
+    const check = async ({ probeOnly = false } = {}) => {
+      if (pending || skipped()) return;
+      // pending spans the retry as well, so neither the timer nor focus/online can start an overlapping round.
+      pending = true;
+      try {
+        await round(probeOnly);
+      } catch {
+        // A single failure (e.g. waking up before the network is back) retries once quietly; only two in a row
+        // surface as an error.
+        await retryDelay();
+        if (controller.signal.aborted || skipped()) return;
+        try {
+          await round(probeOnly);
+        } catch (pollFailure) {
+          if (!controller.signal.aborted) setPollError(pollFailure instanceof Error ? pollFailure : new Error('刷新邮件失败'));
+        }
       } finally {
         pending = false;
       }
