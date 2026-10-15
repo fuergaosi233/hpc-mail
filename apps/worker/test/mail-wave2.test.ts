@@ -237,11 +237,13 @@ describe('全部已读按筛选执行', () => {
     const user = await account('w2-list-plan');
     await own(user.id, `w2-list-plan-${rand()}@hpc.email`);
     const viewer = { userId: user.id, role: 'user' as const };
-    // 默认视图不带 domain 时按地址索引取数，带 domain 回到原计划（逐地址回表判断 domain 读取量反而更大）
-    const views: [Parameters<typeof listMessages>[1], Partial<ListMessagesQuery>, boolean][] = [
-      [viewer, {}, true], [viewer, { direction: 'inbound' }, true], [viewer, { q: 'x' }, false], [viewer, { unread: true }, true],
-      [viewer, { trash: true }, false], [viewer, { direction: 'outbound' }, true],
-      [{ userId: admin.id, role: 'admin', scope: 'user', targetUserId: user.id }, {}, false],
+    // 默认视图不带 domain 时按地址索引取数（带方向/未读筛选的走 idx_messages_visible），
+    // 带 domain 回到原计划（逐地址回表判断 domain 读取量反而更大）
+    const views: [Parameters<typeof listMessages>[1], Partial<ListMessagesQuery>, string | null][] = [
+      [viewer, {}, 'idx_messages_address_deleted_id'], [viewer, { direction: 'inbound' }, 'idx_messages_visible'],
+      [viewer, { q: 'x' }, null], [viewer, { unread: true }, 'idx_messages_visible'],
+      [viewer, { trash: true }, null], [viewer, { direction: 'outbound' }, 'idx_messages_visible'],
+      [{ userId: admin.id, role: 'admin', scope: 'user', targetUserId: user.id }, {}, null],
     ];
     for (const [who, query, byAddress] of views) {
       const list = (extra: Partial<ListMessagesQuery>) => lastPlan('select', (db) =>
@@ -250,7 +252,7 @@ describe('全部已读按筛选执行', () => {
       expect(withDomain, JSON.stringify(query)).not.toContain('idx_messages_domain');
       if (byAddress) {
         const plain = await list({});
-        expect(plain, JSON.stringify(query)).toContain('idx_messages_address_deleted_id');
+        expect(plain, JSON.stringify(query)).toContain(`SEARCH messages USING INDEX ${byAddress} (address=?`);
         expect(plain, JSON.stringify(query)).not.toContain('idx_messages_live');
       } else {
         expect(withDomain, JSON.stringify(query)).toBe(await list({}));

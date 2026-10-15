@@ -14,7 +14,7 @@ import {
  * D1 没有 STAT4，规划器按固定启发式选索引，与数据量无关；小数据上的计划就是线上计划。
  * 截获服务层经 env.db 发出的每条语句及其绑定参数，逐条取 EXPLAIN QUERY PLAN。
  */
-async function capturePlans(run: (e: typeof env) => Promise<unknown>): Promise<{ sql: string; plan: string }[]> {
+async function capturePlans(run: (e: typeof env) => Promise<unknown>): Promise<{ sql: string; plan: string; rowsRead: number }[]> {
   const statements: { sql: string; params: unknown[] }[] = [];
   const db = new Proxy(env.db, {
     get(target, property) {
@@ -33,17 +33,19 @@ async function capturePlans(run: (e: typeof env) => Promise<unknown>): Promise<{
     },
   });
   await run({ ...env, db } as typeof env);
-  const out: { sql: string; plan: string }[] = [];
+  const out: { sql: string; plan: string; rowsRead: number }[] = [];
   for (const statement of statements) {
     if (!/^select\b/i.test(statement.sql.trim())) continue;
     const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${statement.sql}`).bind(...statement.params).all<{ detail: string }>();
-    out.push({ sql: statement.sql, plan: plan.results.map((row) => row.detail).join(' | ') });
+    // 只读语句，重放一次取 D1 的 rows_read
+    const replay = await env.db.prepare(statement.sql).bind(...statement.params).all();
+    out.push({ sql: statement.sql, plan: plan.results.map((row) => row.detail).join(' | '), rowsRead: replay.meta.rows_read });
   }
   return out;
 }
 
 /** 只看读 messages 的语句 */
-const onMessages = (plans: { sql: string; plan: string }[]) => plans.filter((p) => /from "messages"|FROM messages\b/.test(p.sql));
+const onMessages = <T extends { sql: string }>(plans: T[]) => plans.filter((p) => /from "messages"|FROM messages\b/.test(p.sql));
 
 /**
  * 对 messages 的全表扫描（SCAN messages …）与沿 idx_messages_live 只按 deleted_at 倒扫全站未删除邮件，
@@ -96,32 +98,42 @@ beforeAll(async () => {
   ]);
 });
 
+/** idx_messages_visible 四列全部等值：每个（地址, 方向, 已读）区间按 rowid 即 id 有序，取够 LIMIT 即停 */
+const VISIBLE_FULL_PREFIX = 'SEARCH messages USING INDEX idx_messages_visible (address=? AND deleted_at=? AND direction=? AND is_read=?';
+const BY_ADDRESS = 'SEARCH messages USING INDEX idx_messages_address_deleted_id (address=?';
+
 describe('执行计划回归：默认视图按地址取数', () => {
-  const views: [string, Partial<ListMessagesQuery>][] = [
-    ['全部', {}], ['收件', { direction: 'inbound' }], ['已发送', { direction: 'outbound' }], ['未读', { unread: true }],
-    ['翻页', { cursor: encodeCursor(1_000_000) }], ['增量', { afterId: 1 }], ['按地址', { address: 'owner@explain.test' }],
+  // 没有方向/未读筛选的走 address_deleted_id；带方向或未读筛选的走 visible 并补齐等值前缀
+  const views: [string, Partial<ListMessagesQuery>, string][] = [
+    ['全部', {}, BY_ADDRESS], ['翻页', { cursor: encodeCursor(1_000_000) }, BY_ADDRESS], ['增量', { afterId: 1 }, BY_ADDRESS],
+    ['按地址', { address: 'owner@explain.test' }, BY_ADDRESS],
+    ['收件', { direction: 'inbound' }, VISIBLE_FULL_PREFIX], ['已发送', { direction: 'outbound' }, VISIBLE_FULL_PREFIX],
+    ['未读', { unread: true }, VISIBLE_FULL_PREFIX], ['收件未读', { direction: 'inbound', unread: true }, VISIBLE_FULL_PREFIX],
+    ['收件翻页', { direction: 'inbound', cursor: encodeCursor(1_000_000) }, VISIBLE_FULL_PREFIX],
+    ['按地址已发送', { address: 'owner@explain.test', direction: 'outbound' }, VISIBLE_FULL_PREFIX],
   ];
 
   it.each([['稀疏用户', () => sparse], ['管理员', () => admin], ['管理员 scope=mine', () => ({ ...admin, scope: 'mine' as const })]])(
-    '%s：全部/收件/已发送/未读/翻页/按地址走 idx_messages_address_deleted_id，不倒扫全站',
+    '%s：全部/翻页/按地址走 idx_messages_address_deleted_id，收件/已发送/未读走 idx_messages_visible 全等值前缀，不倒扫全站',
     async (_label, who) => {
-      for (const [label, query] of views) {
+      for (const [label, query, expected] of views) {
         const [page] = onMessages(await capturePlans((e) => listMessages(e, who(), q(query))));
-        expect(page!.sql, label).toContain('INDEXED BY idx_messages_address_deleted_id');
-        expect(page!.plan, label).toContain('SEARCH messages USING INDEX idx_messages_address_deleted_id (address=?');
+        expect(page!.plan, label).toContain(expected);
         expectNoFullScan(page!.plan, label);
       }
     },
   );
 
   it('sync：未读数与首页同计划，首页与列表同一条语句', async () => {
-    const plans = onMessages(await capturePlans((e) => syncMessages(e, sparse, q())));
-    expect(plans).toHaveLength(2);
-    expect(plans[0]!.plan).toContain('idx_messages_visible');
-    expect(plans[1]!.plan).toContain('idx_messages_address_deleted_id');
-    for (const p of plans) expectNoFullScan(p.plan, p.sql);
-    const [listed] = onMessages(await capturePlans((e) => listMessages(e, sparse, q())));
-    expect(plans[1]!.sql).toBe(listed!.sql);
+    for (const query of [{}, { direction: 'inbound' as const }]) {
+      const plans = onMessages(await capturePlans((e) => syncMessages(e, sparse, q(query))));
+      expect(plans).toHaveLength(2);
+      expect(plans[0]!.plan).toContain('idx_messages_visible');
+      expect(plans[1]!.plan).toContain(query.direction ? VISIBLE_FULL_PREFIX : BY_ADDRESS);
+      for (const p of plans) expectNoFullScan(p.plan, p.sql);
+      const [listed] = onMessages(await capturePlans((e) => listMessages(e, sparse, q(query))));
+      expect(plans[1]!.sql).toBe(listed!.sql);
+    }
   });
 
   it('domain/星标/搜索/回收站/未认领/审计他人邮箱保持原计划（不加 INDEXED BY）', async () => {
@@ -168,6 +180,44 @@ describe('执行计划回归：默认视图按地址取数', () => {
       const [list] = await capturePlans((e) => listMailboxes(e, opts));
       expect(list!.plan).toMatch(/CORRELATED SCALAR SUBQUERY \d+ \| SEARCH messages USING COVERING INDEX \w+ \(address=\?\)/);
       expectNoFullScan(list!.plan, JSON.stringify(opts));
+    }
+  });
+});
+
+describe('执行计划回归：主人邮件很多、匹配很少', () => {
+  /** 先插少量匹配（id 较小），再插大量不匹配的新邮件：按 id 倒序逐封回表判断要扫过全部新邮件 */
+  async function seedOwner(username: string, address: string, few: string, bulk: string) {
+    const [user] = await createDb(env).insert(users)
+      .values({ username, passwordHash: 'x', role: 'admin', authVersionMigrated: true }).returning({ id: users.id });
+    await createDb(env).insert(mailboxes).values({ address, domain: 'heavy.test', userId: user!.id });
+    for (const [rows, count] of [[few, 1], [bulk, 2000]] as const) {
+      await env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+        INSERT INTO messages (direction, is_read, address, domain, from_address, subject, preview, status)
+        SELECT v.direction, v.is_read, ?, 'heavy.test', 'f@example.net', 's', 'p', 'received'
+        FROM n, (${rows}) v`).bind(count, address).run();
+    }
+    return { userId: user!.id, role: 'admin' as const };
+  }
+
+  it('收件/未读/已发送只读几十行（改用 address_deleted_id 时要逐封回表，读取量随主人邮件量线性增长）', async () => {
+    // reader：2000 封已读收件 + 3 封未读、2 封已发送；sender：2000 封已发送 + 2 封收件
+    const reader = await seedOwner('heavy-reader', 'reader@heavy.test',
+      "SELECT 'inbound' direction, 0 is_read UNION ALL SELECT 'inbound', 0 UNION ALL SELECT 'inbound', 0 UNION ALL SELECT 'outbound', 1 UNION ALL SELECT 'outbound', 1",
+      "SELECT 'inbound' direction, 1 is_read");
+    const sender = await seedOwner('heavy-sender', 'sender@heavy.test',
+      "SELECT 'inbound' direction, 0 is_read UNION ALL SELECT 'inbound', 1", "SELECT 'outbound' direction, 1 is_read");
+    const cases: [Viewer, Partial<ListMessagesQuery>, number][] = [
+      [reader, { direction: 'inbound', unread: true }, 3], [reader, { unread: true }, 3], [reader, { direction: 'outbound' }, 2],
+      [sender, { direction: 'inbound' }, 2], [sender, { unread: true }, 1],
+    ];
+    for (const [who, query, expected] of cases) {
+      const label = `${who === reader ? 'reader' : 'sender'} ${JSON.stringify(query)}`;
+      let page: Awaited<ReturnType<typeof listMessages>> | undefined;
+      const [statement] = onMessages(await capturePlans(async (e) => { page = await listMessages(e, who, q(query)); }));
+      expect(page!.items.map((item) => item.id), label).toEqual((await legacyPage(who, q(query), null)).ids);
+      expect(page!.items, label).toHaveLength(expected);
+      expect(statement!.plan, label).toContain(VISIBLE_FULL_PREFIX);
+      expect(statement!.rowsRead, label).toBeLessThan(100);
     }
   });
 });
