@@ -20,12 +20,13 @@ export const CLEANUP_JOBS_SQL = `SELECT storage_cleanup_jobs.r2_key AS r2_key,
     ${referencedSql('storage_cleanup_jobs.r2_key')} AS referenced
   FROM storage_cleanup_jobs LIMIT ?`;
 
+interface CleanupJobRow { r2_key: string; leased: number; referenced: number }
+
 /** Retained delivery links and other live messages always keep their shared objects. */
 export async function processStorageCleanup(env: Env, limit = 100): Promise<number> {
-  let jobs: { r2_key: string; leased: number; referenced: number }[];
-  try {
-    jobs = (await env.db.prepare(CLEANUP_JOBS_SQL).bind(Date.now(), limit).all<{ r2_key: string; leased: number; referenced: number }>()).results;
-  } catch (error) { console.error('R2 cleanup query deferred:', error); return 0; }
+  let jobs: CleanupJobRow[];
+  try { jobs = (await env.db.prepare(CLEANUP_JOBS_SQL).bind(Date.now(), limit).all<CleanupJobRow>()).results; }
+  catch (error) { console.error('R2 cleanup query deferred:', error); return 0; }
   // 投递中的租约未释放前保留台账，等租约结束后再判断。
   const open = jobs.filter((job) => !job.leased);
   const orphaned = open.filter((job) => !job.referenced).map((job) => job.r2_key);
