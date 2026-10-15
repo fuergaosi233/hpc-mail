@@ -8,7 +8,7 @@ import { adminAuditLogs, mailboxShares, mailboxes, messageTranslations, messages
 import { signToken } from '../src/lib/jwt.js';
 import { bumpCounter, dayWindow, minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
-import { getSettings, invalidateSettingsCache, invalidateSettingsMemory, isTranslationReady, updateSettings } from '../src/services/setting.js';
+import { getSettings, getSettingsFresh, invalidateSettingsCache, invalidateSettingsMemory, isTranslationReady, updateSettings } from '../src/services/setting.js';
 import { AiProviderError } from '../src/services/ai-provider.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_PER_MINUTE, TRANSLATE_REQUESTS_SCOPE, translateSegments } from '../src/services/translate.js';
 
@@ -489,15 +489,16 @@ describe('AI 模型与翻译设置', () => {
     expect(audits.find((row) => row.detail.includes('deepseek-flash→deepseek-pro'))?.detail).not.toContain('apiKey');
   });
 
-  it('旧版设置缓存缺少 ai_model/translation 时回落默认值', async () => {
+  it('旧版 KV 设置缓存（缺少 ai_model/translation）不再被读取，以 D1 为准', async () => {
     const { translation: _translation, ai_model: _aiModel, ...legacy } = DEFAULT_SETTINGS;
     invalidateSettingsMemory();
-    await env.kv.put('setting-cache', JSON.stringify(legacy));
+    await env.kv.put('setting-cache', JSON.stringify({ ...legacy, site: { ...legacy.site, title: 'Legacy KV Title' } }));
     try {
       const settings = await getSettings(env);
-      expect(settings.translation).toEqual(DEFAULT_SETTINGS.translation);
-      expect(settings.ai_model).toEqual(DEFAULT_SETTINGS.ai_model);
+      expect(settings).toEqual(await getSettingsFresh(env));
+      expect(settings.site.title).not.toBe('Legacy KV Title');
     } finally {
+      await env.kv.delete('setting-cache');
       await invalidateSettingsCache(env);
     }
   });

@@ -2,17 +2,33 @@ import { and, eq, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { sessions, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
-import type { Env } from '../types.js';
+import type { Env, ExecCtx } from '../types.js';
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 const sessKey = (sid: string) => `sess:${sid}`;
 const uepochKey = (userId: number) => `uepoch:${userId}`;
 const INSTANCE_EPOCH_KEY = 'instance_epoch';
 
+/**
+ * KV 兼容镜像（KV 不是鉴权真源）：有 ctx 时交给 waitUntil，不阻塞响应；无 ctx（单测直调）时 await。
+ * 失败都只记日志，不影响主流程。
+ */
+async function mirrorToKv(ctx: ExecCtx | null | undefined, label: string, task: () => Promise<unknown>): Promise<void> {
+  const guarded = (async () => {
+    try {
+      await task();
+    } catch (e) {
+      console.error(label, e);
+    }
+  })();
+  if (ctx) ctx.waitUntil(guarded);
+  else await guarded;
+}
+
 /** 创建会话：D1 是鉴权真源；KV 过渡期双写，确保回滚旧 Worker 时新会话仍可用。 */
 export async function createSession(env: Env, userId: number, verified?: {
   authVersion: number; passwordHash: string; totpEnabledAt?: Date | null; totpSecret?: string | null;
-}): Promise<string> {
+}, ctx?: ExecCtx | null): Promise<string> {
   const sid = crypto.randomUUID();
   const now = Date.now();
   const db = createDb(env);
@@ -28,13 +44,9 @@ export async function createSession(env: Env, userId: number, verified?: {
   } else {
     await db.insert(sessions).values({ id: sid, userId, createdAt: new Date(now), expiresAt: new Date(now + SESSION_TTL_SECONDS * 1000) });
   }
-  try {
-    await env.kv.put(sessKey(sid), JSON.stringify({ userId, createdAt: now }), {
-      expirationTtl: SESSION_TTL_SECONDS,
-    });
-  } catch (e) {
-    console.error('会话 KV 兼容写入失败:', e);
-  }
+  await mirrorToKv(ctx, '会话 KV 兼容写入失败:', () => env.kv.put(sessKey(sid), JSON.stringify({ userId, createdAt: now }), {
+    expirationTtl: SESSION_TTL_SECONDS,
+  }));
   return sid;
 }
 
@@ -48,14 +60,10 @@ export async function sessionValidFor(env: Env, sid: string, userId: number): Pr
   return !!row && row.userId === userId && row.revokedAt === null && row.expiresAt.getTime() > Date.now();
 }
 
-export async function destroySession(env: Env, sid: string): Promise<void> {
+export async function destroySession(env: Env, sid: string, ctx?: ExecCtx | null): Promise<void> {
   const db = createDb(env);
   await db.update(sessions).set({ revokedAt: new Date() }).where(eq(sessions.id, sid));
-  try {
-    await env.kv.delete(sessKey(sid));
-  } catch (e) {
-    console.error('会话 KV 兼容删除失败:', e);
-  }
+  await mirrorToKv(ctx, '会话 KV 兼容删除失败:', () => env.kv.delete(sessKey(sid)));
 }
 
 /** 用户代：D1 强一致；缺省视为 0。 */
@@ -83,7 +91,7 @@ export async function getUserEpoch(env: Env, userId: number): Promise<number> {
   return current?.version ?? 0;
 }
 
-export async function bumpUserEpoch(env: Env, userId: number): Promise<number> {
+export async function bumpUserEpoch(env: Env, userId: number, ctx?: ExecCtx | null): Promise<number> {
   const db = createDb(env);
   const updated = await db
     .update(users)
@@ -92,13 +100,13 @@ export async function bumpUserEpoch(env: Env, userId: number): Promise<number> {
     .returning({ authVersion: users.authVersion })
     .get();
   const next = updated?.authVersion ?? ((Number(await env.kv.get(uepochKey(userId))) || 0) + 1);
-  await mirrorUserEpoch(env, userId, next);
+  await mirrorUserEpoch(env, userId, next, ctx);
   return next;
 }
 
-export async function mirrorUserEpoch(env: Env, userId: number, next: number): Promise<void> {
-  try { await env.kv.put(uepochKey(userId), String(next)); }
-  catch (e) { console.error('用户鉴权版本 KV 兼容写入失败:', e); }
+/** 用户鉴权版本的 KV 兼容镜像（D1 是真源） */
+export async function mirrorUserEpoch(env: Env, userId: number, next: number, ctx?: ExecCtx | null): Promise<void> {
+  await mirrorToKv(ctx, '用户鉴权版本 KV 兼容写入失败:', () => env.kv.put(uepochKey(userId), String(next)));
 }
 
 /** 实例代（清库全员下线）；缺省视为 0 */

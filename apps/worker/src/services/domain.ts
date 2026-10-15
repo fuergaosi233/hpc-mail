@@ -4,7 +4,7 @@ import { chunk } from '../lib/d1.js';
 import { createDb } from '../db/client.js';
 import { mailboxes } from '../db/schema.js';
 import type { Env } from '../types.js';
-import { getSettings, getSettingsFresh } from './setting.js';
+import { getSettings } from './setting.js';
 import { loadMailboxPolicyUser, resolveMailboxPolicy } from './mailbox-policy.js';
 
 /**
@@ -29,14 +29,21 @@ export async function getPublicDomains(env: Env, settings?: Settings): Promise<s
   return s.domains.list.filter((e) => e.public).map((e) => e.domain);
 }
 
-/** 当前用户可以新增认领的域名；用户专属配置与认领校验使用同一解析器。 */
+/**
+ * 当前用户可以新增认领的域名；用户专属配置与认领校验使用同一解析器。
+ * 仅供展示（/api/domains、/v1/domains）：未传 settings 时走 isolate 缓存（其他 isolate 最长 15s 陈旧），
+ * 与用户策略并行读取；认领校验在 mailbox.ts 另行直读 D1，不依赖这里的结果。
+ */
 export async function getVisibleDomains(
   env: Env,
   userId: number,
   settings?: Settings,
 ): Promise<string[]> {
-  const user = await loadMailboxPolicyUser(createDb(env), userId);
-  return resolveMailboxPolicy(settings ?? await getSettingsFresh(env), user).domains.map(({ domain }) => domain);
+  const [user, resolved] = await Promise.all([
+    loadMailboxPolicyUser(createDb(env), userId),
+    settings ?? getSettings(env),
+  ]);
+  return resolveMailboxPolicy(resolved, user).domains.map(({ domain }) => domain);
 }
 
 /** 域名是否对普通用户公开。 */
