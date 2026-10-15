@@ -175,10 +175,24 @@ describe('claimList', () => {
       claimed: [], remaining: [d('one')], stoppedBy: null,
     });
     const quota = vi.fn().mockRejectedValue(new ApiError('认领地址数已达上限（1）', { code: 'forbidden', httpStatus: 403 }));
-    expect(await claimList([d('one')], { claim: quota, batchClaim })).toEqual({
-      claimed: [], remaining: [d('one')], stoppedBy: '认领地址数已达上限（1）',
-    });
+    const rejected = await claimList([d('one')], { claim: quota, batchClaim });
+    expect(rejected).toEqual({ claimed: [], remaining: [d('one')], stoppedBy: '认领地址数已达上限（1）' });
+    expect(rejected.uncertain).toBeUndefined();
     expect(batchClaim).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['网络错误', new ApiError('网络连接失败', { code: 'network' }), '网络连接失败'],
+    ['超时', new ApiError('请求超时', { code: 'timeout' }), '请求超时'],
+    ['服务端异常 5xx', new ApiError('服务器内部错误', { code: 'internal', httpStatus: 502 }), '服务器内部错误'],
+  ])('单个认领结果未知（%s）：与批量同一规则，标记可能已认领并提示以邮箱列表为准', async (_name, error, message) => {
+    const claim = vi.fn().mockRejectedValue(error);
+    expect(await claimList([d('one')], { claim, batchClaim: batch({}) })).toEqual({
+      claimed: [],
+      remaining: [d('one')],
+      stoppedBy: `${message}。该地址可能已认领，请以邮箱列表为准`,
+      uncertain: true,
+    });
   });
 });
 

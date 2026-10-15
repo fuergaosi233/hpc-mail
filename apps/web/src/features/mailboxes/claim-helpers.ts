@@ -83,12 +83,22 @@ export interface ClaimListResult {
   remaining: AddressDraft[];
   /** 中途因配额、权限、网络等停止时的原因；仅「被占用」导致的未认领不算 */
   stoppedBy: string | null;
-  /** 批量请求整单失败且结果未知（网络中断、服务端异常）：后端逐个提交，失败前可能已认领了一部分 */
+  /** 认领请求失败且结果未知（网络中断、超时、服务端异常）：后端可能已经提交，地址可能已认领 */
   uncertain?: true;
 }
 
 const draftKey = (draft: AddressDraft) => `${draft.localPart}@${draft.domain}`;
 const failureText = (error: unknown) => (error instanceof ApiError ? error.message : '认领失败，请重试');
+
+/**
+ * 认领请求失败：4xx 是请求在处理前就被拒绝（校验、鉴权、配额、限流），确定一个都没认领；
+ * 网络中断、超时或服务端异常时结果未知，后端可能已经提交，标为 uncertain 让调用方以邮箱列表为准。
+ */
+function claimFailure(items: AddressDraft[], error: unknown, hint: string): ClaimListResult {
+  const rejected = error instanceof ApiError && error.httpStatus !== null && error.httpStatus >= 400 && error.httpStatus < 500;
+  if (rejected) return { claimed: [], remaining: items, stoppedBy: failureText(error) };
+  return { claimed: [], remaining: items, stoppedBy: `${failureText(error)}。${hint}`, uncertain: true };
+}
 
 /** 批量认领结果映射回 ClaimListResult：被占用的与没尝试的按用户给出的顺序合并 */
 export function fromBatchResult(drafts: AddressDraft[], result: BatchClaimMailboxResult): ClaimListResult {
@@ -123,23 +133,15 @@ export async function claimList(
       const created = await api.claim(draft);
       return { claimed: [created?.address ?? draftKey(draft)], remaining: [], stoppedBy: null };
     } catch (error) {
-      const taken = error instanceof ApiError && error.code === 'address_taken';
-      return { claimed: [], remaining: [draft], stoppedBy: taken ? null : failureText(error) };
+      if (error instanceof ApiError && error.code === 'address_taken') return { claimed: [], remaining: [draft], stoppedBy: null };
+      return claimFailure([draft], error, '该地址可能已认领，请以邮箱列表为准');
     }
   }
   try {
     return fromBatchResult(items, await api.batchClaim(items));
   } catch (error) {
-    // 4xx 是请求在处理前就被拒绝（校验、鉴权、限流）：一个都没认领。
-    // 网络中断或服务端异常时结果未知：后端逐个提交，失败前认领的那部分已经生效
-    const rejected = error instanceof ApiError && error.httpStatus !== null && error.httpStatus >= 400 && error.httpStatus < 500;
-    if (rejected) return { claimed: [], remaining: items, stoppedBy: failureText(error) };
-    return {
-      claimed: [],
-      remaining: items,
-      stoppedBy: `${failureText(error)}。部分地址可能已认领，请以邮箱列表为准`,
-      uncertain: true,
-    };
+    // 后端逐个提交：结果未知时，失败前认领的那部分已经生效
+    return claimFailure(items, error, '部分地址可能已认领，请以邮箱列表为准');
   }
 }
 
