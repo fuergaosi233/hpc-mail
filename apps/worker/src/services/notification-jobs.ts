@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNotNull, lt, lte, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, lt, lte, sql } from 'drizzle-orm';
 import { normalizeEmail, getEmailDomain } from '../lib/email-address.js';
 import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
 import { chunk, d1Statement } from '../lib/d1.js';
@@ -207,32 +207,22 @@ export async function processNotificationJobs(
   }
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 8)));
   const concurrency = Math.max(1, Math.min(4, Math.floor(options.concurrency ?? 4)));
-  const candidateQuery = db.select({ id: notificationJobs.id }).from(notificationJobs).where(and(
+  // 过期租约标记与候选查询同一往返
+  const [, candidates] = await db.batch([expireStale, db.select({ id: notificationJobs.id }).from(notificationJobs).where(and(
     eq(notificationJobs.status, 'pending'), lte(notificationJobs.nextAttemptAt, now),
     inArray(notificationJobs.channel, [...MAIL_CHANNELS]),
     options.jobIds ? inArray(notificationJobs.id, options.jobIds.slice(0, 90)) : undefined,
-  )).orderBy(asc(notificationJobs.nextAttemptAt), asc(notificationJobs.id)).limit(limit);
-  const claim = (where: SQL | undefined) => db.update(notificationJobs).set({
-    status: 'processing', attempts: sql`${notificationJobs.attempts} + 1`,
-    lastAttemptAt: new Date(), updatedAt: new Date(),
-  }).where(and(where, eq(notificationJobs.status, 'pending'), lte(notificationJobs.nextAttemptAt, now))).returning();
-  // 指定任务（刚入队或手动重试）：过期租约标记与原子认领同一往返，省掉先查候选再逐条认领。
-  // cron 扫描仍逐条认领：候选多时只锁正在处理的那条，租约从真正开始投递时起算。
-  let prefetched: Job[] | undefined;
-  let candidates: { id: number }[];
-  if (options.jobIds) {
-    const [, claimedRows] = await db.batch([expireStale, claim(inArray(notificationJobs.id, candidateQuery))]);
-    prefetched = claimedRows.sort((a, b) => a.nextAttemptAt.getTime() - b.nextAttemptAt.getTime() || a.id - b.id);
-    candidates = prefetched;
-  } else {
-    // 过期租约标记与候选查询同一往返
-    [, candidates] = await db.batch([expireStale, candidateQuery]);
-  }
+  )).orderBy(asc(notificationJobs.nextAttemptAt), asc(notificationJobs.id)).limit(limit)]);
   let index = 0;
   const workers = await Promise.allSettled(Array.from({ length: Math.min(concurrency, candidates.length) }, async () => {
     while (index < candidates.length) {
-      const at = index++;
-      const claimed = prefetched ? prefetched[at] : await claim(eq(notificationJobs.id, candidates[at]!.id)).get();
+      const candidate = candidates[index++]!;
+      // 逐条认领：轮到投递时才转为 processing，waitUntil 被截断时未开始的任务仍是 pending，由 cron 接着投递
+      const claimed = await db.update(notificationJobs).set({
+        status: 'processing', attempts: sql`${notificationJobs.attempts} + 1`,
+        lastAttemptAt: new Date(), updatedAt: new Date(),
+      }).where(and(eq(notificationJobs.id, candidate.id), eq(notificationJobs.status, 'pending'),
+        lte(notificationJobs.nextAttemptAt, now))).returning().get();
       if (!claimed) continue;
       result.processed += 1;
       let status: DeliveryStatus = 'succeeded';

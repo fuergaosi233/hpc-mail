@@ -1,6 +1,6 @@
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { SECRET_MASK } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
@@ -195,6 +195,60 @@ describe('持久通知队列', () => {
     await processNotificationJobs(env, { jobIds: ids });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect((await db.select().from(notificationJobs).where(eq(notificationJobs.userId, id))).some(job => job.status === 'unknown')).toBe(true);
+  });
+
+  it('指定任务逐条认领：投递进行中只有正在发送的任务是 processing，其余仍为 pending', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let started = 0;
+    let allStarted!: () => void;
+    const fourStarted = new Promise<void>((resolve) => { allStarted = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      if (++started === 4) allStarted();
+      await gate;
+      return Response.json({ ok: true });
+    }));
+    const ids: number[] = [];
+    for (let i = 0; i < 8; i++) {
+      const id = await seed(`notify-claim-each-${i}`);
+      await updateUserNotifyPrefs(env, id, { webhook });
+      ids.push(...await enqueueMailNotifications(env, null, mail(500 + i, [id])));
+    }
+    expect(ids).toHaveLength(8);
+    const run = processNotificationJobs(env, { jobIds: ids, concurrency: 4 });
+    await fourStarted;
+    // 此刻若 waitUntil 被截断，未开始的任务必须仍是 pending，cron 才会接着投递
+    const states = await createDb(env).select({ status: notificationJobs.status }).from(notificationJobs).where(inArray(notificationJobs.id, ids)).all();
+    const tally = states.reduce<Record<string, number>>((acc, { status }) => ({ ...acc, [status]: (acc[status] ?? 0) + 1 }), {});
+    release();
+    expect(await run).toMatchObject({ processed: 8, succeeded: 8 });
+    expect(tally).toEqual({ processing: 4, pending: 4 });
+  });
+
+  it('jobIds 达到 90 个时每条语句的绑定参数不超过 D1 的 100 上限', async () => {
+    const id = await seed('notify-bind-limit');
+    await updateUserNotifyPrefs(env, id, { pushdeer: pd, webhook });
+    const real = await enqueueMailNotifications(env, null, mail(601, [id]));
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ code: 0 })));
+    const jobIds = [...real, ...Array.from({ length: 90 - real.length }, (_, i) => 9_000_000 + i)];
+    // 记录真正绑定到 D1 的参数个数（drizzle 每条语句都经 prepare → bind）
+    const bound: { sql: string; params: number }[] = [];
+    const db = new Proxy(env.db, { get(target, property) {
+      if (property === 'prepare') return (query: string) => {
+        const statement = target.prepare(query);
+        return new Proxy(statement, { get(inner, key) {
+          if (key === 'bind') return (...params: unknown[]) => { bound.push({ sql: query, params: params.length }); return inner.bind(...params); };
+          const value = Reflect.get(inner, key);
+          return typeof value === 'function' ? value.bind(inner) : value;
+        } });
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    expect(await processNotificationJobs({ ...env, db } as never, { jobIds })).toMatchObject({ processed: 2, succeeded: 2 });
+    expect(Math.max(...bound.map((item) => item.params))).toBeGreaterThanOrEqual(90);
+    expect(bound.filter((item) => item.params > 100)).toEqual([]);
   });
 
   it('过期 processing 标为 unknown，不自动重复投递', async () => {

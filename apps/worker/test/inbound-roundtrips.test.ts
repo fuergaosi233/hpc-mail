@@ -2,11 +2,13 @@ import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:
 import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../src/db/client.js';
-import { attachments, mailboxes, messages, notificationJobs, users } from '../src/db/schema.js';
+import { attachments, mailboxes, messages, notificationJobs, storageCleanupJobs, users } from '../src/db/schema.js';
 import { htmlToText } from '../src/lib/text.js';
 import { handleInbound } from '../src/services/inbound.js';
+import { purgeMatchingMessages } from '../src/services/message-lifecycle.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { getSettings, updateSettings } from '../src/services/setting.js';
+import { processStorageCleanup } from '../src/services/storage-cleanup.js';
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -84,7 +86,7 @@ async function settingsFor(patch: Parameters<typeof updateSettings>[1]) {
 }
 
 describe('收件链路 Ack 前往返', () => {
-  it('普通信 Ack 前最多 2 层串行 D1，原文写 R2 与第一层 D1 重叠；即时投递认领合批', async () => {
+  it('普通信 Ack 前最多 2 层串行 D1，原文写 R2 与第一层 D1 重叠；即时投递逐条认领', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ok: true })));
     await settingsFor({ code_extract: { enabled: true, aiEnabled: false } });
     const owner = await seedOwner('rt-plain');
@@ -97,8 +99,8 @@ describe('收件链路 Ack 前往返', () => {
     expect(ack.calls).toBe(2);
     expect(probe.state.rawPutWhileD1Busy).toBe(true);
     await waitOnExecutionContext(ctx);
-    // waitUntil：入队一个 batch、过期标记与认领一个 batch、结果回写一次
-    expect(probe.calls() - ack.calls).toBe(3);
+    // waitUntil：入队一个 batch、过期标记与候选查询一个 batch、逐条认领一次、结果回写一次
+    expect(probe.calls() - ack.calls).toBe(4);
     const row = await createDb(env).select().from(messages).where(eq(messages.address, owner.address)).get();
     expect(row).toMatchObject({ status: 'received', verificationCode: '482913' });
     const jobs = await createDb(env).select().from(notificationJobs).where(eq(notificationJobs.messageId, row!.id)).all();
@@ -178,9 +180,64 @@ describe('收件链路 Ack 前往返', () => {
     await handleInbound(incoming(owner.address, raw, forward), probe.env as never, ctx);
     expect(probe.ack()).toEqual({ layers: 1, calls: 1 });
     await waitOnExecutionContext(ctx);
-    expect(probe.calls()).toBe(1);
+    // waitUntil 里只有覆盖写落定后的台账补登；对象仍被这封信引用，不登记
+    expect(probe.calls()).toBe(2);
+    expect(probe.sqls[1]).toContain('INSERT OR IGNORE INTO storage_cleanup_jobs');
     expect(forward).toHaveBeenCalledOnce();
-    expect(await createDb(env).select().from(messages).where(eq(messages.address, owner.address)).all()).toHaveLength(1);
+    const rows = await createDb(env).select().from(messages).where(eq(messages.address, owner.address)).all();
+    expect(rows).toHaveLength(1);
+    expect(await createDb(env).select().from(storageCleanupJobs).where(eq(storageCleanupJobs.r2Key, rows[0]!.rawR2Key!)).all()).toHaveLength(0);
+  });
+
+  it('重复投递的覆盖写晚于永久删除清理落地时，补登清理台账，不留无引用无台账的对象', async () => {
+    await settingsFor({ code_extract: { enabled: false, aiEnabled: false } });
+    const owner = await seedOwner('rt-dup-purged');
+    const raw = plainMail(owner.address, 'rt-dup-purged', 'deleted then redelivered');
+    const first = createExecutionContext();
+    await handleInbound(incoming(owner.address, raw), env, first);
+    await waitOnExecutionContext(first);
+    const row = await createDb(env).select().from(messages).where(eq(messages.address, owner.address)).get();
+    const rawKey = row!.rawR2Key!;
+    await createDb(env).update(messages).set({ deletedAt: new Date() }).where(eq(messages.id, row!.id));
+
+    // 重复投递读到回收站里的行之后，原文覆盖写卡住；此时用户永久删除，清理先删掉对象
+    let releasePut!: () => void;
+    const putGate = new Promise<void>((resolve) => { releasePut = resolve; });
+    let lookupDone!: () => void;
+    const lookupGate = new Promise<void>((resolve) => { lookupDone = resolve; });
+    const r2 = new Proxy(env.r2, { get(target, property) {
+      if (property === 'put') return async (key: string, ...args: unknown[]) => {
+        if (key.startsWith('raw/')) await putGate;
+        return (target.put as (...a: unknown[]) => Promise<unknown>)(key, ...args);
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    const db = new Proxy(env.db, { get(target, property) {
+      if (property === 'batch') return async (list: D1PreparedStatement[]) => {
+        const out = await target.batch(list);
+        lookupDone();
+        return out;
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    const ctx = createExecutionContext();
+    const delivery = handleInbound(incoming(owner.address, raw), { ...env, r2, db } as never, ctx);
+    await lookupGate;
+    await purgeMatchingMessages(env, eq(messages.id, row!.id), 1);
+    expect(await env.r2.head(rawKey)).toBeNull();
+    releasePut();
+    await delivery;
+    await waitOnExecutionContext(ctx);
+
+    const refs = await createDb(env).select({ id: messages.id }).from(messages).where(eq(messages.rawR2Key, rawKey)).all();
+    const ledger = await createDb(env).select().from(storageCleanupJobs).where(eq(storageCleanupJobs.r2Key, rawKey)).all();
+    expect({ objectExists: !!(await env.r2.head(rawKey)), refs: refs.length, ledger: ledger.length })
+      .toEqual({ objectExists: true, refs: 0, ledger: 1 });
+    await processStorageCleanup(env);
+    expect(await env.r2.head(rawKey)).toBeNull();
+    expect(await createDb(env).select().from(storageCleanupJobs).where(eq(storageCleanupJobs.r2Key, rawKey)).all()).toHaveLength(0);
   });
 
   it('同一封 HTML 信只做一次整段 htmlToText，提码、摘要、AI 兜底与通知正文共用', async () => {
