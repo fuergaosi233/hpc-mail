@@ -1,11 +1,15 @@
-import { claimMailboxRequestSchema, replaceMailboxSharesRequestSchema, searchUsersQuerySchema, updateMailboxRequestSchema } from '@hpc-mail/shared';
+import {
+  batchMailboxRequestSchema, claimMailboxRequestSchema, replaceMailboxSharesRequestSchema, searchUsersQuerySchema, updateMailboxRequestSchema,
+} from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { execCtx, ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../lib/http.js';
 import { AppError } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
   checkAvailability,
+  checkAvailabilityBatch,
   claimMailbox,
+  claimMailboxes,
   listMailboxes,
   releaseMailbox,
   updateMailbox,
@@ -50,8 +54,11 @@ app.delete('/shares/:mailboxId/grantees/:userId', async (c) => {
   return ok(c, { success: true });
 });
 
-app.post('/availability/batch', async () => {
-  throw new AppError('internal', '未实现');
+/** 批量可用性提示：规则同 GET /availability，结果保持请求顺序 */
+app.post('/availability/batch', async (c) => {
+  const req = await parseBody(c, batchMailboxRequestSchema);
+  const user = c.get('user')!;
+  return ok(c, await checkAvailabilityBatch(c.env, { userId: user.id, role: user.role }, req.items));
 });
 
 app.get('/availability', async (c) => {
@@ -66,8 +73,11 @@ app.post('/', async (c) => {
   return ok(c, await claimMailbox(c.env, user.id, user.role, req), 201);
 });
 
-app.post('/batch', async () => {
-  throw new AppError('internal', '未实现');
+/** 批量认领：按顺序逐个认领，被占用的跳过，其他错误停止并保留已认领的（见 stoppedBy） */
+app.post('/batch', async (c) => {
+  const user = c.get('user')!;
+  const req = await parseBody(c, batchMailboxRequestSchema);
+  return ok(c, await claimMailboxes(c.env, user.id, user.role, req.items));
 });
 
 app.put('/:id', async (c) => {
