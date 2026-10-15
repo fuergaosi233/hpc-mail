@@ -3,10 +3,9 @@ import {
   MAX_ATTACHMENT_TOTAL_BYTES,
 } from '@hpc-mail/shared';
 import PostalMime, { type Address } from 'postal-mime';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
-import { attachments as attachmentsTable, messages, settings as settingsTable, users } from '../db/schema.js';
-import { d1Statement } from '../lib/d1.js';
+import { attachments as attachmentsTable, messages } from '../db/schema.js';
 import { getEmailDomain, getNameFromEmail, normalizeEmail } from '../lib/email-address.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { mailText } from '../lib/text.js';
@@ -28,7 +27,6 @@ import { forwardReceivedMail } from './forwarding.js';
 import { NOTIFY_OWNER_IDS_SQL } from './mailbox.js';
 import { enqueueMailNotifications } from './notification-jobs.js';
 import { attachmentKey, getExt, putObject, sha256Hex16 } from './storage.js';
-import { referencedSql } from './storage-cleanup.js';
 import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
 
 /** 未认领 catch-all 转发必须按稳定主体限额，不能让随机 local-part 刷新额度。 */
@@ -90,18 +88,17 @@ interface InboundLookup {
 /**
  * Ack 前唯一一次 D1 读：去重行、收信当时的归属人、归属人的状态与偏好、旧全局通知设置，
  * 合成一个 batch 往返。偏好行只在邮件完整落库后才解析。
+ * 全部是原生 SQL、各自显式绑定：归属人子查询复用 NOTIFY_OWNER_IDS_SQL（?1 = 收件地址），
+ * 不能与 drizzle 生成的匿名 ? 混在同一条语句里，否则新增条件会和 ?1 撞到同一槽位而静默绑错。
  */
 async function lookupInbound(env: Env, ingestKey: string, address: string): Promise<InboundLookup> {
-  const db = createDb(env);
-  // 外层由 drizzle 生成（无绑定参数），子查询沿用 NOTIFY_OWNER_IDS_SQL 的 ?1
-  const ownerUsers = db.select({ id: users.id, status: users.status, role: users.role, notifyPrefs: users.notifyPrefs })
-    .from(users).where(sql`${users.id} IN (${sql.raw(NOTIFY_OWNER_IDS_SQL)})`).toSQL();
   const [dup, owners, ownerUserRows, legacy] = await env.db.batch([
-    d1Statement(env, db.select(duplicateColumns).from(messages).where(eq(messages.ingestKey, ingestKey))),
+    env.db.prepare(`SELECT id, status, error_detail, raw_r2_key, body_r2_key, deleted_at, notify_owner_ids
+      FROM messages WHERE ingest_key = ?1`).bind(ingestKey),
     env.db.prepare(NOTIFY_OWNER_IDS_SQL).bind(address),
-    env.db.prepare(ownerUsers.sql).bind(address),
-    d1Statement(env, db.select({ key: settingsTable.key, value: settingsTable.value }).from(settingsTable)
-      .where(inArray(settingsTable.key, [...LEGACY_NOTIFY_KEYS]))),
+    env.db.prepare(`select "id", "status", "role", "notify_prefs" from "users" where "id" in (${NOTIFY_OWNER_IDS_SQL})`).bind(address),
+    env.db.prepare(`SELECT key, value FROM settings WHERE key IN (${LEGACY_NOTIFY_KEYS.map((_, i) => `?${i + 1}`).join(', ')})`)
+      .bind(...LEGACY_NOTIFY_KEYS),
   ]);
   const row = dup?.results[0] as {
     id: number; status: string; error_detail: string; raw_r2_key: string | null; body_r2_key: string | null;
@@ -120,7 +117,7 @@ async function lookupInbound(env: Env, ingestKey: string, address: string): Prom
 }
 
 /**
- * 收件链路：解析 → 一层并行 I/O（去重 + 归属人 + 偏好的 D1 batch、原文/大正文写 R2，期间完成提码与摘要）
+ * 收件链路：解析 → 去重 + 归属人 + 偏好的 D1 batch（往返期间完成提码与摘要）→ 非重复时原文/大正文并行写 R2
  * → 落库 → 附件落 R2 → waitUntil(邮箱转发、AI 兜底 + 通知队列)。原文/正文/附件未完整保存则 SMTP 重试。
  */
 export async function handleInbound(
@@ -128,7 +125,7 @@ export async function handleInbound(
   env: Env,
   ctx: ExecCtx,
 ): Promise<void> {
-  // 设置读取（内存缓存未命中时走 KV/D1）与原文缓冲、解析重叠，提码前才等待
+  // 设置读取（isolate 内存缓存未命中时直读 D1）与原文缓冲、解析重叠，提码前才等待
   const settingsReady = getSettings(env, ctx);
 
   // 先缓冲原始 .eml（stream 只能读一次），解析与幂等摘要共用这一份字节。
@@ -176,19 +173,12 @@ export async function handleInbound(
   const db = createDb(env);
   const bodySize = bodyBytes(text, html);
 
-  // Ack 前第一层 I/O 同时发出：D1 读与原文（及 >256KB 正文）写 R2 重叠。
-  // R2 key 只由 ingestKey 决定、内容相同，重复投递时覆盖写幂等；两者都成功之后才落库，
-  // 任一失败向上抛出触发 SMTP 重试，不会留下完整状态的邮件。
-  const rawR2Key = `raw/${ingestKey}.eml`;
+  // 去重读先发出，往返期间完成 CPU 部分；R2 写入等去重结果出来、确认不是重复投递之后才开始。
   const lookupReady = lookupInbound(env, ingestKey, toAddress);
-  const rawSaved = (async () => {
-    await env.r2.put(rawR2Key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } });
-  })();
-  const bodySaved = storeMailBody(env, text, html, ingestKey, bodySize);
-  // 下方按顺序 await；先失败的一方在轮到它之前不能成为未处理的 rejection
-  for (const pending of [lookupReady, rawSaved, bodySaved]) pending.catch(() => {});
+  // 下方 CPU 部分若抛错，lookupReady 的失败不能成为未处理的 rejection
+  lookupReady.catch(() => {});
 
-  // I/O 进行中完成 CPU 部分。HTML → 纯文本只转换一次，提码、摘要、AI 兜底、通知与转发共用。
+  // HTML → 纯文本只转换一次，提码、摘要、AI 兜底、通知与转发共用。
   const settings = await settingsReady;
   const body = mailText(text, html);
   // 同步正则提码 + 验证链接识别（同受「自动提取」开关控制）
@@ -230,18 +220,19 @@ export async function handleInbound(
 
   const lookup = await lookupReady;
   let duplicate = lookup.duplicate;
-  // 已删除或已完整的重复投递：同 key 同内容的 R2 覆盖写交给 waitUntil 收尾，不拖慢 Ack。
-  // 去重读之后这封信可能被永久删除、对象已被清理，迟到的覆盖写会把它重建成孤儿，写完补登清理台账。
+  // 已删除或已完整的重复投递：在任何 R2 写入之前返回
   if (duplicate?.deletedAt || (duplicate && (duplicate.status === 'received' ||
     (duplicate.status === 'degraded' && !duplicate.errorDetail.includes('保存失败'))) && duplicate.rawR2Key &&
-    (bodySize <= D1_BODY_LIMIT || duplicate.bodyR2Key))) {
-    ctx.waitUntil(ledgerUnreferencedWrites(env, rawR2Key, rawSaved, bodySaved));
-    return;
-  }
+    (bodySize <= D1_BODY_LIMIT || duplicate.bodyR2Key))) return;
 
   // 接受 SMTP 投递前必须保存原文与完整正文；存储故障由 SMTP 重投恢复，不能接受丢失正文。
-  await rawSaved;
-  const { bodyText, bodyHtml, bodyR2Key } = await bodySaved;
+  // 两次写入并行；rawBytes 只作为实参直接传给 put，不被任何闭包捕获——否则会随 waitUntil
+  // 后处理一直持有整封原始 .eml。
+  const rawR2Key = `raw/${ingestKey}.eml`;
+  const [, { bodyText, bodyHtml, bodyR2Key }] = await Promise.all([
+    env.r2.put(rawR2Key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } }),
+    storeMailBody(env, text, html, ingestKey, bodySize),
+  ]);
 
   const size = bodySize + attachmentsSize;
   const ownerIds = duplicate?.notifyOwnerIds ?? lookup.ownerIds;
@@ -255,11 +246,11 @@ export async function handleInbound(
   const completeOnInsert = !duplicate && parsedAttachments.length === 0;
 
   // 消息落库：失败向上抛出触发 SMTP 重试。
-  // 补投修复的字段回写与「pending → 完整」切换在下方同一事务里提交，不单独往返。
+  // 补投修复先单独提交字段回写（上传附件之前），附件失败时刚写入的原文/正文也已被这一行引用。
   let inserted: { id: number } | undefined;
-  let repair: ReturnType<typeof repairStatement> | undefined;
   if (duplicate) {
-    repair = repairStatement(db, duplicate.id, { bodyText, bodyHtml, bodyR2Key, rawR2Key, replyTo, notifyOwnerIds: ownerIds });
+    await db.update(messages).set({ bodyText, bodyHtml, bodyR2Key, rawR2Key, replyTo, notifyOwnerIds: ownerIds })
+      .where(eq(messages.id, duplicate.id));
     inserted = { id: duplicate.id };
   } else try {
     inserted = await db.insert(messages).values({
@@ -332,7 +323,7 @@ export async function handleInbound(
         inserts.push(db.insert(attachmentsTable).values(rows.slice(start, start + ATTACHMENT_INSERT_BATCH)).onConflictDoNothing());
       }
       // batch 是事务：任一附件行写入失败，状态切换一并回滚，邮件保持 pending
-      const [marked] = await db.batch([markComplete, ...(repair ? [repair] : []), ...inserts]);
+      const [marked] = await db.batch([markComplete, ...inserts]);
       completed = marked.length > 0;
     } catch (e) {
       console.error('附件入库失败:', e);
@@ -342,9 +333,6 @@ export async function handleInbound(
       } catch (updateError) { console.error('附件降级状态保存失败:', updateError); }
       throw e;
     }
-  } else if (repair) {
-    const [marked] = await db.batch([markComplete, repair]);
-    completed = marked.length > 0;
   } else {
     completed = !!(await markComplete.get());
   }
@@ -411,31 +399,4 @@ export async function handleInbound(
       })]);
     })(),
   );
-}
-
-/**
- * 提前返回的重复投递在 R2 写入落定后，为不再被任何行引用的 key 补一条清理台账（已有台账则忽略），
- * 由存储清理按引用复核后删除。仍被引用的 key 不登记，与正常删除路径互不干扰。
- */
-async function ledgerUnreferencedWrites(
-  env: Env,
-  rawR2Key: string,
-  rawSaved: Promise<void>,
-  bodySaved: Promise<{ bodyR2Key: string | null }>,
-): Promise<void> {
-  const [, body] = await Promise.allSettled([rawSaved, bodySaved]);
-  const keys = [rawR2Key];
-  if (body.status === 'fulfilled' && body.value.bodyR2Key) keys.push(body.value.bodyR2Key);
-  try {
-    await env.db.batch(keys.map((key) => env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key)
-      SELECT ?1 WHERE NOT ${referencedSql('?1')}`).bind(key)));
-  } catch (error) {
-    console.error('重复投递的 R2 清理台账保存失败:', error);
-  }
-}
-
-/** 补投修复：补存原文/正文 key 与收件快照（与状态切换同一 batch 提交） */
-function repairStatement(db: ReturnType<typeof createDb>, id: number, fields: Pick<typeof messages.$inferInsert,
-  'bodyText' | 'bodyHtml' | 'bodyR2Key' | 'rawR2Key' | 'replyTo' | 'notifyOwnerIds'>) {
-  return db.update(messages).set(fields).where(eq(messages.id, id));
 }
