@@ -6,11 +6,11 @@ import { and, desc, eq, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { mailboxes, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
-import type { AuthUser, Env } from '../types.js';
+import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { loadMailboxPolicyUser, resolveMailboxPolicy, type MailboxPolicyUser } from './mailbox-policy.js';
 import { getSettingsFresh } from './setting.js';
 import { PURGE_MESSAGES_INDEX, purgeStatements } from './message-lifecycle.js';
-import { processStorageCleanup } from './storage-cleanup.js';
+import { scheduleStorageCleanup } from './storage-cleanup.js';
 
 type MailboxRow = typeof mailboxes.$inferSelect;
 
@@ -271,6 +271,7 @@ export async function transferMailbox(
 /**
  * 释放地址。默认历史邮件不动（随地址回到未认领态，下一个认领者可见）；
  * deleteHistory=true 时同时删除该地址名下全部邮件——堵住「释放后被他人继承验证码/账单」的隐私路径。
+ * 元数据与清理台账同一事务提交；传入 ctx 时 R2 删除放进 waitUntil，不阻塞响应。
  */
 export async function releaseMailbox(
   env: Env,
@@ -278,6 +279,7 @@ export async function releaseMailbox(
   id: number,
   isAdmin: boolean,
   deleteHistory = false,
+  ctx?: ExecCtx | null,
 ): Promise<{ deletedMessages: number }> {
   const db = createDb(env);
   const row = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
@@ -297,7 +299,7 @@ export async function releaseMailbox(
   const result = await env.db.batch(statements);
   if (!result[result.length - 1]?.meta.changes) throw new AppError('conflict', '邮箱归属已改变，请刷新后重试');
   const deletedMessages = deleteHistory ? (result[1 + PURGE_MESSAGES_INDEX]?.meta.changes ?? 0) : 0;
-  if (deleteHistory) await processStorageCleanup(env, 100);
+  if (deleteHistory) await scheduleStorageCleanup(env, ctx, 100);
   return { deletedMessages };
 }
 

@@ -1,6 +1,6 @@
 import { claimMailboxRequestSchema, replaceMailboxSharesRequestSchema, searchUsersQuerySchema, updateMailboxRequestSchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
-import { ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../lib/http.js';
+import { execCtx, ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../lib/http.js';
 import { AppError } from '../lib/errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
@@ -81,7 +81,7 @@ app.delete('/:id', async (c) => {
   const user = c.get('user')!;
   const id = parseId(c.req.param('id'));
   const deleteHistory = parseBooleanFlag(c.req.query('deleteHistory'));
-  const result = await releaseMailbox(c.env, user.id, id, user.role === 'admin', deleteHistory);
+  const result = await releaseMailbox(c.env, user.id, id, user.role === 'admin', deleteHistory, execCtx(c));
   return ok(c, { success: true, ...result });
 });
 
