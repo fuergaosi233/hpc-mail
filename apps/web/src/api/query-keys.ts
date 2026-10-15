@@ -32,6 +32,8 @@ export const queryKeys = {
     thread: (id: number, view?: { scope?: string; userId?: number }) =>
       ['messages', 'thread', id, view] as const,
     unreadCount: ['messages', 'unread-count'] as const,
+    /** 往来联系人（写信收件人自动补全） */
+    contacts: ['messages', 'contacts'] as const,
   },
 
   apiKeys: {
