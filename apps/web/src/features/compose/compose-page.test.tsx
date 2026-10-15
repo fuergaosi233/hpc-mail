@@ -90,9 +90,11 @@ describe('ComposePage complete delivery',()=>{
     client.setQueryData(sent,emptyList);client.setQueryData(starred,emptyList);
     client.setQueryData(queryKeys.messages.detail(5),{id:5});client.setQueryData(queryKeys.messages.detail(8,{scope:'unclaimed'}),{id:8});
     client.setQueryData(queryKeys.messages.thread(5),{items:[{id:5}]});client.setQueryData(queryKeys.messages.thread(8),{items:[{id:8},{id:5}]});client.setQueryData(queryKeys.messages.thread(9),{items:[{id:9}]});
-    client.setQueryData(queryKeys.messages.unreadCount,{unread:0});
+    client.setQueryData(queryKeys.messages.unreadCount,{unread:0});client.setQueryData(queryKeys.messages.contacts,{contacts:[]});
     fireEvent.click(screen.getByRole('button',{name:'发送'}));
     expect(await screen.findByText('sent page')).toBeInTheDocument();
+    // 新收件人进入往来联系人
+    expect(client.getQueryState(queryKeys.messages.contacts)?.isInvalidated).toBe(true);
     const invalidated=(key:readonly unknown[])=>client.getQueryState(key)?.isInvalidated;
     expect(invalidated(queryKeys.messages.detail(5))).toBe(false);
     expect(invalidated(queryKeys.messages.detail(8,{scope:'unclaimed'}))).toBe(false);

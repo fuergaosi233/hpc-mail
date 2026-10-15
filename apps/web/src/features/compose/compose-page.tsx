@@ -22,6 +22,7 @@ import {
   internalSendMailSchema,
 } from '@hpc-mail/shared';
 import { ApiError, isUncertainSendError } from '@/api/errors';
+import { queryKeys } from '@/api/query-keys';
 import { messageApi, uploadsApi } from '@/api/resources';
 import { Progress } from '@/components/ui/progress';
 import { PageHeader } from '@/components/page-header';
@@ -61,9 +62,6 @@ import { exceedsExternalLimit, hasExternalRecipient } from './compose-attachment
 import { IdentityPicker } from './identity-picker';
 import { RecipientInput } from './recipient-input';
 import { clearSendAttempt, hashSendPayload, persistSendAttempt, readSendAttempt } from './send-attempt';
-
-/** 往来联系人（收件人自动补全）；发信后新收件人会进入联系人，标记过期 */
-const CONTACTS_KEY = ['messages', 'contacts'] as const;
 
 interface AttachmentUpload {
   key: string;
@@ -205,7 +203,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   const { data: visibleDomains } = useDomains();
   const { data: mailboxes } = useMailboxesQuery(false);
   const { data: contactsData } = useQuery({
-    queryKey: CONTACTS_KEY,
+    queryKey: queryKeys.messages.contacts,
     queryFn: () => messageApi.contacts(),
     staleTime: 5 * 60_000,
   });
@@ -427,7 +425,8 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
         sourceIds: [payload.replyToMessageId, payload.forwardAttachmentsFrom, initial.sourceMessageId].filter((id) => id !== undefined),
         selfDelivered: [...payload.to, ...payload.cc, ...payload.bcc].some((address) => owned.has(address.toLowerCase())),
       });
-      void queryClient.invalidateQueries({ queryKey: CONTACTS_KEY, refetchType: 'none' });
+      // 新收件人会进入往来联系人
+      void queryClient.invalidateQueries({ queryKey: queryKeys.messages.contacts, refetchType: 'none' });
       navigate(result.errorDetail || result.status === 'failed' || result.recipientOutcomes?.some((outcome) => outcome.status === 'failed') ? `/mail/${result.id}` : '/sent');
     },
     onError: (err) => {
