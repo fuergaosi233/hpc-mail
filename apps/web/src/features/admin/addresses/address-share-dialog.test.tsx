@@ -42,6 +42,9 @@ vi.mock('@/features/mailboxes/use-mailboxes', () => ({
 }));
 import { AddressesPage } from './addresses-page';
 
+// jsdom 未实现 scrollTo：窗口虚拟列表挂载时会把滚动位置同步一次
+window.scrollTo = vi.fn() as typeof window.scrollTo;
+
 /** 后端按 mailboxId 过滤：只返回该邮箱（0 或 1 项） */
 const sharesOf = async (mailboxId?: number) => grants.filter((grant) => grant.mailboxId === mailboxId);
 

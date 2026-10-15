@@ -5,6 +5,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/errors';
 import { AddressesPage } from './addresses-page';
 
+// jsdom 未实现 scrollTo：窗口虚拟列表挂载时会把滚动位置同步一次
+window.scrollTo = vi.fn() as typeof window.scrollTo;
+
 const mocks = vi.hoisted(() => ({ transfer: vi.fn(), search: vi.fn(), toast: vi.fn() }));
 const box = { id: 42, address: 'existing@example.com', domain: 'example.com', userId: 10, ownerUsername: 'old-owner',
   displayName: '', messageCount: 12, createdAt: '2026-10-06T00:00:00Z' };
