@@ -332,6 +332,8 @@ describe('认领读取与单独读取同一解码', () => {
       expect(await batched).toEqual(await outcome(loadMailboxPolicyUser(createDb(env), id)));
     }
     expect(await loadMailboxPolicyUser(createDb(env), f.other.id)).toEqual({ id: f.other.id, role: 'user', status: 'active', mailboxPolicy: policy, mailboxPolicyRevision: 1 });
+    await expect(loadMailboxPolicyUser(createDb(env), f.admin.id)).rejects.toMatchObject({ code: 'user_disabled', message: '用户已被禁用' });
+    await expect(loadMailboxPolicyUser(createDb(env), 999_999_999)).rejects.toMatchObject({ code: 'not_found', message: '用户不存在' });
   });
 
   it('认领设置非法时与 getSettingsFresh 一样回落默认值', async () => {
