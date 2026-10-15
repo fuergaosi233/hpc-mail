@@ -229,11 +229,12 @@ export async function handleInbound(
 
   const lookup = await lookupReady;
   let duplicate = lookup.duplicate;
-  // 已删除或已完整的重复投递：同 key 同内容的 R2 覆盖写交给 waitUntil 收尾，不拖慢 Ack
+  // 已删除或已完整的重复投递：同 key 同内容的 R2 覆盖写交给 waitUntil 收尾，不拖慢 Ack。
+  // 去重读之后这封信可能被永久删除、对象已被清理，迟到的覆盖写会把它重建成孤儿，写完补登清理台账。
   if (duplicate?.deletedAt || (duplicate && (duplicate.status === 'received' ||
     (duplicate.status === 'degraded' && !duplicate.errorDetail.includes('保存失败'))) && duplicate.rawR2Key &&
     (bodySize <= D1_BODY_LIMIT || duplicate.bodyR2Key))) {
-    ctx.waitUntil(Promise.allSettled([rawSaved, bodySaved]));
+    ctx.waitUntil(ledgerUnreferencedWrites(env, rawR2Key, rawSaved, bodySaved));
     return;
   }
 
@@ -409,6 +410,36 @@ export async function handleInbound(
       })]);
     })(),
   );
+}
+
+/**
+ * 对象仍被引用：附件行、正文溢出、原始 .eml 或 90 天外链。
+ * 与 storage-cleanup.ts 的 referencedSql 同一口径（?1 = r2_key），两边需同步修改。
+ */
+const R2_KEY_REFERENCED_SQL = `(EXISTS (SELECT 1 FROM attachments WHERE attachments.r2_key = ?1)
+  OR EXISTS (SELECT 1 FROM messages WHERE messages.body_r2_key = ?1)
+  OR EXISTS (SELECT 1 FROM messages WHERE messages.raw_r2_key = ?1)
+  OR EXISTS (SELECT 1 FROM external_attachment_links WHERE external_attachment_links.r2_key = ?1))`;
+
+/**
+ * 提前返回的重复投递在 R2 写入落定后，为不再被任何行引用的 key 补一条清理台账（已有台账则忽略），
+ * 由存储清理按引用复核后删除。仍被引用的 key 不登记，与正常删除路径互不干扰。
+ */
+async function ledgerUnreferencedWrites(
+  env: Env,
+  rawR2Key: string,
+  rawSaved: Promise<void>,
+  bodySaved: Promise<{ bodyR2Key: string | null }>,
+): Promise<void> {
+  const [, body] = await Promise.allSettled([rawSaved, bodySaved]);
+  const keys = [rawR2Key];
+  if (body.status === 'fulfilled' && body.value.bodyR2Key) keys.push(body.value.bodyR2Key);
+  try {
+    await env.db.batch(keys.map((key) => env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key)
+      SELECT ?1 WHERE NOT ${R2_KEY_REFERENCED_SQL}`).bind(key)));
+  } catch (error) {
+    console.error('重复投递的 R2 清理台账保存失败:', error);
+  }
 }
 
 /** 补投修复：补存原文/正文 key 与收件快照（与状态切换同一 batch 提交） */
