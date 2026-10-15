@@ -23,6 +23,10 @@ import { syncAllRead } from './message-cache';
 import { rememberFilterAddress, useInboxFilters } from './use-inbox-filters';
 import { useUnreadCount } from './use-unread-count';
 
+/** 未读数由服务端封顶计数（UNREAD_COUNT_CAP），到顶时只知道「至少这么多」 */
+const UNREAD_COUNT_CAP = 1000;
+const formatUnreadTotal = (count: number) => (count >= UNREAD_COUNT_CAP ? `${UNREAD_COUNT_CAP}+` : String(count));
+
 const byDomainThenAddress = (a: { domain: string; address: string }, b: { domain: string; address: string }) =>
   a.domain.localeCompare(b.domain) || a.address.localeCompare(b.address);
 
@@ -203,7 +207,7 @@ export function InboxPage() {
         open={confirmReadAll}
         onOpenChange={setConfirmReadAll}
         title="将全部未读邮件标为已读？"
-        description={`你认领的地址中共有 ${unreadCount} 封未读邮件，将全部标为已读。`}
+        description={`你认领的地址中共有 ${formatUnreadTotal(unreadCount)} 封未读邮件，将全部标为已读。`}
         confirmLabel="全部标为已读"
         loading={readAll.isPending}
         onConfirm={() => readAll.mutate({})}
