@@ -82,7 +82,8 @@ export function AdminAddressMailPage() {
     );
   }
 
-  if (!mailbox) {
+  // 刷新返回 404 时 TanStack 仍保留上次的 data：只要是 404 就按已释放处理，不再展示旧地址
+  if (!mailbox || isNotFound(error)) {
     return (
       <div className="mx-auto max-w-4xl">
         <PageHeader title="地址不存在" actions={<BackToAddresses />} />
