@@ -1,7 +1,7 @@
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { Check, Shuffle, X } from 'lucide-react';
 import { type FormEvent, useEffect, useId, useRef, useState } from 'react';
-import { claimMailboxRequestSchema, localPartSchema } from '@hpc-mail/shared';
+import { claimMailboxRequestSchema, localPartSchema, MAX_BATCH_CLAIM } from '@hpc-mail/shared';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { Button } from '@/components/ui/button';
@@ -17,7 +17,7 @@ import {
   type AddressDraft,
   claimList,
   type ClaimListResult,
-  MAX_BATCH_CLAIM,
+  createAvailabilityLoader,
   parseBatchCount,
   randomAddresses,
   randomLocalPart,
@@ -74,11 +74,17 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const [countText, setCountText] = useState('1');
   /** 勾选后，随机生成的每个地址都从可见域名里随机取后缀 */
   const [randomDomain, setRandomDomain] = useState(false);
-  /** 认领进行中已认领的个数；null 表示没在认领 */
-  const [progress, setProgress] = useState<number | null>(null);
+  /** 认领请求进行中：多个地址一次批量请求，只显示整体进行中状态 */
+  const [claiming, setClaiming] = useState(false);
   const [result, setResult] = useState<ClaimListResult | null>(null);
   const count = parseBatchCount(countText);
-  const claiming = progress !== null;
+  /** 同一轮发起的可用性查询（随机生成一批）合成一次批量请求 */
+  const [checkAvailability] = useState(() =>
+    createAvailabilityLoader({
+      one: (item) => mailboxApi.availability(item.localPart, item.domain),
+      many: (items) => mailboxApi.batchAvailability(items),
+    }),
+  );
 
   // 域名列表变化后，已选的域名可能不再可用：回退到第一个
   useEffect(() => {
@@ -104,7 +110,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       const target = settled[row.id] ?? { localPart: '', domain: row.domain };
       return {
         queryKey: queryKeys.mailboxes.availability(target.localPart, target.domain),
-        queryFn: () => mailboxApi.availability(target.localPart, target.domain),
+        queryFn: () => checkAvailability(target),
         enabled:
           open &&
           !result &&
@@ -143,7 +149,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
     setError(null);
     setCountText('1');
     setRandomDomain(false);
-    setProgress(null);
+    setClaiming(false);
     setResult(null);
   }
 
@@ -200,13 +206,9 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
     }
     if (!canSubmit) return;
 
-    setProgress(0);
-    const outcome = await claimList(
-      rows.map(({ localPart, domain: rowDomain }) => ({ localPart, domain: rowDomain })),
-      mailboxApi.claim,
-      setProgress,
-    );
-    setProgress(null);
+    setClaiming(true);
+    const outcome = await claimList(rows, mailboxApi);
+    setClaiming(false);
 
     if (outcome.claimed.length > 0) {
       invalidateMailboxOwnership(queryClient);
@@ -438,7 +440,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                 </ul>
                 <p role="status" aria-live="polite" className="min-h-5 text-xs text-ink-tertiary">
                   {claiming
-                    ? `正在认领 ${progress}/${rows.length}…`
+                    ? multiple ? `正在认领 ${rows.length} 个地址…` : '正在认领…'
                     : multiple
                       ? `共 ${rows.length} 个地址，可直接修改任一个，或再点「随机生成」换一批，确认无误后点「认领 ${rows.length} 个」。`
                       : ''}

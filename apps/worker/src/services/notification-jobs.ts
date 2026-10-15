@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNotNull, lt, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, lt, lte, sql, type SQL } from 'drizzle-orm';
 import { normalizeEmail, getEmailDomain } from '../lib/email-address.js';
 import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
 import { chunk, d1Statement } from '../lib/d1.js';
@@ -7,7 +7,7 @@ export type { NotificationHealth, NotificationDeliveryView } from '@hpc-mail/sha
 import { createDb } from '../db/client.js';
 import { mailboxes, messages, notificationJobs, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
-import { htmlToText } from '../lib/text.js';
+import { htmlToText, type MailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { getDomains } from './domain.js';
 import { sendFeishuNotification } from './feishu.js';
@@ -29,6 +29,8 @@ export interface MailNotificationInput {
   message: WebhookMailPayload['message'];
   text?: string;
   html?: string;
+  /** 收件链路的正文视图：通知正文复用同一份 HTML → 纯文本转换结果 */
+  mailText?: MailText;
 }
 interface Payload {
   message: WebhookMailPayload['message'];
@@ -55,12 +57,13 @@ export async function enqueueMailNotifications(
       ? ownerIds.map((id) => ({ status: 'fulfilled', value: owners.get(id)?.prefs ?? DEFAULT_USER_NOTIFY_PREFS }))
       : await Promise.allSettled(ownerIds.map(id => getUserNotifyPrefs(env, id)));
     const now = new Date();
-    const fullBody = input.text || htmlToText(input.html || '');
-    const payload = {
-      message: input.message,
-      body: fullBody.slice(0, 4000),
-      bodyTruncated: fullBody.length > 4000,
-    } satisfies Payload;
+    // 正文只在确有通道启用时才转换（未开通知的收件不必整段转换大 HTML）
+    let payload: Payload | undefined;
+    const payloadOf = (): Payload => {
+      if (payload) return payload;
+      const fullBody = input.mailText?.plain ?? (input.text || htmlToText(input.html || ''));
+      return payload = { message: input.message, body: fullBody.slice(0, 4000), bodyTruncated: fullBody.length > 4000 };
+    };
     const rows: typeof notificationJobs.$inferInsert[] = [];
     for (let i = 0; i < ownerIds.length; i++) {
       const result = prefs[i]!;
@@ -72,7 +75,7 @@ export async function enqueueMailNotifications(
         if (!result.value[channel].enabled) continue;
         rows.push({
           userId: ownerIds[i]!, messageId: input.message.id, channel,
-          payload: payload as unknown as Record<string, unknown>,
+          payload: payloadOf() as unknown as Record<string, unknown>,
           maxAttempts: channel === 'webhook' ? 1 : 3,
           nextAttemptAt: now, createdAt: now, updatedAt: now,
           dedupeKey: `mail:${input.message.id}:${ownerIds[i]}:${channel}`,
@@ -204,21 +207,32 @@ export async function processNotificationJobs(
   }
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 8)));
   const concurrency = Math.max(1, Math.min(4, Math.floor(options.concurrency ?? 4)));
-  // 过期租约标记与候选查询同一往返
-  const [, candidates] = await db.batch([expireStale, db.select({ id: notificationJobs.id }).from(notificationJobs).where(and(
+  const candidateQuery = db.select({ id: notificationJobs.id }).from(notificationJobs).where(and(
     eq(notificationJobs.status, 'pending'), lte(notificationJobs.nextAttemptAt, now),
     inArray(notificationJobs.channel, [...MAIL_CHANNELS]),
     options.jobIds ? inArray(notificationJobs.id, options.jobIds.slice(0, 90)) : undefined,
-  )).orderBy(asc(notificationJobs.nextAttemptAt), asc(notificationJobs.id)).limit(limit)]);
+  )).orderBy(asc(notificationJobs.nextAttemptAt), asc(notificationJobs.id)).limit(limit);
+  const claim = (where: SQL | undefined) => db.update(notificationJobs).set({
+    status: 'processing', attempts: sql`${notificationJobs.attempts} + 1`,
+    lastAttemptAt: new Date(), updatedAt: new Date(),
+  }).where(and(where, eq(notificationJobs.status, 'pending'), lte(notificationJobs.nextAttemptAt, now))).returning();
+  // 指定任务（刚入队或手动重试）：过期租约标记与原子认领同一往返，省掉先查候选再逐条认领。
+  // cron 扫描仍逐条认领：候选多时只锁正在处理的那条，租约从真正开始投递时起算。
+  let prefetched: Job[] | undefined;
+  let candidates: { id: number }[];
+  if (options.jobIds) {
+    const [, claimedRows] = await db.batch([expireStale, claim(inArray(notificationJobs.id, candidateQuery))]);
+    prefetched = claimedRows.sort((a, b) => a.nextAttemptAt.getTime() - b.nextAttemptAt.getTime() || a.id - b.id);
+    candidates = prefetched;
+  } else {
+    // 过期租约标记与候选查询同一往返
+    [, candidates] = await db.batch([expireStale, candidateQuery]);
+  }
   let index = 0;
   const workers = await Promise.allSettled(Array.from({ length: Math.min(concurrency, candidates.length) }, async () => {
     while (index < candidates.length) {
-      const candidate = candidates[index++]!;
-      const claimed = await db.update(notificationJobs).set({
-        status: 'processing', attempts: sql`${notificationJobs.attempts} + 1`,
-        lastAttemptAt: new Date(), updatedAt: new Date(),
-      }).where(and(eq(notificationJobs.id, candidate.id), eq(notificationJobs.status, 'pending'),
-        lte(notificationJobs.nextAttemptAt, now))).returning().get();
+      const at = index++;
+      const claimed = prefetched ? prefetched[at] : await claim(eq(notificationJobs.id, candidates[at]!.id)).get();
       if (!claimed) continue;
       result.processed += 1;
       let status: DeliveryStatus = 'succeeded';

@@ -1,4 +1,11 @@
-import type { ClaimMailboxRequest, Mailbox, MailboxAvailability, MailboxUnavailableReason } from '@hpc-mail/shared';
+import {
+  type BatchClaimMailboxResult,
+  type ClaimMailboxRequest,
+  type Mailbox,
+  type MailboxAvailability,
+  type MailboxUnavailableReason,
+  MAX_BATCH_CLAIM,
+} from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 
 /** 去掉易混字符（0/o、1/l/i）的小写字母表，读出来、抄下来都不容易错 */
@@ -33,9 +40,6 @@ export function unavailableMessage(availability: Pick<MailboxAvailability, 'avai
   if (availability.available) return null;
   return availability.reason ? REASON_MESSAGES[availability.reason] : '该地址暂不可认领';
 }
-
-/** 单次最多生成/认领的地址个数 */
-export const MAX_BATCH_CLAIM = 20;
 
 /** 个数输入框文本 → 1..MAX_BATCH_CLAIM 的整数；空或非法按 1 */
 export function parseBatchCount(text: string): number {
@@ -81,34 +85,92 @@ export interface ClaimListResult {
   stoppedBy: string | null;
 }
 
+const draftKey = (draft: AddressDraft) => `${draft.localPart}@${draft.domain}`;
+const failureText = (error: unknown) => (error instanceof ApiError ? error.message : '认领失败，请重试');
+
+/** 批量认领结果映射回 ClaimListResult：被占用的与没尝试的按用户给出的顺序合并 */
+export function fromBatchResult(drafts: AddressDraft[], result: BatchClaimMailboxResult): ClaimListResult {
+  const order = new Map(drafts.map((draft, index) => [draftKey(draft), index]));
+  const position = (draft: AddressDraft) => order.get(draftKey(draft)) ?? drafts.length;
+  const remaining = [...result.taken, ...result.notAttempted]
+    .map(({ localPart, domain }) => ({ localPart, domain }))
+    .sort((a, b) => position(a) - position(b));
+  return {
+    claimed: result.claimed.map((mailbox) => mailbox.address),
+    remaining,
+    stoppedBy: result.stoppedBy?.message ?? null,
+  };
+}
+
 /**
- * 按用户确认的地址列表顺序认领。逐个调用单个认领接口，配额、域名与权限校验沿用后端那一份：
+ * 按用户确认的地址列表顺序认领，配额、域名与权限校验沿用后端那一份：
  * 地址恰好被别人占用只跳过这一个（不替用户改名），其余错误立即停止并保留已认领的，不再硬撞。
+ * 只有一个地址时走单个认领接口；多个地址一次批量请求，后端按同一套规则逐个处理。
  */
 export async function claimList(
   drafts: AddressDraft[],
-  claim: (body: ClaimMailboxRequest) => Promise<Pick<Mailbox, 'address'> | undefined>,
-  onProgress: (done: number) => void = () => {},
+  api: {
+    claim: (body: ClaimMailboxRequest) => Promise<Pick<Mailbox, 'address'> | undefined>;
+    batchClaim: (items: ClaimMailboxRequest[]) => Promise<BatchClaimMailboxResult>;
+  },
 ): Promise<ClaimListResult> {
-  const claimed: string[] = [];
-  const remaining: AddressDraft[] = [];
-  for (let i = 0; i < drafts.length; i++) {
-    const draft = drafts[i]!;
+  const items = drafts.map(({ localPart, domain }) => ({ localPart, domain }));
+  if (items.length === 1) {
+    const draft = items[0]!;
     try {
-      const created = await claim({ localPart: draft.localPart, domain: draft.domain });
-      claimed.push(created?.address ?? `${draft.localPart}@${draft.domain}`);
-      onProgress(claimed.length);
+      const created = await api.claim(draft);
+      return { claimed: [created?.address ?? draftKey(draft)], remaining: [], stoppedBy: null };
     } catch (error) {
-      if (error instanceof ApiError && error.code === 'address_taken') {
-        remaining.push(draft);
-        continue;
-      }
-      return {
-        claimed,
-        remaining: [...remaining, ...drafts.slice(i)],
-        stoppedBy: error instanceof ApiError ? error.message : '认领失败，请重试',
-      };
+      const taken = error instanceof ApiError && error.code === 'address_taken';
+      return { claimed: [], remaining: [draft], stoppedBy: taken ? null : failureText(error) };
     }
   }
-  return { claimed, remaining, stoppedBy: null };
+  try {
+    return fromBatchResult(items, await api.batchClaim(items));
+  } catch (error) {
+    // 整个请求失败（网络、校验、限流等）：一个都没认领
+    return { claimed: [], remaining: items, stoppedBy: failureText(error) };
+  }
+}
+
+/**
+ * 可用性查询合批：同一轮同步代码里发起的查询（随机生成一批、失效后一起重查）合成一次批量请求，
+ * 每次最多 MAX_BATCH_CLAIM 个；只有一个时仍走单个查询接口。结果按请求顺序对应回各自的调用。
+ */
+export function createAvailabilityLoader(api: {
+  one: (item: ClaimMailboxRequest) => Promise<MailboxAvailability>;
+  many: (items: ClaimMailboxRequest[]) => Promise<MailboxAvailability[]>;
+}): (item: ClaimMailboxRequest) => Promise<MailboxAvailability> {
+  interface Pending {
+    item: ClaimMailboxRequest;
+    resolve: (value: MailboxAvailability) => void;
+    reject: (error: unknown) => void;
+  }
+  let queue: Pending[] = [];
+
+  const run = async (batch: Pending[]) => {
+    try {
+      if (batch.length === 1) {
+        batch[0]!.resolve(await api.one(batch[0]!.item));
+        return;
+      }
+      const results = await api.many(batch.map((pending) => pending.item));
+      if (results.length !== batch.length) throw new Error('可用性检查结果数量不符');
+      batch.forEach((pending, index) => pending.resolve(results[index]!));
+    } catch (error) {
+      for (const pending of batch) pending.reject(error);
+    }
+  };
+
+  const flush = () => {
+    const pending = queue;
+    queue = [];
+    for (let i = 0; i < pending.length; i += MAX_BATCH_CLAIM) void run(pending.slice(i, i + MAX_BATCH_CLAIM));
+  };
+
+  return (item) =>
+    new Promise<MailboxAvailability>((resolve, reject) => {
+      if (queue.length === 0) queueMicrotask(flush);
+      queue.push({ item, resolve, reject });
+    });
 }

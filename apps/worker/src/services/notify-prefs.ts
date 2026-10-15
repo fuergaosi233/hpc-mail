@@ -43,17 +43,11 @@ function normalize(raw: unknown): UserNotifyPrefs {
   return out;
 }
 
-/**
- * 读旧全局通知设置（settings 表 feishu/notify_webhook/gmail_forward 三行原始值），
- * 映射成个人偏好结构——仅作为**管理员**首次未配置个人偏好时的继承来源。
- */
-async function readLegacyGlobalNotify(env: Env): Promise<UserNotifyPrefs | null> {
-  const db = createDb(env);
-  const rows = await db
-    .select()
-    .from(settingsTable)
-    .where(inArray(settingsTable.key, ['feishu', 'notify_webhook', 'gmail_forward']))
-    .all();
+/** 旧全局通知设置所在的 settings 键（feishu/notify_webhook/gmail_forward 三行原始值） */
+export const LEGACY_NOTIFY_KEYS = ['feishu', 'notify_webhook', 'gmail_forward'] as const;
+
+/** settings 原始行 → 个人偏好结构；没有任何旧设置行时返回 null */
+function legacyFromRows(rows: { key: string; value: string }[]): UserNotifyPrefs | null {
   if (!rows.length) return null;
   const map = new Map(rows.map((r) => [r.key, r.value]));
   const out = clone(DEFAULT_USER_NOTIFY_PREFS);
@@ -72,6 +66,19 @@ async function readLegacyGlobalNotify(env: Env): Promise<UserNotifyPrefs | null>
   const fw = gmailForwardSettingSchema.safeParse(jsonOf(map.get('gmail_forward')));
   if (fw.success) out.forward = fw.data;
   return out;
+}
+
+/**
+ * 读旧全局通知设置，映射成个人偏好结构——仅作为**管理员**首次未配置个人偏好时的继承来源。
+ */
+async function readLegacyGlobalNotify(env: Env): Promise<UserNotifyPrefs | null> {
+  const db = createDb(env);
+  const rows = await db
+    .select()
+    .from(settingsTable)
+    .where(inArray(settingsTable.key, [...LEGACY_NOTIFY_KEYS]))
+    .all();
+  return legacyFromRows(rows);
 }
 
 /**
@@ -100,6 +107,20 @@ export interface NotifyOwner {
   prefs: UserNotifyPrefs;
 }
 
+/** users 表一行（notifyPrefs 为已解析的 JSON 值）→ 归属人状态与偏好；未配置的管理员继承旧全局设置 */
+function ownerFromRow(
+  row: { status: string; role: string; notifyPrefs: unknown },
+  legacy: UserNotifyPrefs | null | undefined,
+): NotifyOwner {
+  let prefs: UserNotifyPrefs;
+  if (row.notifyPrefs) prefs = normalize(row.notifyPrefs);
+  else if (row.role === 'admin') prefs = clone(legacy ?? DEFAULT_USER_NOTIFY_PREFS);
+  else prefs = clone(DEFAULT_USER_NOTIFY_PREFS);
+  return { active: row.status === 'active', prefs };
+}
+
+const needsLegacy = (row: { role: string; notifyPrefs: unknown }) => !row.notifyPrefs && row.role === 'admin';
+
 /**
  * 一次查询读出多位归属人的状态与偏好（未配置的管理员共用一次旧全局设置读取），
  * 收件链路据此只读一次、往下传给转发、入队与即时投递。不存在的用户不在结果里。
@@ -117,14 +138,35 @@ export async function loadNotifyOwners(env: Env, userIds: number[]): Promise<Map
       .where(inArray(users.id, batch))
       .all();
     for (const row of rows) {
-      let prefs: UserNotifyPrefs;
-      if (row.notifyPrefs) prefs = normalize(row.notifyPrefs);
-      else if (row.role === 'admin') {
-        if (legacy === undefined) legacy = await readLegacyGlobalNotify(env);
-        prefs = clone(legacy ?? DEFAULT_USER_NOTIFY_PREFS);
-      } else prefs = clone(DEFAULT_USER_NOTIFY_PREFS);
-      out.set(row.id, { active: row.status === 'active', prefs });
+      if (needsLegacy(row) && legacy === undefined) legacy = await readLegacyGlobalNotify(env);
+      out.set(row.id, ownerFromRow(row, legacy));
     }
+  }
+  return out;
+}
+
+/** 原生 D1 查询得到的 users 行（notify_prefs 为 JSON 文本） */
+export interface NotifyOwnerRawRow {
+  id: number;
+  status: string;
+  role: string;
+  notify_prefs: string | null;
+}
+
+/**
+ * 与 loadNotifyOwners 相同的映射，数据来自调用方已合批读出的 users 行与旧全局设置行
+ * （收件链路把它们与去重查询合进同一个 D1 batch，不再单独往返）。JSON 损坏时抛出，由调用方降级。
+ */
+export function notifyOwnersFromRows(
+  rows: NotifyOwnerRawRow[],
+  legacyRows: { key: string; value: string }[],
+): Map<number, NotifyOwner> {
+  const out = new Map<number, NotifyOwner>();
+  let legacy: UserNotifyPrefs | null | undefined;
+  for (const raw of rows) {
+    const row = { status: raw.status, role: raw.role, notifyPrefs: raw.notify_prefs === null ? null : JSON.parse(raw.notify_prefs) as unknown };
+    if (needsLegacy(row) && legacy === undefined) legacy = legacyFromRows(legacyRows);
+    out.set(Number(raw.id), ownerFromRow(row, legacy));
   }
   return out;
 }

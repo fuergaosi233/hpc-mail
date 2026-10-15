@@ -4,7 +4,7 @@ import { createDb, type Db } from '../db/client.js';
 import { mailboxes, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import { hashPassword } from '../lib/password.js';
-import type { Env } from '../types.js';
+import type { Env, ExecCtx } from '../types.js';
 import { avatarUrl } from './avatar.js';
 import { mirrorUserEpoch } from './session.js';
 import { getSettingsFresh } from './setting.js';
@@ -116,6 +116,7 @@ export async function updateUser(
   actingUserId: number,
   id: number,
   req: UpdateUserRequest,
+  ctx?: ExecCtx | null,
 ): Promise<AdminUser> {
   const db = createDb(env);
   const target = await db.select().from(users).where(eq(users.id, id)).get();
@@ -178,7 +179,7 @@ export async function updateUser(
     throw error;
   }
   if (!row) throw new AppError('conflict', '用户或域名配置已改变，请刷新后重试');
-  if (bumpEpoch && row) await mirrorUserEpoch(env, id, row.authVersion);
+  if (bumpEpoch && row) await mirrorUserEpoch(env, id, row.authVersion, ctx);
 
   const count = await db
     .select({ apiKeyCount: apiKeyCountSql })
@@ -192,7 +193,7 @@ export async function updateUser(
  * 删除用户：级联清理 mailboxes / mailbox_shares / api_keys / stars / 头像 R2 对象，避免僵尸数据。
  * messages 不动（仍按 address 归属，随地址回未认领态）。
  */
-export async function deleteUser(env: Env, actingUserId: number, id: number): Promise<void> {
+export async function deleteUser(env: Env, actingUserId: number, id: number, ctx?: ExecCtx | null): Promise<void> {
   if (id === actingUserId) throw new AppError('forbidden', '不能删除自己');
   const db = createDb(env);
   const target = await db
@@ -222,11 +223,12 @@ export async function deleteUser(env: Env, actingUserId: number, id: number): Pr
     throw error;
   }
   if (target.avatarKey) {
-    try {
-      await env.r2.delete(target.avatarKey);
-    } catch (e) {
+    // 头像对象尽力删除：有 ctx 时放进 waitUntil，不阻塞响应
+    const removal = env.r2.delete(target.avatarKey).catch((e: unknown) => {
       console.error('删除用户头像对象失败:', e);
-    }
+    });
+    if (ctx) ctx.waitUntil(removal);
+    else await removal;
   }
   // 用户行已删除，鉴权中间件会立即拒绝旧 token；KV 兼容版本不再需要额外 bump。
 }

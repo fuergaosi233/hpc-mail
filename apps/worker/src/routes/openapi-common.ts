@@ -93,7 +93,7 @@ export const schemas: Record<string, Schema> = {
     bodyText: str, bodyHtml: str, attachments: array(ref('Attachment')), hasRaw: bool }, ['recipientOutcomes', 'recipientsTo', 'replyTo', 'verificationLink']),
   MessagePage: page(ref('MessageSummary')), Attachment: attachment, Mailbox: mailbox,
   SessionMessagePage: object({ items: array(ref('MessageSummary')), nextCursor: nullable(str),
-    head: { ...str, description: 'First page only (no cursor): opaque fingerprint of this page for the current filters, same algorithm as /messages/sync head. Compare for equality only.' } }, ['head']),
+    head: { ...str, description: 'First page only (no cursor and no afterId): opaque fingerprint of this page for the current filters, same algorithm as /messages/sync head. Compare for equality only.' } }, ['head']),
   MessageSync: object({ unread: { ...int, description: 'Same value as /messages/unread-count.' },
     head: { ...str, description: 'Opaque fingerprint of the first page for these filters. When it differs from the head of the loaded first page, refetch the list.' } }),
   BatchClaimMailboxResult: object({ claimed: array(ref('Mailbox')),

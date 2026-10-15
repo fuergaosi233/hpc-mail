@@ -6,6 +6,7 @@ import {
   markAllReadRequestSchema,
   starMessagesRequestSchema,
   translateMessageRequestSchema,
+  type MessageListPage,
   type MessageSummary,
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
@@ -24,10 +25,13 @@ import {
   purgeMessages,
   restoreMessages,
   starMessages,
+  syncMessages,
+  UNREAD_COUNT_CAP,
   type Viewer,
 } from '../services/message.js';
 import { messageViewer, mutationViewer } from '../lib/message-viewer.js';
 import { AppError } from '../lib/errors.js';
+import { pageHead } from '../lib/pagination.js';
 import { decodeInlineAttachments, sendMail } from '../services/outbound.js';
 import {
   beginIdempotentSend,
@@ -58,10 +62,17 @@ function viewerFromListQuery(
   return { userId: user.id, role: user.role, scope: query.scope, targetUserId: query.userId };
 }
 
+/**
+ * 首页（不带 cursor）附带 head，与 /sync 同一算法；带 afterId 的增量页不是 sync 所描述的首页，同样不带。
+ * /v1 列表不返回 head。
+ */
 app.get('/', async (c) => {
   const query = parseQuery(c, listMessagesQuerySchema);
   const user = c.get('user')!;
-  return ok(c, await listMessages(c.env, viewerFromListQuery(user, query), query));
+  const page = await listMessages(c.env, viewerFromListQuery(user, query), query);
+  if (query.cursor !== undefined || query.afterId !== undefined) return ok(c, page);
+  const body: MessageListPage = { ...page, head: await pageHead(page) };
+  return ok(c, body);
 });
 
 app.post('/send', async (c) => {
@@ -142,7 +153,7 @@ app.post('/restore', async (c) => {
 /** 永久删除（回收站里彻底删） */
 app.post('/purge', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, mutationViewerOf(c, req.scope), req.ids);
+  const purged = await purgeMessages(c.env, mutationViewerOf(c, req.scope), req.ids, execCtx(c));
   return ok(c, { purged, changed: purged });
 });
 
@@ -152,17 +163,23 @@ app.post('/star', async (c) => {
   return ok(c, { changed });
 });
 
-/** 侧栏收件箱未读角标：口径同 /inbox（scope=mine + inbound + 未读）。须在 /:id 之前注册 */
+/** 侧栏收件箱未读角标：口径同 /inbox（scope=mine + inbound + 未读），封顶 UNREAD_COUNT_CAP。须在 /:id 之前注册 */
 app.get('/unread-count', async (c) => {
   const user = c.get('user')!;
-  return ok(c, { unread: await countUnread(c.env, user.id, user.role) });
+  return ok(c, { unread: await countUnread(c.env, user.id, user.role, UNREAD_COUNT_CAP) });
+});
+
+/**
+ * 列表轻量轮询：参数与列表相同（同一 schema 与范围校验，cursor/afterId 忽略），
+ * 返回调用者未读数与该筛选首页的 head；head 与已加载首页不同才需要重拉列表
+ */
+app.get('/sync', async (c) => {
+  const query = parseQuery(c, listMessagesQuerySchema);
+  const user = c.get('user')!;
+  return ok(c, await syncMessages(c.env, viewerFromListQuery(user, query), query));
 });
 
 /** 写信收件人自动补全：近期联系人 */
-app.get('/sync', async () => {
-  throw new AppError('internal', '未实现');
-});
-
 app.get('/contacts', async (c) => {
   return ok(c, { contacts: await getRecentContacts(c.env, viewerOf(c)) });
 });

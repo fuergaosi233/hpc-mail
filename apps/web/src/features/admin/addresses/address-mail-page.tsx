@@ -1,5 +1,10 @@
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft } from 'lucide-react';
 import { Link, useParams } from 'react-router-dom';
+import type { Mailbox } from '@hpc-mail/shared';
+import { ApiError } from '@/api/errors';
+import { queryKeys } from '@/api/query-keys';
+import { adminApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
@@ -10,7 +15,6 @@ import { useAdminMailDirection } from '@/features/admin/mail/admin-mail-page';
 import { FilterBar } from '@/features/inbox/filter-bar';
 import { MailList } from '@/features/inbox/mail-list';
 import { useInboxFilters } from '@/features/inbox/use-inbox-filters';
-import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 
 const DIRECTION_OPTIONS = [
   { value: 'inbound', label: '收件箱' },
@@ -30,15 +34,31 @@ function BackToAddresses() {
   );
 }
 
+const isNotFound = (error: unknown) =>
+  error instanceof ApiError && (error.httpStatus === 404 || error.code === 'not_found');
+
+/** 按 id 只读这一个邮箱；从全站地址列表进来时先用列表缓存里的这一行渲染，不必等请求返回 */
+function useAdminMailbox(mailboxId: number, enabled: boolean) {
+  const queryClient = useQueryClient();
+  return useQuery({
+    queryKey: queryKeys.mailboxes.adminDetail(mailboxId),
+    queryFn: () => adminApi.getMailbox(mailboxId),
+    enabled,
+    placeholderData: () =>
+      queryClient.getQueryData<Mailbox[]>(queryKeys.mailboxes.list('all'))?.find((item) => item.id === mailboxId),
+  });
+}
+
 /** 管理员只读查看某个已认领地址的全部收件与发件；地址固定，不随 URL 中的 domain/address 变化 */
 export function AdminAddressMailPage() {
   const { mailboxId: rawId } = useParams();
   const mailboxId = Number(rawId);
-  const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(true);
+  const validId = Number.isInteger(mailboxId) && mailboxId > 0;
+  const { data: mailbox, isLoading, isError, error, refetch } = useAdminMailbox(mailboxId, validId);
   const { filters, setUnread, setQuery, reset } = useInboxFilters();
   const { direction, setDirection } = useAdminMailDirection();
 
-  if (!Number.isInteger(mailboxId) || mailboxId <= 0) {
+  if (!validId) {
     return (
       <div className="mx-auto max-w-4xl">
         <EmptyState title="地址不存在" description="无效的地址 id。" className="rounded-lg border border-line bg-surface" />
@@ -54,7 +74,7 @@ export function AdminAddressMailPage() {
     );
   }
 
-  if (isError) {
+  if (isError && !isNotFound(error)) {
     return (
       <div className="mx-auto max-w-4xl">
         <QueryErrorState error={error} onRetry={() => void refetch()} />
@@ -62,7 +82,6 @@ export function AdminAddressMailPage() {
     );
   }
 
-  const mailbox = mailboxes?.find((item) => item.id === mailboxId);
   if (!mailbox) {
     return (
       <div className="mx-auto max-w-4xl">

@@ -1,5 +1,6 @@
 import type { MailboxShareGrant, SharedMailboxView } from '@hpc-mail/shared';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/sqlite-core';
 import { createDb } from '../db/client.js';
 import { mailboxShares, mailboxes, users } from '../db/schema.js';
 import { chunk } from '../lib/d1.js';
@@ -18,57 +19,56 @@ function assertManageableMailbox<T extends { userId: number }>(
   }
 }
 
-/** 自有或全站已认领邮箱，附带所有者与共享名单（含尚未分享的）。 */
-export async function listMailboxShares(env: Env, actorId: number, all = false): Promise<MailboxShareGrant[]> {
+const owners = alias(users, 'owners');
+
+/**
+ * 自有或全站已认领邮箱，附带所有者与共享名单（含尚未分享的）。
+ * 一条 JOIN 查询：邮箱按地址、共享按被分享人用户名排序；mailboxId 只取该邮箱（0 或 1 项）。
+ */
+export async function listMailboxShares(env: Env, actorId: number, all = false, mailboxId?: number): Promise<MailboxShareGrant[]> {
   const db = createDb(env);
-  const boxes = await db
-    .select({ box: mailboxes, ownerUsername: users.username })
+  const rows = await db
+    .select({
+      box: mailboxes,
+      ownerUsername: owners.username,
+      granteeId: mailboxShares.userId,
+      granteeUsername: users.username,
+      granteeStatus: users.status,
+      grantedAt: mailboxShares.createdAt,
+    })
     .from(mailboxes)
-    .innerJoin(users, eq(users.id, mailboxes.userId))
-    .where(all ? undefined : eq(mailboxes.userId, actorId))
-    .orderBy(asc(mailboxes.address))
+    .innerJoin(owners, eq(owners.id, mailboxes.userId))
+    .leftJoin(mailboxShares, eq(mailboxShares.mailboxId, mailboxes.id))
+    .leftJoin(users, eq(users.id, mailboxShares.userId))
+    .where(and(all ? undefined : eq(mailboxes.userId, actorId), mailboxId === undefined ? undefined : eq(mailboxes.id, mailboxId)))
+    .orderBy(asc(mailboxes.address), asc(users.username))
     .all();
-  if (boxes.length === 0) return [];
 
-  const rows = [];
-  for (const batch of chunk(boxes.map(({ box }) => box.id))) {
-    const part = await db
-      .select({
-        mailboxId: mailboxShares.mailboxId,
-        userId: mailboxShares.userId,
-        username: users.username,
-        status: users.status,
-        grantedAt: mailboxShares.createdAt,
-      })
-      .from(mailboxShares)
-      .innerJoin(users, eq(users.id, mailboxShares.userId))
-      .where(inArray(mailboxShares.mailboxId, batch))
-      .orderBy(asc(users.username))
-      .all();
-    rows.push(...part);
-  }
-
-  const byMailbox = new Map<number, MailboxShareGrant['grantees']>();
+  const grants = new Map<number, MailboxShareGrant>();
   for (const row of rows) {
-    const list = byMailbox.get(row.mailboxId) ?? [];
-    list.push({
-      userId: row.userId,
-      username: row.username,
-      status: row.status,
+    let grant = grants.get(row.box.id);
+    if (!grant) {
+      grant = {
+        mailboxId: row.box.id,
+        address: row.box.address,
+        domain: row.box.domain,
+        displayName: row.box.displayName,
+        ownerUserId: row.box.userId,
+        ownerUsername: row.ownerUsername,
+        grantees: [],
+      };
+      grants.set(row.box.id, grant);
+    }
+    // 被分享人用户行缺失的共享不展示（与只取存在用户的名单一致）
+    if (row.granteeId === null || row.granteeUsername === null || row.granteeStatus === null || row.grantedAt === null) continue;
+    grant.grantees.push({
+      userId: row.granteeId,
+      username: row.granteeUsername,
+      status: row.granteeStatus,
       grantedAt: row.grantedAt.toISOString(),
     });
-    byMailbox.set(row.mailboxId, list);
   }
-
-  return boxes.map(({ box, ownerUsername }) => ({
-    mailboxId: box.id,
-    address: box.address,
-    domain: box.domain,
-    displayName: box.displayName,
-    ownerUserId: box.userId,
-    ownerUsername,
-    grantees: byMailbox.get(box.id) ?? [],
-  }));
+  return [...grants.values()];
 }
 
 /**

@@ -1,9 +1,10 @@
-import { LOCAL_PART_REGEX, DEFAULT_RESERVED_LOCAL_PARTS } from '@hpc-mail/shared';
+import { LOCAL_PART_REGEX, DEFAULT_RESERVED_LOCAL_PARTS, MAX_BATCH_CLAIM, type BatchClaimMailboxResult } from '@hpc-mail/shared';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/errors';
 import {
   claimList,
-  MAX_BATCH_CLAIM,
+  createAvailabilityLoader,
+  fromBatchResult,
   parseBatchCount,
   randomAddresses,
   randomLocalPart,
@@ -103,46 +104,138 @@ describe('randomAddresses', () => {
 
 describe('claimList', () => {
   const taken = () => new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 });
-  const ok = (body: { localPart: string; domain: string }) => Promise.resolve({ address: `${body.localPart}@${body.domain}` });
   const d = (localPart: string, domain = 'a.test') => ({ localPart, domain });
+  const box = (draft: { localPart: string; domain: string }) => ({ address: `${draft.localPart}@${draft.domain}` });
+  const batch = (result: Partial<BatchClaimMailboxResult>) =>
+    vi.fn(async (_items: Array<{ localPart: string; domain: string }>) => ({
+      claimed: [], taken: [], notAttempted: [], stoppedBy: null, ...result,
+    }) as BatchClaimMailboxResult);
 
-  it('按给定顺序、各用各自的域名逐个认领，并逐个汇报进度', async () => {
-    const claim = vi.fn(ok);
-    const progress = vi.fn();
-    const result = await claimList([d('one', 'a.test'), d('two', 'b.test'), d('three', 'a.test')], claim, progress);
+  it('多个地址只发一次批量认领，按给定顺序、各用各自的域名', async () => {
+    const drafts = [d('one', 'a.test'), d('two', 'b.test'), d('three', 'a.test')];
+    const claim = vi.fn();
+    const batchClaim = batch({ claimed: drafts.map(box) as never });
+    const result = await claimList(drafts, { claim, batchClaim });
     expect(result).toEqual({ claimed: ['one@a.test', 'two@b.test', 'three@a.test'], remaining: [], stoppedBy: null });
-    expect(claim.mock.calls.map(([body]) => body)).toEqual([d('one', 'a.test'), d('two', 'b.test'), d('three', 'a.test')]);
-    expect(progress.mock.calls.map(([n]) => n)).toEqual([1, 2, 3]);
+    expect(batchClaim).toHaveBeenCalledTimes(1);
+    expect(batchClaim).toHaveBeenCalledWith(drafts);
+    expect(claim).not.toHaveBeenCalled();
   });
 
   it('某个地址被抢先占用：只跳过它、不替用户改名，其余照常认领', async () => {
-    const claim = vi.fn((body: { localPart: string; domain: string }) => (body.localPart === 'two' ? Promise.reject(taken()) : ok(body)));
-    const result = await claimList([d('one'), d('two', 'b.test'), d('three')], claim);
+    const batchClaim = batch({ claimed: [box(d('one')), box(d('three'))] as never, taken: [d('two', 'b.test')] });
+    const result = await claimList([d('one'), d('two', 'b.test'), d('three')], { claim: vi.fn(), batchClaim });
     expect(result).toEqual({ claimed: ['one@a.test', 'three@a.test'], remaining: [d('two', 'b.test')], stoppedBy: null });
-    expect(claim).toHaveBeenCalledTimes(3);
   });
 
-  it('配额用尽等其他错误立即停止：带出后端原因，未尝试的与被占用的都留在 remaining（含各自域名），不再继续请求', async () => {
-    const claim = vi.fn((body: { localPart: string; domain: string }) => {
-      if (body.localPart === 'one') return Promise.reject(taken());
-      if (body.localPart === 'three') return Promise.reject(new ApiError('认领地址数已达上限（2）', { code: 'forbidden', httpStatus: 403 }));
-      return ok(body);
+  it('配额用尽等其他错误中途停止：带出后端原因，被占用的与没尝试的按原顺序都留在 remaining（含各自域名）', async () => {
+    const batchClaim = batch({
+      claimed: [box(d('two', 'b.test'))] as never,
+      taken: [d('one')],
+      notAttempted: [d('three', 'b.test'), d('four')],
+      stoppedBy: { code: 'forbidden', message: '认领地址数已达上限（2）' },
     });
-    const result = await claimList([d('one'), d('two', 'b.test'), d('three', 'b.test'), d('four')], claim);
+    const result = await claimList([d('one'), d('two', 'b.test'), d('three', 'b.test'), d('four')], { claim: vi.fn(), batchClaim });
     expect(result).toEqual({
       claimed: ['two@b.test'],
       remaining: [d('one'), d('three', 'b.test'), d('four')],
       stoppedBy: '认领地址数已达上限（2）',
     });
-    expect(claim).toHaveBeenCalledTimes(3);
   });
 
-  it('非 ApiError 的异常也不会抛出，给通用提示', async () => {
-    const claim = vi.fn().mockRejectedValue(new TypeError('boom'));
-    expect(await claimList([d('one'), d('two')], claim)).toEqual({
+  it('整个批量请求失败时一个都不算认领：ApiError 带出原因，其他异常给通用提示，均不抛出', async () => {
+    const forbidden = vi.fn().mockRejectedValue(new ApiError('请求过于频繁', { code: 'rate_limited', httpStatus: 429 }));
+    expect(await claimList([d('one'), d('two')], { claim: vi.fn(), batchClaim: forbidden })).toEqual({
+      claimed: [],
+      remaining: [d('one'), d('two')],
+      stoppedBy: '请求过于频繁',
+    });
+    const broken = vi.fn().mockRejectedValue(new TypeError('boom'));
+    expect(await claimList([d('one'), d('two')], { claim: vi.fn(), batchClaim: broken })).toEqual({
       claimed: [],
       remaining: [d('one'), d('two')],
       stoppedBy: '认领失败，请重试',
     });
+  });
+
+  it('只有一个地址时仍走单个认领接口：被占用不算停止，其他错误带出原因', async () => {
+    const batchClaim = batch({});
+    const ok = vi.fn(async (body: { localPart: string; domain: string }) => box(body));
+    expect(await claimList([d('one', 'b.test')], { claim: ok, batchClaim })).toEqual({
+      claimed: ['one@b.test'], remaining: [], stoppedBy: null,
+    });
+    expect(ok).toHaveBeenCalledWith(d('one', 'b.test'));
+    expect(await claimList([d('one')], { claim: vi.fn().mockRejectedValue(taken()), batchClaim })).toEqual({
+      claimed: [], remaining: [d('one')], stoppedBy: null,
+    });
+    const quota = vi.fn().mockRejectedValue(new ApiError('认领地址数已达上限（1）', { code: 'forbidden', httpStatus: 403 }));
+    expect(await claimList([d('one')], { claim: quota, batchClaim })).toEqual({
+      claimed: [], remaining: [d('one')], stoppedBy: '认领地址数已达上限（1）',
+    });
+    expect(batchClaim).not.toHaveBeenCalled();
+  });
+});
+
+describe('fromBatchResult', () => {
+  const d = (localPart: string) => ({ localPart, domain: 'a.test' });
+
+  it('被占用的与没尝试的按用户给出的顺序合并，与后端返回的先后无关', () => {
+    const drafts = [d('a'), d('b'), d('c'), d('d'), d('e')];
+    expect(fromBatchResult(drafts, {
+      claimed: [{ address: 'a@a.test' }] as never,
+      taken: [d('d'), d('b')],
+      notAttempted: [d('e'), d('c')],
+      stoppedBy: { code: 'forbidden', message: '已达上限' },
+    })).toEqual({ claimed: ['a@a.test'], remaining: [d('b'), d('c'), d('d'), d('e')], stoppedBy: '已达上限' });
+  });
+});
+
+describe('createAvailabilityLoader', () => {
+  type Draft = { localPart: string; domain: string };
+  const d = (localPart: string, domain = 'a.test') => ({ localPart, domain });
+  const free = (item: Draft) => ({ address: `${item.localPart}@${item.domain}`, available: true });
+
+  it('同一轮发起的多个查询合成一次批量请求，结果按顺序对应回各自的调用', async () => {
+    const one = vi.fn();
+    const many = vi.fn(async (items: Draft[]) =>
+      items.map((item) => (item.localPart === 'busy' ? { ...free(item), available: false, reason: 'taken' as const } : free(item))));
+    const load = createAvailabilityLoader({ one, many });
+    const results = await Promise.all([load(d('one')), load(d('busy', 'b.test')), load(d('three'))]);
+    expect(many).toHaveBeenCalledTimes(1);
+    expect(many).toHaveBeenCalledWith([d('one'), d('busy', 'b.test'), d('three')]);
+    expect(one).not.toHaveBeenCalled();
+    expect(results).toEqual([
+      free(d('one')),
+      { address: 'busy@b.test', available: false, reason: 'taken' },
+      free(d('three')),
+    ]);
+  });
+
+  it('只有一个查询时走单个查询接口；下一轮的查询另发请求', async () => {
+    const one = vi.fn(async (item: Draft) => free(item));
+    const many = vi.fn(async (items: Draft[]) => items.map(free));
+    const load = createAvailabilityLoader({ one, many });
+    await load(d('one'));
+    expect(one).toHaveBeenCalledWith(d('one'));
+    await Promise.all([load(d('two')), load(d('three'))]);
+    expect(one).toHaveBeenCalledTimes(1);
+    expect(many).toHaveBeenCalledTimes(1);
+  });
+
+  it(`超过 ${MAX_BATCH_CLAIM} 个时按上限分批`, async () => {
+    const many = vi.fn(async (items: Draft[]) => items.map(free));
+    const load = createAvailabilityLoader({ one: vi.fn(), many });
+    await Promise.all(Array.from({ length: MAX_BATCH_CLAIM + 2 }, (_, i) => load(d(`p${i}`))));
+    expect(many.mock.calls.map(([items]) => items.length)).toEqual([MAX_BATCH_CLAIM, 2]);
+  });
+
+  it('批量请求失败或结果数量不符时，这一批的每个查询都失败', async () => {
+    const error = new ApiError('网络连接失败', { code: 'network' });
+    const failing = createAvailabilityLoader({ one: vi.fn(), many: vi.fn().mockRejectedValue(error) });
+    const settled = await Promise.allSettled([failing(d('one')), failing(d('two'))]);
+    expect(settled).toEqual([{ status: 'rejected', reason: error }, { status: 'rejected', reason: error }]);
+    const short = createAvailabilityLoader({ one: vi.fn(), many: vi.fn(async () => [free(d('one'))]) });
+    const mismatched = await Promise.allSettled([short(d('one')), short(d('two'))]);
+    expect(mismatched.map((item) => item.status)).toEqual(['rejected', 'rejected']);
   });
 });

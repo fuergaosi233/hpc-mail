@@ -1,6 +1,6 @@
 import { claimMailboxRequestSchema, updateMailboxRequestSchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
-import { ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../../lib/http.js';
+import { execCtx, ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../../lib/http.js';
 import { AppError } from '../../lib/errors.js';
 import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
 import { checkAvailability, claimMailbox, listMailboxes, releaseMailbox, updateMailbox } from '../../services/mailbox.js';
@@ -42,7 +42,7 @@ app.put('/:id', async (c) => {
 app.delete('/:id', async (c) => {
   requireScope(c, 'mailbox.write');
   const key = c.get('apiKey')!;
-  const result = await releaseMailbox(c.env, key.userId, parseId(c.req.param('id')), key.role === 'admin', parseBooleanFlag(c.req.query('deleteHistory')));
+  const result = await releaseMailbox(c.env, key.userId, parseId(c.req.param('id')), key.role === 'admin', parseBooleanFlag(c.req.query('deleteHistory')), execCtx(c));
   return ok(c, { success: true, ...result });
 });
 

@@ -127,6 +127,13 @@
       "when": 1791714965337,
       "tag": "0017_user_mailbox_policy",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1792036381300,
+      "tag": "0018_active_admin_index",
+      "breakpoints": true
     }
   ]
 }
