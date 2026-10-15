@@ -4,7 +4,7 @@ import { chunk } from '../lib/d1.js';
 import { createDb } from '../db/client.js';
 import { mailboxes } from '../db/schema.js';
 import type { Env } from '../types.js';
-import { getSettings } from './setting.js';
+import { getSettings, getSettingsFresh } from './setting.js';
 import { loadMailboxPolicyUser, resolveMailboxPolicy } from './mailbox-policy.js';
 
 /**
@@ -31,8 +31,7 @@ export async function getPublicDomains(env: Env, settings?: Settings): Promise<s
 
 /**
  * 当前用户可以新增认领的域名；用户专属配置与认领校验使用同一解析器。
- * 仅供展示（/api/domains、/v1/domains）：未传 settings 时走 isolate 缓存（其他 isolate 最长 15s 陈旧），
- * 与用户策略并行读取；认领校验在 mailbox.ts 另行直读 D1，不依赖这里的结果。
+ * 直读 D1（与用户策略并行，不多一层往返）：认领弹窗以它为前端闸门，管理员增删域名后必须立即可见。
  */
 export async function getVisibleDomains(
   env: Env,
@@ -41,7 +40,7 @@ export async function getVisibleDomains(
 ): Promise<string[]> {
   const [user, resolved] = await Promise.all([
     loadMailboxPolicyUser(createDb(env), userId),
-    settings ?? getSettings(env),
+    settings ?? getSettingsFresh(env),
   ]);
   return resolveMailboxPolicy(resolved, user).domains.map(({ domain }) => domain);
 }

@@ -94,7 +94,7 @@ export const schemas: Record<string, Schema> = {
   MessagePage: page(ref('MessageSummary')), Attachment: attachment, Mailbox: mailbox,
   SessionMessagePage: object({ items: array(ref('MessageSummary')), nextCursor: nullable(str),
     head: { ...str, description: 'First page only (no cursor and no afterId): opaque fingerprint of this page for the current filters, same algorithm as /messages/sync head. Compare for equality only.' } }, ['head']),
-  MessageSync: object({ unread: { ...int, description: 'Same value as /messages/unread-count.' },
+  MessageSync: object({ unread: { ...int, maximum: 1000, description: 'Same value as /messages/unread-count: counting stops at 1000, so 1000 means at least 1000.' },
     head: { ...str, description: 'Opaque fingerprint of the first page for these filters. When it differs from the head of the loaded first page, refetch the list.' } }),
   BatchClaimMailboxResult: object({ claimed: array(ref('Mailbox')),
     taken: { ...array(ref('ClaimMailboxRequest')), description: 'Skipped because the address is already claimed; request order.' },

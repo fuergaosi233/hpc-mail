@@ -8,6 +8,7 @@ import type {
   Page,
   Role,
 } from '@hpc-mail/shared';
+import { UNREAD_COUNT_CAP } from '@hpc-mail/shared';
 import {
   and,
   asc,
@@ -492,11 +493,8 @@ function matchesSender(fromAddress: string, filter: string | undefined): boolean
   return filter.startsWith('@') ? sender.endsWith(filter) : sender === filter;
 }
 
-/**
- * /api 未读数封顶：侧栏超过 99 显示 99+、标题超过 999 显示 999+，数到 1000 以上的精确值用户看不到，
- * 未读堆积多的管理员每次轮询却要数完全部未读。
- */
-export const UNREAD_COUNT_CAP = 1000;
+/** /api 未读数封顶值在 @hpc-mail/shared，前后端共用；这里重新导出给路由 */
+export { UNREAD_COUNT_CAP };
 
 /**
  * 收件箱未读数：口径同 /inbox 的未读筛选（scope=mine + inbound + 未读），一条 COUNT 查询。

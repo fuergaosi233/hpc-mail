@@ -74,7 +74,7 @@ export function buildSessionOpenApiSpec(origin: string) {
       description: 'Irreversible metadata removal. R2 cleanup failures are retried durably. Count reflects actual permitted deletions, not the input id count.' }) },
     '/messages/star': { post: operation('Set per-user stars', changed, { request: 'StarMessagesRequest', parameters: mutationQuery }) },
     '/messages/unread-count': { get: operation('Count unread inbox messages', object({ unread: int }), {
-      description: 'Counts only addresses the caller claimed. Shared mail is excluded because its read state belongs to the owner.' }) },
+      description: 'Counts only addresses the caller claimed. Shared mail is excluded because its read state belongs to the owner. Counting stops at 1000 (1000 means at least 1000); /v1/messages/unread-count returns the exact value.' }) },
     '/messages/contacts': { get: operation('Read recent contact addresses', object({ contacts: array(str) }), { parameters: scopeQuery }) },
     '/messages/{id}': { get: operation('Read full message detail', ref('MessageDetail'), { parameters: scopeQuery,
       description: 'replyTo supplies preferred reply targets; fall back to fromAddress. Attachment URLs are short-lived signed URLs. Degraded mail has errorDetail; hasRaw reports archive availability.' }) },

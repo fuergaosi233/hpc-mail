@@ -324,7 +324,7 @@ describe('/api/domains 往返', () => {
     { domain: 'perf-priv.example', public: false, perUserLimit: 0 },
   ];
 
-  it('鉴权 batch 之后用户策略与设置并行读取（最多 2 层 D1），结果与认领口径一致', async () => {
+  it('鉴权 batch 之后用户策略与设置并行直读（最多 2 层 D1），结果与认领口径一致', async () => {
     await updateSettings(env, { domains: { list } });
     const userId = await seedUser('perf-domains-user');
     const adminId = await seedUser('perf-domains-admin', { role: 'admin' });
@@ -346,9 +346,26 @@ describe('/api/domains 往返', () => {
       traced.reset();
       const hot = await request('/api/domains', bearer(token), traced.env);
       expect(((await hot.json()) as { data: string[] }).data).toEqual(want);
-      expect(traced.calls.map((call) => call.kind)).toEqual(['batch', 'single']);
+      // 设置直读 D1（认领弹窗的前端闸门要立即反映域名变更），与策略读取并行，仍是 2 层
+      expect(traced.calls.map((call) => call.kind)).toEqual(['batch', 'single', 'single']);
       expect(traced.layers()).toBe(2);
     }
+  });
+
+  it('其他 isolate 更新域名（本 isolate 内存缓存未失效）后立即可见', async () => {
+    const userId = await seedUser('perf-domains-other-isolate');
+    const token = await jwtFor(userId);
+    await updateSettings(env, { domains: { list } });
+    // 预热本 isolate 的设置内存缓存
+    expect(((await (await request('/api/config', {})).json()) as { data: { domains: string[] } }).data.domains).toEqual(['perf-pub.example']);
+    // 模拟另一 isolate 的写入：直接改 D1，不经过本 isolate 的缓存失效
+    const domains = await getSettingsFresh(env);
+    await env.db.prepare(`UPDATE settings SET value = ? WHERE key = 'domains'`)
+      .bind(JSON.stringify({ ...domains.domains, list: list.map((entry) => ({ ...entry, public: true })) })).run();
+    expect(((await (await request('/api/domains', bearer(token))).json()) as { data: string[] }).data)
+      .toEqual(['perf-pub.example', 'perf-priv.example']);
+    invalidateSettingsMemory();
+    await updateSettings(env, { domains: { list: [] } });
   });
 
   it('同 isolate 内更新域名后立即可见', async () => {

@@ -32,7 +32,6 @@ export const queryKeys = {
     thread: (id: number, view?: { scope?: string; userId?: number }) =>
       ['messages', 'thread', id, view] as const,
     unreadCount: ['messages', 'unread-count'] as const,
-    sync: (filters: Partial<ListMessagesQuery>) => ['messages', 'sync', filters] as const,
   },
 
   apiKeys: {

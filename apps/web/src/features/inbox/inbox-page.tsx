@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AtSign, MailOpen, RefreshCw } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import type { MarkAllReadRequest } from '@hpc-mail/shared';
+import { UNREAD_COUNT_CAP, type MarkAllReadRequest } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
 import { useRestoredQueryRefreshing } from '@/app/query-persistence';
@@ -24,7 +24,6 @@ import { rememberFilterAddress, useInboxFilters } from './use-inbox-filters';
 import { useUnreadCount } from './use-unread-count';
 
 /** 未读数由服务端封顶计数（UNREAD_COUNT_CAP），到顶时只知道「至少这么多」 */
-const UNREAD_COUNT_CAP = 1000;
 const formatUnreadTotal = (count: number) => (count >= UNREAD_COUNT_CAP ? `${UNREAD_COUNT_CAP}+` : String(count));
 
 const byDomainThenAddress = (a: { domain: string; address: string }, b: { domain: string; address: string }) =>
