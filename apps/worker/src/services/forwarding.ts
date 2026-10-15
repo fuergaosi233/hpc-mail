@@ -5,9 +5,9 @@ import { attachments } from '../db/schema.js';
 import { hmacSha256Base64 } from '../lib/crypto.js';
 import { normalizeEmail } from '../lib/email-address.js';
 import { bytesToBase64, encodeBodyBase64, foldBase64, foldMimeHeaders, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
-import { htmlToText } from '../lib/text.js';
+import { htmlToText, type MailText } from '../lib/text.js';
 import type { Env } from '../types.js';
-import { bumpCounter, dayWindow } from './rate-counter.js';
+import { counterResult, counterStatement, dayWindow } from './rate-counter.js';
 import { retainExternalAttachments } from './external-attachment.js';
 import { injectAttachmentLinks } from './attachment-links.js';
 import { FORWARD_DOMAIN_DAILY_LIMIT, FORWARD_TARGET_DAILY_LIMIT, recordDeliveryResult } from './notification-jobs.js';
@@ -41,6 +41,8 @@ export interface ForwardMail {
   html: string;
   replyTo: string[];
   attachments: ForwardAttachment[];
+  /** 收件链路的正文视图：中转正文未改写时复用同一份 HTML → 纯文本转换结果 */
+  mailText?: MailText;
 }
 
 export async function relayMarker(env: Env): Promise<string> {
@@ -87,6 +89,8 @@ async function relayForward(env: Env, target: string, mail: ForwardMail): Promis
     throw new Error('转发正文超过外发大小上限，请在邮箱网站查看完整邮件');
   }
 
+  // 附件改为下载链接时正文已改写，只能重新转换
+  const plainText = mail.mailText && text === mail.text && html === mail.html ? mail.mailText.plain : text || htmlToText(html);
   const msg = createMimeMessage();
   msg.setSender({ name: `${mail.fromName || mail.fromAddress} (via HPC Mail)`, addr: sender });
   msg.setRecipient(target);
@@ -98,7 +102,7 @@ async function relayForward(env: Env, target: string, mail: ForwardMail): Promis
     charset: 'UTF-8',
     encoding: 'base64',
     data: encodeBodyBase64(
-      `———— HPC Mail 转发 ————\n${metaLines.join('\n')}\n————————————————\n\n${text || htmlToText(html)}`,
+      `———— HPC Mail 转发 ————\n${metaLines.join('\n')}\n————————————————\n\n${plainText}`,
     ),
   });
   if (html) {
@@ -154,11 +158,12 @@ export async function forwardReceivedMail(
     let status: 'succeeded' | 'failed' | 'skipped' = 'succeeded';
     let detail = '';
     try {
-      const [domainUsage, targetUsage] = await Promise.all([
-        bumpCounter(env, 'fwd-domain', mail.domain, window),
-        bumpCounter(env, 'fwd-target', target, window),
-      ]);
-      if (domainUsage.count > FORWARD_DOMAIN_DAILY_LIMIT || targetUsage.count > FORWARD_TARGET_DAILY_LIMIT) {
+      // 域名与目标两个日计数合成一个 D1 往返
+      const [domainUsage, targetUsage] = (await env.db.batch([
+        counterStatement(env, 'fwd-domain', mail.domain, window),
+        counterStatement(env, 'fwd-target', target, window),
+      ])).map(result => counterResult(result)?.count ?? 1) as [number, number];
+      if (domainUsage > FORWARD_DOMAIN_DAILY_LIMIT || targetUsage > FORWARD_TARGET_DAILY_LIMIT) {
         status = 'skipped';
         detail = '今日转发额度已用尽';
       } else {
