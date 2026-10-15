@@ -17,7 +17,7 @@ const LEGACY_KV_CACHE_KEY = 'setting-cache';
 const SETTINGS_SQL = 'SELECT key, value FROM settings';
 
 /** 设置行与默认值合并（逐 key safeParse，非法回落默认） */
-function mergeSettingRows(rows: readonly { key: string; value: string }[]): Settings {
+export function mergeSettingRows(rows: readonly { key: string; value: string }[]): Settings {
   const stored = new Map(rows.map((r) => [r.key, r.value]));
   const merged = { ...DEFAULT_SETTINGS } as Settings;
   for (const key of Object.keys(SETTING_SCHEMAS) as SettingKey[]) {

@@ -8,10 +8,10 @@ import { mailboxes, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import {
-  claimSettingsFromResult, claimSettingsStatement, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy,
+  claimSettingsStatement, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy,
   type ClaimSettings, type MailboxPolicyUser,
 } from './mailbox-policy.js';
-import { getSettingsFresh } from './setting.js';
+import { getSettingsFresh, mergeSettingRows } from './setting.js';
 import { PURGE_MESSAGES_INDEX, purgeStatements } from './message-lifecycle.js';
 import { scheduleStorageCleanup } from './storage-cleanup.js';
 
@@ -147,6 +147,10 @@ interface ClaimContext {
 
 const addressOf = (req: ClaimMailboxRequest) => `${req.localPart}@${req.domain}`;
 
+/** 与 getSettingsFresh 同一个合并函数（只读回 domains / mailbox_policy 两行，其余项为默认值且不使用） */
+const claimSettingsFrom = (result: D1Result | undefined): ClaimSettings =>
+  mergeSettingRows((result?.results ?? []) as { key: string; value: string }[]);
+
 /** 规则所需的全部读取合成一个 D1 batch：认领设置（强一致直读）、用户权限、已认领数、地址占用。 */
 async function loadClaimContext(env: Env, actor: { userId: number; role: Role }, addresses: string[]): Promise<ClaimContext> {
   const unique = [...new Set(addresses)];
@@ -158,7 +162,7 @@ async function loadClaimContext(env: Env, actor: { userId: number; role: Role },
   ]);
   return {
     userId: actor.userId,
-    settings: claimSettingsFromResult(settingsResult),
+    settings: claimSettingsFrom(settingsResult),
     user: mailboxPolicyUserFromResult(userResult),
     owned: ownedCountsFromResult(ownedResult),
     taken: new Set(((takenResult?.results ?? []) as { address: string }[]).map((row) => row.address)),
@@ -247,7 +251,7 @@ async function claimGuardError(env: Env, context: ClaimContext): Promise<AppErro
     claimSettingsStatement(env.db),
     mailboxPolicyUserStatement(env.db, context.userId),
   ]);
-  const current = claimSettingsFromResult(settingsResult);
+  const current = claimSettingsFrom(settingsResult);
   if ((current.domains.revision ?? 0) !== (context.settings.domains.revision ?? 0)) {
     return new AppError('conflict', '域名配置已改变，请刷新后重试');
   }
@@ -283,8 +287,10 @@ export async function claimMailboxes(
 ): Promise<BatchClaimMailboxResult> {
   const result: BatchClaimMailboxResult = { claimed: [], taken: [], notAttempted: [], stoppedBy: null };
   let index = 0;
+  let started = false;
   try {
     const context = await loadClaimContext(env, { userId, role }, items.map(addressOf));
+    started = true;
     for (; index < items.length; index++) {
       const item = items[index]!;
       try {
@@ -295,8 +301,15 @@ export async function claimMailboxes(
       }
     }
   } catch (error) {
-    if (!(error instanceof AppError)) throw error;
-    result.stoppedBy = { code: error.code, message: error.message };
+    if (error instanceof AppError) {
+      result.stoppedBy = { code: error.code, message: error.message };
+    } else if (started) {
+      // 已有地址提交后不能变成 500：调用方需要知道哪些已认领。出错那项结果不确定，与其后各项一起列入 notAttempted。
+      console.error('批量认领中断:', error);
+      result.stoppedBy = { code: 'internal', message: '认领中断，部分地址可能已认领，请以邮箱列表为准' };
+    } else {
+      throw error;
+    }
     result.notAttempted = items.slice(index);
   }
   return result;

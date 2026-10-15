@@ -1,14 +1,18 @@
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
-import { describe, expect, it } from 'vitest';
-import { MAX_BATCH_CLAIM, type BatchClaimMailboxResult, type ClaimMailboxRequest, type Mailbox, type MailboxAvailability, type UserMailboxPolicy } from '@hpc-mail/shared';
+import { describe, expect, it, vi } from 'vitest';
+import {
+  DEFAULT_SETTINGS, MAX_BATCH_CLAIM, type BatchClaimMailboxResult, type ClaimMailboxRequest, type Mailbox, type MailboxAvailability, type UserMailboxPolicy,
+} from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { mailboxes, messages, users } from '../src/db/schema.js';
+import type { AppError } from '../src/lib/errors.js';
 import { signToken } from '../src/lib/jwt.js';
 import { checkAvailability, checkAvailabilityBatch, claimMailbox, claimMailboxes } from '../src/services/mailbox.js';
+import { loadMailboxPolicyUser, mailboxPolicyUserFromResult, mailboxPolicyUserStatement } from '../src/services/mailbox-policy.js';
 import { createSession } from '../src/services/session.js';
-import { updateSettings } from '../src/services/setting.js';
+import { getSettingsFresh, updateSettings } from '../src/services/setting.js';
 import { updateUser } from '../src/services/user.js';
 import type { Env } from '../src/types.js';
 
@@ -61,27 +65,38 @@ async function data<T>(response: Response, status = 200): Promise<T> {
 const ownedBy = async (userId: number) => (await db.select().from(mailboxes).where(eq(mailboxes.userId, userId))).map((row) => row.address).sort();
 
 /** 统计 D1 往返：每次 batch 与每条单独执行的语句各算一次 */
-function counting(hook?: (sql: string) => Promise<void>): { env: Env; trips: () => number } {
+function counting(hook?: (sql: string) => Promise<void>, onBatch?: (sqls: string[]) => Promise<void>): { env: Env; trips: () => number } {
   let trips = 0;
-  const wrap = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => new Proxy(statement, {
-    get(target, property) {
-      if (property === 'bind') return (...args: unknown[]) => wrap(target.bind(...args), sql);
-      const method = Reflect.get(target, property);
-      if (typeof method !== 'function') return method;
-      return async (...args: unknown[]) => {
-        if (['first', 'all', 'run', 'raw'].includes(String(property))) { trips++; await hook?.(sql); }
-        return method.apply(target, args);
-      };
-    },
-  });
+  const sqlOf = new WeakMap<object, string>();
+  const wrap = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => {
+    const proxy = new Proxy(statement, {
+      get(target, property) {
+        if (property === 'bind') return (...args: unknown[]) => wrap(target.bind(...args), sql);
+        const method = Reflect.get(target, property);
+        if (typeof method !== 'function') return method;
+        return async (...args: unknown[]) => {
+          if (['first', 'all', 'run', 'raw'].includes(String(property))) { trips++; await hook?.(sql); }
+          return method.apply(target, args);
+        };
+      },
+    });
+    sqlOf.set(proxy, sql);
+    return proxy;
+  };
   const wrapped = { ...env, db: new Proxy(env.db, { get(target, property) {
     if (property === 'prepare') return (sql: string) => wrap(target.prepare(sql), sql);
-    if (property === 'batch') return async (statements: D1PreparedStatement[]) => { trips++; return target.batch(statements); };
+    if (property === 'batch') return async (statements: D1PreparedStatement[]) => {
+      trips++;
+      await onBatch?.(statements.map((statement) => sqlOf.get(statement) ?? ''));
+      return target.batch(statements);
+    };
     const method = Reflect.get(target, property);
     return typeof method === 'function' ? method.bind(target) : method;
   } }) } as Env;
   return { env: wrapped, trips: () => trips };
 }
+
+const INTERRUPTED = { code: 'internal', message: '认领中断，部分地址可能已认领，请以邮箱列表为准' };
 
 describe('批量认领', () => {
   it('按顺序逐个认领：被占用（含本批重复）的跳过并继续，认领结果与单个认领同形', async () => {
@@ -239,5 +254,94 @@ describe('认领与可用性的 D1 往返', () => {
     await expect(claimMailbox(probe.env, f.other.id, 'user', f.item('late', limitedDomain)))
       .rejects.toMatchObject({ code: 'forbidden', message: '认领配额已在并发请求中用尽，请刷新后重试' });
     expect(probe.trips()).toBe(3);
+  });
+});
+
+describe('批量认领中断', () => {
+  it('已认领若干项后 D1 故障：HTTP 200，保留 claimed，stoppedBy=internal，出错项及其后进入 notAttempted，并记录原始错误', async () => {
+    const f = await fixture();
+    const failure = new Error('D1_ERROR: transient');
+    let inserts = 0;
+    const racing = counting(async (sql) => {
+      if (/INSERT INTO mailboxes/i.test(sql) && ++inserts === 3) throw failure;
+    });
+    const items = [f.item('a'), f.item('b'), f.item('c'), f.item('d')];
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const ctx = createExecutionContext();
+      const response = await app.request('/api/mailboxes/batch', { method: 'POST',
+        headers: { Authorization: `Bearer ${f.user.jwt}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ items }) }, racing.env, ctx);
+      await waitOnExecutionContext(ctx);
+      const result = await data<BatchClaimMailboxResult>(response);
+      expect(result.claimed.map((box) => box.address)).toEqual([`${f.prefix}-a@${openDomain}`, `${f.prefix}-b@${openDomain}`]);
+      expect(result).toMatchObject({ taken: [], notAttempted: items.slice(2), stoppedBy: INTERRUPTED });
+      expect(logged.mock.calls.some((args) => args.includes(failure))).toBe(true);
+    } finally {
+      logged.mockRestore();
+    }
+    expect(await ownedBy(f.user.id)).toEqual([`${f.prefix}-a@${openDomain}`, `${f.prefix}-b@${openDomain}`]);
+  });
+
+  it('守卫未通过后诊断读取失败，同样收进 stoppedBy', async () => {
+    const f = await fixture();
+    let raced = false;
+    // 写入前并发占满按域额度 → 守卫拒绝 → 诊断读取的 batch 失败
+    const racing = counting(async (sql) => {
+      if (/INSERT INTO mailboxes/i.test(sql) && !raced) {
+        raced = true;
+        await f.own(f.user.id, f.item('race', limitedDomain));
+      }
+    }, async () => { if (raced) throw new Error('D1_ERROR: diagnose failed'); });
+    const items = [f.item('x', limitedDomain), f.item('y')];
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await claimMailboxes(racing.env, f.user.id, 'user', items);
+      expect(result).toMatchObject({ claimed: [], taken: [], notAttempted: items, stoppedBy: INTERRUPTED });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('开始逐项处理之前的非业务错误仍抛出（500）', async () => {
+    const f = await fixture();
+    const failure = new Error('D1_ERROR: unavailable');
+    const broken = counting(undefined, async () => { throw failure; });
+    await expect(claimMailboxes(broken.env, f.user.id, 'user', [f.item('a')])).rejects.toBe(failure);
+    const ctx = createExecutionContext();
+    const response = await app.request('/api/mailboxes/batch', { method: 'POST',
+      headers: { Authorization: `Bearer ${f.user.jwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [f.item('a')] }) }, counting(undefined, async (sqls) => {
+      // 鉴权 batch 放行，认领读取 batch 失败
+      if (sqls.some((sql) => /FROM mailboxes WHERE address IN/.test(sql))) throw failure;
+    }).env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(500);
+    expect(await ownedBy(f.user.id)).toEqual([]);
+  });
+});
+
+describe('认领读取与单独读取同一解码', () => {
+  it('合批与 loadMailboxPolicyUser 对公共、专属、禁用、缺失用户结果一致', async () => {
+    const f = await fixture();
+    const policy: UserMailboxPolicy = { perUserLimit: 3, domains: [{ domain: privateDomain, perUserLimit: 1 }] };
+    await updateUser(env, f.admin.id, f.other.id, { mailboxPolicy: policy, expectedMailboxPolicyRevision: 0 });
+    await db.update(users).set({ status: 'disabled' }).where(eq(users.id, f.admin.id));
+    const outcome = (promise: Promise<unknown>) => promise.then((value) => ({ value }), (error: AppError) => ({ code: error.code, message: error.message }));
+    for (const id of [f.user.id, f.other.id, f.admin.id, 999_999_999]) {
+      const batched = outcome((async () => mailboxPolicyUserFromResult((await env.db.batch([mailboxPolicyUserStatement(env.db, id)]))[0]))());
+      expect(await batched).toEqual(await outcome(loadMailboxPolicyUser(createDb(env), id)));
+    }
+    expect(await loadMailboxPolicyUser(createDb(env), f.other.id)).toEqual({ id: f.other.id, role: 'user', status: 'active', mailboxPolicy: policy, mailboxPolicyRevision: 1 });
+  });
+
+  it('认领设置非法时与 getSettingsFresh 一样回落默认值', async () => {
+    const f = await fixture();
+    await env.db.prepare(`UPDATE settings SET value = ? WHERE key = 'mailbox_policy'`).bind(JSON.stringify({ perUserLimit: -5, reservedLocalParts: [] })).run();
+    expect((await getSettingsFresh(env)).mailbox_policy).toEqual(DEFAULT_SETTINGS.mailbox_policy);
+    // 默认保留前缀含 postmaster；fixture 与损坏行都不含
+    expect(await checkAvailability(env, { userId: f.user.id, role: 'user' }, 'postmaster', openDomain))
+      .toEqual({ address: `postmaster@${openDomain}`, available: false, reason: 'reserved' });
+    expect((await claimMailboxes(env, f.user.id, 'user', [{ localPart: 'postmaster', domain: openDomain }])).stoppedBy)
+      .toEqual({ code: 'forbidden', message: '前缀 postmaster 为系统保留，无法认领' });
   });
 });
