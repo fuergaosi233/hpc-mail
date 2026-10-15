@@ -163,13 +163,13 @@ describe('JWT 鉴权单次往返', () => {
 });
 
 describe('settings 读取缓存', () => {
-  it('isolate 内存缓存命中直写的旧值，updateSettings 立即失效；KV 回填走 waitUntil', async () => {
+  it('isolate 内存缓存命中直写的旧值，updateSettings 立即失效；不回填 KV 缓存', async () => {
     invalidateSettingsMemory();
     await env.kv.delete('setting-cache');
     const ctx = createExecutionContext();
     const first = await getSettings(env, ctx);
     await waitOnExecutionContext(ctx);
-    expect(await env.kv.get('setting-cache')).not.toBeNull();
+    expect(await env.kv.get('setting-cache')).toBeNull();
     await env.db.prepare("INSERT INTO settings (key, value) VALUES ('site', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
       .bind(JSON.stringify({ ...first.site, title: 'Direct Write Title' })).run();
     expect((await getSettings(env)).site.title).toBe(first.site.title);

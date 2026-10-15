@@ -1,15 +1,18 @@
 import type { PublicConfig } from '@hpc-mail/shared';
 import { Hono } from 'hono';
-import { execCtx, ok } from '../lib/http.js';
+import { ok } from '../lib/http.js';
 import { getPublicDomains } from '../services/domain.js';
 import { getSettings, isTranslationReady } from '../services/setting.js';
 import type { AppContext } from '../types.js';
 
 const app = new Hono<AppContext>();
 
-/** 公开配置：站点名 / 注册模式 / 公开域名表 / 翻译是否可用（无鉴权，仅暴露对普通用户开放的域名） */
+/**
+ * 公开配置：站点名 / 注册模式 / 公开域名表 / 翻译是否可用（无鉴权，仅暴露对普通用户开放的域名）。
+ * 热 isolate 命中设置内存缓存，不访问 D1/KV；冷 isolate 只读一次 D1。
+ */
 app.get('/', async (c) => {
-  const settings = await getSettings(c.env, execCtx(c));
+  const settings = await getSettings(c.env);
   const config: PublicConfig = {
     siteTitle: settings.site.title,
     registrationMode: settings.register_mode,
