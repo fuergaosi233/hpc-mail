@@ -100,7 +100,10 @@ function claimFailure(items: AddressDraft[], error: unknown, hint: string): Clai
   return { claimed: [], remaining: items, stoppedBy: `${failureText(error)}。${hint}`, uncertain: true };
 }
 
-/** 批量认领结果映射回 ClaimListResult：被占用的与没尝试的按用户给出的顺序合并 */
+/**
+ * 批量认领结果映射回 ClaimListResult：被占用的与没尝试的按用户给出的顺序合并。
+ * stoppedBy.code 为 internal 表示后端中途遇到非业务错误，出错那一项可能已经提交：按结果未知处理。
+ */
 export function fromBatchResult(drafts: AddressDraft[], result: BatchClaimMailboxResult): ClaimListResult {
   const order = new Map(drafts.map((draft, index) => [draftKey(draft), index]));
   const position = (draft: AddressDraft) => order.get(draftKey(draft)) ?? drafts.length;
@@ -111,6 +114,7 @@ export function fromBatchResult(drafts: AddressDraft[], result: BatchClaimMailbo
     claimed: result.claimed.map((mailbox) => mailbox.address),
     remaining,
     stoppedBy: result.stoppedBy?.message ?? null,
+    ...(result.stoppedBy?.code === 'internal' ? { uncertain: true as const } : {}),
   };
 }
 
@@ -148,11 +152,15 @@ export async function claimList(
 /**
  * 可用性查询合批：同一轮同步代码里发起的查询（随机生成一批、失效后一起重查）合成一次批量请求，
  * 每次最多 MAX_BATCH_CLAIM 个；只有一个时仍走单个查询接口。结果按请求顺序对应回各自的调用。
+ * 失败由这里整批重试一次（4xx 不重试），调用方的查询应关闭逐个重试，否则各自的重试定时器会绕过合批。
  */
-export function createAvailabilityLoader(api: {
-  one: (item: ClaimMailboxRequest) => Promise<MailboxAvailability>;
-  many: (items: ClaimMailboxRequest[]) => Promise<MailboxAvailability[]>;
-}): (item: ClaimMailboxRequest) => Promise<MailboxAvailability> {
+export function createAvailabilityLoader(
+  api: {
+    one: (item: ClaimMailboxRequest) => Promise<MailboxAvailability>;
+    many: (items: ClaimMailboxRequest[]) => Promise<MailboxAvailability[]>;
+  },
+  { retryDelayMs = 1000 }: { retryDelayMs?: number } = {},
+): (item: ClaimMailboxRequest) => Promise<MailboxAvailability> {
   interface Pending {
     item: ClaimMailboxRequest;
     resolve: (value: MailboxAvailability) => void;
@@ -160,13 +168,22 @@ export function createAvailabilityLoader(api: {
   }
   let queue: Pending[] = [];
 
+  const request = async (items: ClaimMailboxRequest[]) =>
+    items.length === 1 ? [await api.one(items[0]!)] : api.many(items);
+  const retryable = (error: unknown) =>
+    !(error instanceof ApiError && error.httpStatus !== null && error.httpStatus >= 400 && error.httpStatus < 500);
+
   const run = async (batch: Pending[]) => {
+    const items = batch.map((pending) => pending.item);
     try {
-      if (batch.length === 1) {
-        batch[0]!.resolve(await api.one(batch[0]!.item));
-        return;
+      let results: MailboxAvailability[];
+      try {
+        results = await request(items);
+      } catch (error) {
+        if (!retryable(error)) throw error;
+        await new Promise((resolve) => globalThis.setTimeout(resolve, retryDelayMs));
+        results = await request(items);
       }
-      const results = await api.many(batch.map((pending) => pending.item));
       if (results.length !== batch.length) throw new Error('可用性检查结果数量不符');
       batch.forEach((pending, index) => pending.resolve(results[index]!));
     } catch (error) {

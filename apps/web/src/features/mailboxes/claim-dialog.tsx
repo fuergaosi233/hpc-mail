@@ -111,6 +111,8 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       return {
         queryKey: queryKeys.mailboxes.availability(target.localPart, target.domain),
         queryFn: () => checkAvailability(target),
+        // 失败由 loader 整批重试；逐行重试各有定时器，会绕过合批变成一串单个请求
+        retry: false,
         enabled:
           open &&
           !result &&

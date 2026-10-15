@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, type QueryClientConfig, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/errors';
@@ -62,8 +62,12 @@ beforeAll(() => {
   Element.prototype.releasePointerCapture ??= () => {};
 });
 
-function renderDialog(domains = ['example.com'], onOpenChange = vi.fn()) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderDialog(
+  domains = ['example.com'],
+  onOpenChange = vi.fn(),
+  queries: QueryClientConfig['defaultOptions'] = { queries: { retry: false } },
+) {
+  const client = new QueryClient({ defaultOptions: queries });
   const wrap = (list: string[]) => (
     <QueryClientProvider client={client}>
       <ClaimDialog open onOpenChange={onOpenChange} domains={list} />
@@ -312,6 +316,37 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('服务器内部错误。该地址可能已认领，请以邮箱列表为准');
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['mailboxes'] });
     expect(mocks.batchClaim).not.toHaveBeenCalled();
+    client.clear();
+  });
+
+  it('批量认领后端中途非业务错误停止（internal）：出错那项可能已提交，照样刷新我的邮箱', async () => {
+    mocks.batchClaim.mockResolvedValueOnce({
+      claimed: [], taken: [], notAttempted: [],
+      stoppedBy: { code: 'internal', message: '认领中断，部分地址可能已认领，请以邮箱列表为准' },
+    });
+    const { client } = renderDialog(['one.test']);
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
+    setCount('2');
+    fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
+    fireEvent.click(screen.getByRole('button', { name: '认领 2 个' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('认领中断，部分地址可能已认领，请以邮箱列表为准');
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['mailboxes'] });
+    client.clear();
+  });
+
+  it('批量可用性检查失败：只整批重试一次，不会退化成逐行的单个请求', async () => {
+    const offline = new ApiError('网络连接失败', { code: 'network' });
+    mocks.batchAvailability.mockRejectedValueOnce(offline).mockRejectedValueOnce(offline);
+    // 与线上一致：非 4xx 错误默认会按行重试（这里把延迟调短，逐行重试若存在会很快暴露）
+    const { client } = renderDialog(['one.test'], vi.fn(), {
+      queries: { retry: (count) => count < 2, retryDelay: 10 },
+    });
+    setCount('3');
+    fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
+    await waitFor(() => expect(mocks.batchAvailability).toHaveBeenCalledTimes(2), { timeout: 3000 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(mocks.batchAvailability).toHaveBeenCalledTimes(2);
+    expect(mocks.availability).not.toHaveBeenCalled();
     client.clear();
   });
 
