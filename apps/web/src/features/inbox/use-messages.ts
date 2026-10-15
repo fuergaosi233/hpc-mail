@@ -54,11 +54,13 @@ export function useMessagesQuery(query: Partial<ListMessagesQuery>) {
         if (controller.signal.aborted) return;
         markUnreadRefreshed(queryClient);
         setPollError(null);
-        if (!untouched(since)) return;
+        // The unread count does not depend on list edits (the unread-count query is paused meanwhile): write it unless
+        // a mutation is pending or the count was refreshed elsewhere since the request went out.
         const unread = queryClient.getQueryState(queryKeys.messages.unreadCount);
-        if (unread?.dataUpdatedAt === unreadSince && unread?.fetchStatus !== 'fetching') {
+        if (queryClient.isMutating() === 0 && unread?.dataUpdatedAt === unreadSince && unread?.fetchStatus !== 'fetching') {
           queryClient.setQueryData(queryKeys.messages.unreadCount, { unread: sync.unread });
         }
+        if (!untouched(since)) return;
         const latest = queryClient.getQueryState<MessageListData>(queryKey);
         // A first page without head (persisted by an older build) or a failed refetch counts as changed.
         if (!latest?.data || (latest.status !== 'error' && latest.data.pages[0]?.head === sync.head)) return;

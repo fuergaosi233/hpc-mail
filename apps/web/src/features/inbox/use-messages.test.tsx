@@ -6,7 +6,7 @@ import type { ListMessagesQuery, MessageListPage, MessageSummary } from '@hpc-ma
 const api = vi.hoisted(() => ({ list: vi.fn(), sync: vi.fn(), unreadCount: vi.fn() }));
 vi.mock('@/api/resources', () => ({ messageApi: api }));
 import { queryKeys } from '@/api/query-keys';
-import { type MessageListData, syncReadState } from './message-cache';
+import { type MessageListData, syncReadState, syncStarState } from './message-cache';
 import { useMessagesQuery } from './use-messages';
 import { markUnreadRefreshed, nextUnreadRefreshDelay, useUnreadCount } from './use-unread-count';
 
@@ -328,6 +328,25 @@ describe('list polling via /messages/sync', () => {
       focusManager.setFocused(true);
     });
     await waitFor(() => expect(api.sync).toHaveBeenCalledTimes(1));
+    await settle();
+    expect(api.list).toHaveBeenCalledTimes(1);
+  });
+
+  it('writes the unread count even when the list was edited in place during the round', async () => {
+    api.list.mockResolvedValue(page([3, 2], null, 'h1'));
+    let resolveSync: (value: { unread: number; head: string }) => void = () => {};
+    api.sync.mockImplementation(() => new Promise((resolve) => (resolveSync = resolve)));
+    const client = createClient();
+    client.setQueryData(queryKeys.messages.unreadCount, { unread: 1 });
+    const { result } = renderList(client);
+    await waitFor(() => expect(result.current.data).toBeDefined());
+
+    await tick();
+    await waitFor(() => expect(api.sync).toHaveBeenCalledTimes(1));
+    // sync 在途时本地就地改了列表（如加星标）：列表这一轮不重拉，未读数照常写入
+    act(() => syncStarState(client, [3], true, { refetchActive: false }));
+    await act(async () => resolveSync({ unread: 7, head: 'h2' }));
+    await waitFor(() => expect(client.getQueryData(queryKeys.messages.unreadCount)).toEqual({ unread: 7 }));
     await settle();
     expect(api.list).toHaveBeenCalledTimes(1);
   });
