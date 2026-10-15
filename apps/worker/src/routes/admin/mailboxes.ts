@@ -1,5 +1,6 @@
 import { transferMailboxRequestSchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
+import { AppError } from '../../lib/errors.js';
 import { clientIp, ok, parseBody, parseId } from '../../lib/http.js';
 import { requireAdmin, requireAuth } from '../../middleware/auth.js';
 import { transferMailbox } from '../../services/mailbox.js';
@@ -7,6 +8,10 @@ import type { AppContext } from '../../types.js';
 
 const app = new Hono<AppContext>();
 app.use('*', requireAuth, requireAdmin);
+
+app.get('/:id', async () => {
+  throw new AppError('internal', '未实现');
+});
 
 app.post('/:id/transfer', async (c) => {
   const req = await parseBody(c, transferMailboxRequestSchema);

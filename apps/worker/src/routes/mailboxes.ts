@@ -50,6 +50,10 @@ app.delete('/shares/:mailboxId/grantees/:userId', async (c) => {
   return ok(c, { success: true });
 });
 
+app.post('/availability/batch', async () => {
+  throw new AppError('internal', '未实现');
+});
+
 app.get('/availability', async (c) => {
   const req = parseQuery(c, claimMailboxRequestSchema);
   const user = c.get('user')!;
@@ -60,6 +64,10 @@ app.post('/', async (c) => {
   const user = c.get('user')!;
   const req = await parseBody(c, claimMailboxRequestSchema);
   return ok(c, await claimMailbox(c.env, user.id, user.role, req), 201);
+});
+
+app.post('/batch', async () => {
+  throw new AppError('internal', '未实现');
 });
 
 app.put('/:id', async (c) => {

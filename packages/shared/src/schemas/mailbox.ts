@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { LOCAL_PART_REGEX } from '../constants.js';
+import { LOCAL_PART_REGEX, MAX_BATCH_CLAIM } from '../constants.js';
+import type { ErrorCode } from '../envelope.js';
 
 export const localPartSchema = z
   .string()
@@ -21,6 +22,12 @@ export const claimMailboxRequestSchema = z.object({
   domain: domainSchema,
 });
 export type ClaimMailboxRequest = z.infer<typeof claimMailboxRequestSchema>;
+
+/** 批量认领 / 批量可用性检查：按给出的顺序逐个处理 */
+export const batchMailboxRequestSchema = z.object({
+  items: z.array(claimMailboxRequestSchema).min(1).max(MAX_BATCH_CLAIM),
+});
+export type BatchMailboxRequest = z.infer<typeof batchMailboxRequestSchema>;
 
 export const updateMailboxRequestSchema = z.object({
   displayName: z.string().trim().max(64),
@@ -57,6 +64,20 @@ export interface MailboxAvailability {
   available: boolean;
   /** available=false 时说明原因 */
   reason?: MailboxUnavailableReason;
+}
+
+/**
+ * 批量认领结果：按请求顺序逐个认领，与单个认领同一套规则。
+ * 被占用的跳过并继续；其他错误立即停止，已认领的保留。
+ */
+export interface BatchClaimMailboxResult {
+  claimed: Mailbox[];
+  /** 因已被占用而跳过的地址，保持请求顺序 */
+  taken: ClaimMailboxRequest[];
+  /** 停止后没有尝试的地址（含触发停止的那一个），保持请求顺序；全部尝试过时为空 */
+  notAttempted: ClaimMailboxRequest[];
+  /** 停止原因；null 表示全部尝试过 */
+  stoppedBy: { code: ErrorCode; message: string } | null;
 }
 
 export interface MailboxTransferResult {

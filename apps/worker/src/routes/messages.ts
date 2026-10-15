@@ -159,6 +159,10 @@ app.get('/unread-count', async (c) => {
 });
 
 /** 写信收件人自动补全：近期联系人 */
+app.get('/sync', async () => {
+  throw new AppError('internal', '未实现');
+});
+
 app.get('/contacts', async (c) => {
   return ok(c, { contacts: await getRecentContacts(c.env, viewerOf(c)) });
 });

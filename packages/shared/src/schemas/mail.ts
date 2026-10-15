@@ -13,6 +13,7 @@ import {
   MESSAGE_DIRECTIONS,
   type MessageDirection,
 } from '../constants.js';
+import type { Page } from '../envelope.js';
 import { domainSchema, localPartSchema } from './mailbox.js';
 
 export const emailAddressSchema = z
@@ -345,6 +346,17 @@ export interface RecipientOutcome {
   address: string;
   status: 'delivered' | 'sent' | 'failed';
   error?: string;
+}
+
+/** /api 列表页：首页（无 cursor）附带 head 指纹，与 /messages/sync 同算法，只用于比较首页是否变化 */
+export interface MessageListPage extends Page<MessageSummary> {
+  head?: string;
+}
+
+/** /api/messages/sync 轻量轮询：unread 同 /messages/unread-count；head 为当前筛选下首页的指纹 */
+export interface MessageSyncResult {
+  unread: number;
+  head: string;
 }
 
 export interface MessageSummary {

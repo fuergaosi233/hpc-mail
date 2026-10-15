@@ -18,6 +18,8 @@ export const queryKeys = {
     shared: ['mailboxes', 'shared'] as const,
     shares: ['mailboxes', 'shares'] as const,
     shareUsers: (q: string, excludeUserId?: number) => ['mailboxes', 'share-users', q, excludeUserId] as const,
+    /** 管理员按 id 读单个邮箱；挂在 mailboxes 下，所有权变化时随 root 一起失效 */
+    adminDetail: (id: number) => ['mailboxes', 'admin-detail', id] as const,
   },
 
   messages: {
@@ -30,6 +32,7 @@ export const queryKeys = {
     thread: (id: number, view?: { scope?: string; userId?: number }) =>
       ['messages', 'thread', id, view] as const,
     unreadCount: ['messages', 'unread-count'] as const,
+    sync: (filters: Partial<ListMessagesQuery>) => ['messages', 'sync', filters] as const,
   },
 
   apiKeys: {
@@ -44,6 +47,7 @@ export const queryKeys = {
     invites: ['admin', 'invites'] as const,
     domainStatus: (domain: string) => ['admin', 'domain-status', domain] as const,
     mailboxShares: ['admin', 'mailbox-shares'] as const,
+    mailboxSharesOf: (mailboxId: number) => ['admin', 'mailbox-shares', mailboxId] as const,
   },
 } as const;
 

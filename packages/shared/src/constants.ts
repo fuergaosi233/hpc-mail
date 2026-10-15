@@ -71,6 +71,8 @@ export const MAX_WAIT_POLLS_PER_USER_PER_MINUTE = 120;
 export const MAX_AUTH_USER_REQUESTS_PER_MINUTE = 600;
 export const MAX_AUTH_GLOBAL_REQUESTS_PER_MINUTE = 5000;
 export const MAX_DRAFT_ATTACHMENTS_PER_USER = 20;
+/** 批量认领 / 批量可用性检查单次最多处理的地址数 */
+export const MAX_BATCH_CLAIM = 20;
 export const MAX_DRAFT_ATTACHMENT_BYTES_PER_USER = 100 * 1024 * 1024;
 
 /** 用户名：小写字母/数字开头，3-32 位，允许 - _ */

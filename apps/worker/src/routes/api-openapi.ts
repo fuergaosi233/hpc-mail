@@ -47,6 +47,10 @@ export function buildSessionOpenApiSpec(origin: string) {
         query('limit', { type: 'integer', minimum: 1, maximum: 20, default: 20 })],
       description: 'JWT only. Returns only id, username and role for active candidates; no account details or mailbox lists. hasMore means refine the search.'
     }) },
+    '/mailboxes/batch': { post: operation('Claim several addresses in order', ref('BatchClaimMailboxResult'), { request: 'BatchMailboxRequest',
+      description: 'Same rules as POST /mailboxes, applied to each item in request order. An already-claimed address is skipped into taken and the batch continues; any other error stops the batch, keeps the addresses already claimed and reports stoppedBy with the remaining items in notAttempted.' }) },
+    '/mailboxes/availability/batch': { post: operation('Check availability of several addresses', array(ref('MailboxAvailability')), { request: 'BatchMailboxRequest',
+      description: 'Advisory only, same rules as GET /mailboxes/availability. Results follow request order.' }) },
     '/mailboxes/availability': { get: operation('Check mailbox availability', ref('MailboxAvailability'), { parameters: [query('localPart', str, undefined, true), query('domain', str, undefined, true)],
       description: 'Advisory only, not a reservation. Same rules as claiming; when available=false, reason is taken, reserved, quota, domain_limit or domain_unavailable. Claim still re-checks everything.' }) },
     '/mailboxes/{id}': {
@@ -54,7 +58,9 @@ export function buildSessionOpenApiSpec(origin: string) {
       delete: operation('Release mailbox ownership', object({ success: bool, deletedMessages: int }), { parameters: [query('deleteHistory', { type: 'string', enum: ['1', 'true', '0', 'false'] })],
         description: 'Default retains all address history for the next claimant. deleteHistory=1 atomically removes all existing address mail and ownership. Owner or administrator only. Previously delivered external links retain their promised 90-day validity.' }),
     },
-    '/messages': { get: operation('List mail with cursor pagination', ref('MessagePage'), { parameters: listQuery, description: 'unread=1 matches only caller-claimed addresses; other views still include shared inbound mail. trash=1 items include deletedAt. Inbound summaries carry verificationLink (empty when none was detected).' }) },
+    '/messages': { get: operation('List mail with cursor pagination', ref('SessionMessagePage'), { parameters: listQuery, description: 'unread=1 matches only caller-claimed addresses; other views still include shared inbound mail. trash=1 items include deletedAt. Inbound summaries carry verificationLink (empty when none was detected).' }) },
+    '/messages/sync': { get: operation('Poll unread count and first-page fingerprint', ref('MessageSync'), { parameters: listQuery,
+      description: 'Lightweight polling for the list view: accepts the same filters as GET /messages (cursor and afterId are ignored). Refetch the list only when head differs from the head returned with its first page.' }) },
     '/messages/send': { post: operation('Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', status: 201, parameters: [idempotencyHeader],
       description: 'HTTP 201 may contain partial or total delivery failure. Inspect status/errorDetail/recipientOutcomes; retry only failed recipients. sent means provider acceptance, not confirmed destination-inbox delivery. Use base64 attachments or draft attachmentTokens; source forwarding attachments count toward the total. Large external attachments become independent 90-day signed links.' }) },
     '/messages/read': { post: operation('Mark selected owned messages read/unread', changed, { request: 'MarkReadRequest', parameters: mutationQuery,
@@ -120,6 +126,8 @@ export function buildSessionOpenApiSpec(origin: string) {
         description: 'At least one field. Cannot disable self or remove the last active administrator. Password reset/disable revokes prior JWT epochs. Role changes preserve mailbox shares. mailboxPolicy=null restores public rules; a dedicated policy contains perUserLimit and domains:[{domain,perUserLimit}], with 0 meaning unlimited and an empty domain list blocking new claims. Only configured system domains may be granted, including private ones. Changing mailboxPolicy requires expectedMailboxPolicyRevision from GET /admin/users; a stale revision returns 409. Existing mailboxes retain read/send access and count toward quotas. Administrators are exempt. Role changes also increment mailboxPolicyRevision.' }),
       delete: operation('Delete a user', success, { ...admin, description: 'Cannot delete self or last active administrator. Releases owned mailboxes and revokes keys/shares; message history remains address-owned and may be inherited by later claimants.' }),
     },
+    '/admin/mailboxes/{id}': { get: operation('Read any claimed mailbox', ref('Mailbox'), { ...admin,
+      description: 'Administrator JWT only. Includes ownerUsername and messageCount; 404 when the mailbox does not exist.' }) },
     '/admin/mailboxes/{id}/transfer': { post: operation('Transfer any existing mailbox to an active user', ref('MailboxTransferResult'), {
       ...admin, request: 'TransferMailboxRequest', description: 'Administrator JWT only. userId is the target owner; expectedOwnerId comes from GET /mailboxes?all=1. Transfers an existing mailbox directly, including another user’s mailbox. For ordinary users with a dedicated mailboxPolicy, obeys configured-domain visibility, reserved-prefix restrictions and dedicated total/per-domain quotas; violations return 400/403. Users inheriting public rules and administrators retain the force-transfer exemption. Quotas and target permission/domain revisions are rechecked atomically; concurrent changes can return 409. Preserves mailbox id, address, display name and all message/attachment history. Atomically changes ownership, revokes all old shares and records mailbox.transfer audit. A stale owner returns 409, unless the mailbox already belongs to the target: that retry returns transferred=false and does not revoke new shares. Disabled/missing users cannot receive a mailbox. Future mail uses the new owner’s notification preferences; existing receipt-time snapshots/jobs remain unchanged.'
     }) },
@@ -133,7 +141,8 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/admin/settings/domain-status': { get: operation('Check public domain DNS onboarding', ref('DomainStatus'), { ...admin, parameters: [query('domain', str, undefined, true)],
       description: 'Checks MX/SPF via public DNS. Cannot prove the private Cloudflare catch-all target or end-to-end email delivery.' }) },
     '/admin/mailbox-shares': {
-      get: operation('List grants on all claimed mailboxes', array(ref('MailboxShareGrant')), admin),
+      get: operation('List grants on all claimed mailboxes', array(ref('MailboxShareGrant')), { ...admin,
+        parameters: [query('mailboxId', { type: 'integer', minimum: 1 }, 'Only this mailbox (at most one item).')] }),
       put: operation('Replace grants on any claimed mailbox', ref('MailboxShareGrant'), { ...admin, request: 'ReplaceMailboxSharesRequest',
         description: 'Administrator JWT can share any claimed mailbox, including other users’ mailboxes, with any active user or administrator except the owner. Empty userIds revokes all shares. At most 100 grantees. expectedOwnerId optionally detects stale ownership with 409. The write also rechecks ownership and recipient status atomically. Owner metadata and grantee status are returned. Grants are read-only incoming mail; owner disable hides shares, role changes preserve them, and release/transfer/deletion revoke them.' }),
     },

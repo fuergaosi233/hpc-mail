@@ -4,6 +4,8 @@ import type {
   UserSearchResults,
   AdminAuditLogEntry,
   AdminUser,
+  BatchClaimMailboxResult,
+  BatchMailboxRequest,
   ApiKeySummary,
   ApiRequestLogEntry,
   ChangePasswordRequest,
@@ -28,6 +30,8 @@ import type {
   ReplaceMailboxSharesRequest,
   SharedMailboxView,
   MessageDetail,
+  MessageListPage,
+  MessageSyncResult,
   MessageSummary,
   MultipartCompleteResult,
   MultipartInitResult,
@@ -104,6 +108,10 @@ export const mailboxApi = {
     }),
   availability: (localPart: string, domain: string) =>
     api.get<MailboxAvailability>('/mailboxes/availability', { query: { localPart, domain } }),
+  batchAvailability: (items: ClaimMailboxRequest[]) =>
+    api.post<MailboxAvailability[], BatchMailboxRequest>('/mailboxes/availability/batch', { items }),
+  batchClaim: (items: ClaimMailboxRequest[]) =>
+    api.post<BatchClaimMailboxResult, BatchMailboxRequest>('/mailboxes/batch', { items }),
   shared: () => api.get<SharedMailboxView[]>('/mailboxes/shared'),
   listShares: () => api.get<MailboxShareGrant[]>('/mailboxes/shares'),
   replaceShares: (body: ReplaceMailboxSharesRequest) =>
@@ -115,7 +123,10 @@ export const mailboxApi = {
 // ---- 邮件 ----
 export const messageApi = {
   list: (query: Partial<ListMessagesQuery>, signal?: AbortSignal) =>
-    api.get<Page<MessageSummary>>('/messages', { query: query as unknown as QueryParams, signal }),
+    api.get<MessageListPage>('/messages', { query: query as unknown as QueryParams, signal }),
+  /** 轻量轮询：未读数 + 当前筛选下首页指纹；与列表首页的 head 不同才需要重拉列表 */
+  sync: (query: Partial<ListMessagesQuery>, signal?: AbortSignal) =>
+    api.get<MessageSyncResult>('/messages/sync', { query: query as unknown as QueryParams, signal }),
   detail: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }, signal?: AbortSignal) =>
     api.get<MessageDetail>(`/messages/${id}`, { query: { scope: view?.scope, userId: view?.userId }, signal }),
   thread: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }, signal?: AbortSignal) =>
@@ -219,6 +230,7 @@ export const apiKeyApi = {
 export const adminApi = {
   searchUsers: (q: string, excludeUserId?: number, signal?: AbortSignal) =>
     api.get<UserSearchResults>('/admin/users/search', { query: { q, excludeUserId }, signal }),
+  getMailbox: (id: number) => api.get<Mailbox>(`/admin/mailboxes/${id}`),
   transferMailbox: (id: number, body: TransferMailboxRequest) =>
     api.post<MailboxTransferResult, TransferMailboxRequest>(`/admin/mailboxes/${id}/transfer`, body),
   listUsers: () => api.get<AdminUser[]>('/admin/users'),
@@ -236,7 +248,8 @@ export const adminApi = {
   revokeInvite: (id: number) => api.delete<void>(`/admin/invites/${id}`),
   auditLogs: (cursor?: string, limit = 30) =>
     api.get<Page<AdminAuditLogEntry>>('/admin/audit-logs', { query: { cursor, limit } }),
-  listMailboxShares: () => api.get<MailboxShareGrant[]>('/admin/mailbox-shares'),
+  listMailboxShares: (mailboxId?: number) =>
+    api.get<MailboxShareGrant[]>('/admin/mailbox-shares', { query: { mailboxId } }),
   replaceMailboxShares: (body: ReplaceMailboxSharesRequest) =>
     api.put<MailboxShareGrant, ReplaceMailboxSharesRequest>('/admin/mailbox-shares', body),
   revokeMailboxShare: (mailboxId: number, userId: number) =>
