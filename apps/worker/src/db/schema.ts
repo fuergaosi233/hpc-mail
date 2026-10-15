@@ -39,7 +39,11 @@ export const users = sqliteTable('users', {
   createdAt: createdAtColumn(),
   lastLoginAt: integer('last_login_at', { mode: 'timestamp_ms' }),
   lastLoginIp: text('last_login_ip'),
-});
+}, (t) => [
+  // 未认领地址的通知归属（resolveNotifyOwnerIds）每封收件都查一次启用中的管理员；
+  // 部分索引只收这几行，免得每次扫完整张 users。
+  index('idx_users_active_admin').on(t.id).where(sql`${t.role} = 'admin' AND ${t.status} = 'active'`),
+]);
 
 export const mailboxes = sqliteTable(
   'mailboxes',

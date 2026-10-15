@@ -1,0 +1,1 @@
+CREATE INDEX `idx_users_active_admin` ON `users` (`id`) WHERE "users"."role" = 'admin' AND "users"."status" = 'active';
