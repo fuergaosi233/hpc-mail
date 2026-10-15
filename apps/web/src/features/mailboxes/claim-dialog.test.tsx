@@ -2,13 +2,56 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/errors';
-const mocks = vi.hoisted(() => ({
-  claim: vi.fn(async (body: { localPart: string; domain: string }) => ({ address: `${body.localPart}@${body.domain}` })),
-  availability: vi.fn(async (_localPart = ''): Promise<{ available: boolean; reason?: string }> => ({ available: true })),
-  toast: vi.fn(),
-  writeClipboard: vi.fn(async () => true),
+type Draft = { localPart: string; domain: string };
+const mocks = vi.hoisted(() => {
+  /** 后端对单个地址的认领结果：单个认领接口与批量认领的模拟共用这一份 */
+  const claimOne = vi.fn(async (body: Draft) => ({ address: `${body.localPart}@${body.domain}` }));
+  /** 后端对单个地址的可用性结果：单个与批量查询共用 */
+  const availableOf = vi.fn(
+    async (_localPart = '', _domain = ''): Promise<{ available: boolean; reason?: string }> => ({ available: true }),
+  );
+  return {
+    claimOne,
+    availableOf,
+    claim: vi.fn((body: Draft) => claimOne(body)),
+    /** 模拟后端批量认领：按顺序逐个处理，被占用的跳过，其他错误停止 */
+    batchClaim: vi.fn(async (items: Draft[]) => {
+      const result = {
+        claimed: [] as Array<{ address: string }>,
+        taken: [] as Draft[],
+        notAttempted: [] as Draft[],
+        stoppedBy: null as { code: string; message: string } | null,
+      };
+      for (let i = 0; i < items.length; i++) {
+        try {
+          result.claimed.push(await claimOne(items[i]!));
+        } catch (error) {
+          const { code, message } = error as { code: string; message: string };
+          if (code === 'address_taken') {
+            result.taken.push(items[i]!);
+            continue;
+          }
+          result.notAttempted = items.slice(i);
+          result.stoppedBy = { code, message };
+          break;
+        }
+      }
+      return result;
+    }),
+    availability: vi.fn((localPart: string, domain: string) => availableOf(localPart, domain)),
+    batchAvailability: vi.fn((items: Draft[]) => Promise.all(items.map((item) => availableOf(item.localPart, item.domain)))),
+    toast: vi.fn(),
+    writeClipboard: vi.fn(async () => true),
+  };
+});
+vi.mock('@/api/resources', () => ({
+  mailboxApi: {
+    claim: mocks.claim,
+    batchClaim: mocks.batchClaim,
+    availability: mocks.availability,
+    batchAvailability: mocks.batchAvailability,
+  },
 }));
-vi.mock('@/api/resources', () => ({ mailboxApi: { claim: mocks.claim, availability: mocks.availability } }));
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
 vi.mock('@/components/ui/copy-button', () => ({ writeClipboard: mocks.writeClipboard }));
 import { ClaimDialog } from './claim-dialog';
@@ -51,7 +94,7 @@ describe('认领可用性原因', () => {
     ['domain_limit', '该域名下的认领数已达上限'],
     ['domain_unavailable', '该域名当前不可认领'],
   ])('reason=%s 显示对应提示并禁用提交', async (reason, text) => {
-    mocks.availability.mockResolvedValueOnce({ available: false, reason });
+    mocks.availableOf.mockResolvedValueOnce({ available: false, reason });
     const { client } = renderDialog();
     fireEvent.change(screen.getByPlaceholderText('例如 hello'), { target: { value: 'hello' } });
     expect(await screen.findByText(new RegExp(text), {}, { timeout: 2000 })).toBeInTheDocument();
@@ -106,11 +149,12 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     expect(prefixes()).toHaveLength(1);
     expect(prefixes()[0]).toMatch(RANDOM);
     await waitFor(() => expect(mocks.availability).toHaveBeenCalled());
+    expect(mocks.batchAvailability).not.toHaveBeenCalled();
     expect(mocks.claim).not.toHaveBeenCalled();
     client.clear();
   });
 
-  it('个数为 3：点随机生成只展示 3 个可编辑地址，确认前不会发认领请求', async () => {
+  it('个数为 3：点随机生成只展示 3 个可编辑地址，一次批量检查可用性，确认前不会发认领请求', async () => {
     const { client } = renderDialog(['one.test']);
     setCount('3');
     fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
@@ -119,8 +163,12 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     expect(new Set(values).size).toBe(3);
     values.forEach((value) => expect(value).toMatch(RANDOM));
     expect(screen.getByRole('button', { name: '认领 3 个' })).toBeInTheDocument();
-    for (const value of values) await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(value, 'one.test'));
+    for (const value of values) expect(await screen.findByText(`${value}@one.test 可以认领`)).toBeInTheDocument();
+    expect(mocks.batchAvailability).toHaveBeenCalledTimes(1);
+    expect(mocks.batchAvailability).toHaveBeenCalledWith(values.map((value) => ({ localPart: value, domain: 'one.test' })));
+    expect(mocks.availability).not.toHaveBeenCalled();
     expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.batchClaim).not.toHaveBeenCalled();
     client.clear();
   });
 
@@ -145,11 +193,13 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     expect(prefixes()).toEqual([before[0], 'my-pick', before[2]]);
     fireEvent.click(screen.getByRole('button', { name: '认领 3 个' }));
     await screen.findByText('已认领 3 个地址');
-    expect(mocks.claim.mock.calls.map(([body]) => body)).toEqual([
+    expect(mocks.batchClaim).toHaveBeenCalledTimes(1);
+    expect(mocks.batchClaim).toHaveBeenCalledWith([
       { localPart: before[0], domain: 'one.test' },
       { localPart: 'my-pick', domain: 'one.test' },
       { localPart: before[2], domain: 'one.test' },
     ]);
+    expect(mocks.claim).not.toHaveBeenCalled();
     client.clear();
   });
 
@@ -167,7 +217,8 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     expect(prefixes()).toEqual([rerolled[1], rerolled[2]]);
     fireEvent.click(screen.getByRole('button', { name: '认领 2 个' }));
     await screen.findByText('已认领 2 个地址');
-    expect(mocks.claim).toHaveBeenCalledTimes(2);
+    expect(mocks.batchClaim).toHaveBeenCalledWith([rerolled[1], rerolled[2]].map((value) => ({ localPart: value, domain: 'one.test' })));
+    expect(mocks.claim).not.toHaveBeenCalled();
     client.clear();
   });
 
@@ -190,7 +241,7 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
   });
 
   it('某个地址刚被别人占用：其余照常认领，可返回修改只保留未认领的', async () => {
-    mocks.claim.mockImplementation(async (body) => {
+    mocks.claimOne.mockImplementation(async (body) => {
       if (body.localPart === 'taken-one') throw new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 });
       return { address: `${body.localPart}@${body.domain}` };
     });
@@ -208,7 +259,7 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
   });
 
   it('中途配额用尽：保留已认领的并说明原因，不再继续请求，也不提供返回修改', async () => {
-    mocks.claim
+    mocks.claimOne
       .mockImplementationOnce(async (body) => ({ address: `${body.localPart}@${body.domain}` }))
       .mockRejectedValueOnce(new ApiError('认领地址数已达上限（1）', { code: 'forbidden', httpStatus: 403 }));
     const { client } = renderDialog(['one.test']);
@@ -218,12 +269,13 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     await screen.findByText('已认领 1 个地址，还有 4 个未认领');
     expect(screen.getByRole('alert')).toHaveTextContent('未能认领满：认领地址数已达上限（1）');
     expect(screen.queryByRole('button', { name: '返回修改' })).toBeNull();
-    expect(mocks.claim).toHaveBeenCalledTimes(2);
+    expect(mocks.batchClaim).toHaveBeenCalledTimes(1);
+    expect(mocks.claim).not.toHaveBeenCalled();
     client.clear();
   });
 
   it('一个都没认领成功：留在表单里保留所有地址并显示原因', async () => {
-    mocks.claim.mockRejectedValueOnce(new ApiError('认领地址数已达上限（1）', { code: 'forbidden', httpStatus: 403 }));
+    mocks.claimOne.mockRejectedValueOnce(new ApiError('认领地址数已达上限（1）', { code: 'forbidden', httpStatus: 403 }));
     const { client } = renderDialog(['one.test']);
     setCount('3');
     fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
@@ -236,7 +288,7 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
   });
 
   it('有地址不可认领或重复时标红该行并禁用认领，修复后恢复', async () => {
-    mocks.availability.mockImplementation(async (localPart = '') =>
+    mocks.availableOf.mockImplementation(async (localPart = '') =>
       localPart === 'busy' ? { available: false, reason: 'taken' } : { available: true },
     );
     const { client } = renderDialog(['one.test']);
@@ -252,7 +304,7 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     expect(screen.getByRole('button', { name: '认领 2 个' })).toBeDisabled();
     fireEvent.change(screen.getByLabelText('前缀 2'), { target: { value: 'fine2' } });
     await waitFor(() => expect(screen.getByRole('button', { name: '认领 2 个' })).toBeEnabled(), { timeout: 2000 });
-    mocks.availability.mockImplementation(async () => ({ available: true }));
+    mocks.availableOf.mockImplementation(async () => ({ available: true }));
     client.clear();
   });
 
@@ -276,29 +328,35 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     fireEvent.keyDown(screen.getByLabelText('随机生成个数'), { key: 'Enter' });
     expect(prefixes()).toHaveLength(2);
     expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.batchClaim).not.toHaveBeenCalled();
     client.clear();
   });
 
   it('认领进行中不能关闭对话框，也不能重复提交', async () => {
     let release!: () => void;
-    mocks.claim.mockImplementation(
-      (body) => new Promise((resolve) => { release = () => resolve({ address: `${body.localPart}@${body.domain}` }); }),
+    mocks.batchClaim.mockImplementationOnce(
+      (items) => new Promise((resolve) => {
+        release = () => resolve({
+          claimed: items.map((item) => ({ address: `${item.localPart}@${item.domain}` })),
+          taken: [], notAttempted: [], stoppedBy: null,
+        });
+      }),
     );
     const onOpenChange = vi.fn();
     const { client } = renderDialog(['one.test'], onOpenChange);
     setCount('2');
     fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
     fireEvent.click(screen.getByRole('button', { name: '认领 2 个' }));
-    expect(await screen.findByText('正在认领 0/2…')).toBeInTheDocument();
+    expect(await screen.findByText('正在认领 2 个地址…')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '随机生成' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '取消' })).toBeDisabled();
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
     expect(onOpenChange).not.toHaveBeenCalled();
-    release();
-    await waitFor(() => expect(mocks.claim).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('button', { name: /认领 2 个/ }));
+    expect(mocks.batchClaim).toHaveBeenCalledTimes(1);
     release();
     await screen.findByText('已认领 2 个地址');
-    mocks.claim.mockImplementation(async (body) => ({ address: `${body.localPart}@${body.domain}` }));
+    expect(mocks.claim).not.toHaveBeenCalled();
     client.clear();
   });
 });
@@ -371,7 +429,9 @@ describe('随机邮箱后缀', () => {
     expect(seen.size).toBeGreaterThan(1);
     const [domain] = rowDomains();
     const [prefix] = prefixes();
-    await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(prefix, domain));
+    // 同一轮里连点 40 次生成的查询会合批，这里只关心最终显示的地址查过可用性
+    await waitFor(() => expect(mocks.availableOf).toHaveBeenCalledWith(prefix, domain));
+    expect(await screen.findByText(`${prefix}@${domain} 可以认领`)).toBeInTheDocument();
     expect(mocks.claim).not.toHaveBeenCalled();
     client.clear();
   });
@@ -384,7 +444,7 @@ describe('随机邮箱后缀', () => {
     const shown = prefixes().map((prefix, index) => ({ localPart: prefix, domain: rowDomains()[index]! }));
     fireEvent.click(screen.getByRole('button', { name: '认领 8 个' }));
     await screen.findByText('已认领 8 个地址');
-    expect(mocks.claim.mock.calls.map(([body]) => body)).toEqual(shown);
+    expect(mocks.batchClaim).toHaveBeenCalledWith(shown);
     expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual(
       shown.map((item) => `${item.localPart}@${item.domain}`),
     );
@@ -405,7 +465,7 @@ describe('随机邮箱后缀', () => {
     await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(typed[1], target));
     fireEvent.click(screen.getByRole('button', { name: '认领 3 个' }));
     await screen.findByText('已认领 3 个地址');
-    expect(mocks.claim.mock.calls.map(([body]) => body)).toEqual([
+    expect(mocks.batchClaim).toHaveBeenCalledWith([
       { localPart: typed[0], domain: before[0] },
       { localPart: typed[1], domain: target },
       { localPart: typed[2], domain: before[2] },
@@ -464,7 +524,7 @@ describe('随机邮箱后缀', () => {
   });
 
   it('某行域名被占用时，提示换域名可行，并保持其余行不受影响', async () => {
-    mocks.availability.mockImplementation(async (_localPart = '', domain = '') =>
+    mocks.availableOf.mockImplementation(async (_localPart = '', domain = '') =>
       domain === 'b.test' ? { available: false, reason: 'domain_limit' } : { available: true },
     );
     const { client } = renderDialog(DOMAINS);
@@ -475,12 +535,12 @@ describe('随机邮箱后缀', () => {
     expect(await screen.findByText(/该域名下的认领数已达上限/, {}, { timeout: 2000 })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '认领 2 个' })).toBeDisabled();
     expect(screen.getByLabelText('前缀 1')).not.toHaveAttribute('aria-invalid', 'true');
-    mocks.availability.mockImplementation(async () => ({ available: true }));
+    mocks.availableOf.mockImplementation(async () => ({ available: true }));
     client.clear();
   });
 
   it('认领中途被占用后「返回修改」，保留各自的域名', async () => {
-    mocks.claim.mockImplementation(async (body) => {
+    mocks.claimOne.mockImplementation(async (body) => {
       if (body.localPart === 'busy') throw new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 });
       return { address: `${body.localPart}@${body.domain}` };
     });
@@ -493,11 +553,11 @@ describe('随机邮箱后缀', () => {
     fireEvent.change(screen.getByLabelText('前缀 1'), { target: { value: 'busy' } });
     fireEvent.click(screen.getByRole('button', { name: '认领 2 个' }));
     await screen.findByText('已认领 1 个地址，还有 1 个未认领');
-    expect(mocks.claim.mock.calls.map(([body]) => body.domain)).toEqual(['c.test', 'b.test']);
+    expect(mocks.batchClaim.mock.calls[0]![0].map((item) => item.domain)).toEqual(['c.test', 'b.test']);
     fireEvent.click(screen.getByRole('button', { name: '返回修改' }));
     expect(prefixes()).toEqual(['busy']);
     expect(rowDomains()).toEqual(['c.test']);
-    mocks.claim.mockImplementation(async (body) => ({ address: `${body.localPart}@${body.domain}` }));
+    mocks.claimOne.mockImplementation(async (body) => ({ address: `${body.localPart}@${body.domain}` }));
     client.clear();
   });
 
