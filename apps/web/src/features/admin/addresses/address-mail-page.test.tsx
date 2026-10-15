@@ -147,16 +147,22 @@ describe('管理员查看单个地址的收发件', () => {
     client.clear();
   });
 
-  it('全站地址列表已在缓存里时先用列表里的这一行渲染，单个邮箱返回后再更新', async () => {
+  it('全站地址列表已在缓存里时先用列表里的这一行显示头部；邮件列表等真实数据返回后按最新归属人挂载', async () => {
     let resolve!: (value: typeof box) => void;
     mocks.getMailbox.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
     const { client } = mount('/admin/addresses/42/mail', (c) => c.setQueryData(queryKeys.mailboxes.list('all'), [box]));
     expect(screen.getByRole('heading', { name: 'existing@example.com' })).toBeInTheDocument();
     expect(screen.getByText(/共 12 封邮件/)).toBeInTheDocument();
-    expect(mocks.lastQuery.current).toMatchObject({ userId: 10, address: 'existing@example.com' });
     expect(mocks.getMailbox).toHaveBeenCalledWith(42);
-    resolve({ ...box, messageCount: 13 });
+    // 列表缓存的这一行可能已过期：占位期间不按旧归属人查邮件
+    expect(screen.queryByTestId('mail-list')).toBeNull();
+    expect(mocks.lastQuery.current).toBeNull();
+    // 期间已过户给另一个用户：邮件列表直接按新归属人查询
+    resolve({ ...box, userId: 20, ownerUsername: 'new-owner', messageCount: 13 });
     expect(await screen.findByText(/共 13 封邮件/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'new-owner' })).toHaveAttribute('href', '/admin/users/20/mail');
+    expect(screen.getByTestId('mail-list')).toBeInTheDocument();
+    expect(mocks.lastQuery.current).toMatchObject({ userId: 20, address: 'existing@example.com' });
     client.clear();
   });
 
