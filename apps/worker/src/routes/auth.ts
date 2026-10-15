@@ -9,7 +9,7 @@ import {
 } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { requireAuth } from '../middleware/auth.js';
-import { clientIp, ok, parseBody } from '../lib/http.js';
+import { clientIp, execCtx, ok, parseBody } from '../lib/http.js';
 import { AppError } from '../lib/errors.js';
 import { changePassword, login, logout, register } from '../services/auth.js';
 import { avatarUrl, deleteAvatar, uploadAvatar } from '../services/avatar.js';
@@ -32,13 +32,13 @@ function sessionUserOf(user: AuthUser, overrideAvatarUrl?: string | null): Sessi
 
 app.post('/login', async (c) => {
   const req = await parseBody(c, loginRequestSchema);
-  const result = await login(c.env, req, clientIp(c), c.executionCtx);
+  const result = await login(c.env, req, clientIp(c), execCtx(c));
   return ok(c, result);
 });
 
 app.post('/register', async (c) => {
   const req = await parseBody(c, registerRequestSchema);
-  const result = await register(c.env, req, clientIp(c));
+  const result = await register(c.env, req, clientIp(c), execCtx(c));
   return ok(c, result, 201);
 });
 
@@ -61,7 +61,7 @@ app.delete('/avatar', requireAuth, async (c) => {
 
 app.put('/password', requireAuth, async (c) => {
   const req = await parseBody(c, changePasswordRequestSchema);
-  const result = await changePassword(c.env, c.get('user')!, req);
+  const result = await changePassword(c.env, c.get('user')!, req, execCtx(c));
   return ok(c, result);
 });
 
@@ -86,7 +86,7 @@ app.post('/2fa/disable', requireAuth, async (c) => {
 app.post('/logout', requireAuth, async (c) => {
   const sid = c.get('sessionId');
   if (!sid) throw new AppError('unauthorized', '会话不存在');
-  await logout(c.env, sid);
+  await logout(c.env, sid, execCtx(c));
   return ok(c, { success: true });
 });
 
