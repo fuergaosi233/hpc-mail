@@ -5,7 +5,7 @@ import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
 import { mergeHeadPage, type MessageListData } from './message-cache';
 import { messageListQueryOptions } from './message-queries';
-import { pauseUnreadCountPolling } from './use-unread-count';
+import { markUnreadRefreshed, nextUnreadRefreshDelay, pauseUnreadCountPolling } from './use-unread-count';
 
 const POLL_INTERVAL_MS = 20_000;
 const RETRY_DELAY_MS = 2_500;
@@ -52,6 +52,7 @@ export function useMessagesQuery(query: Partial<ListMessagesQuery>) {
         const unreadSince = queryClient.getQueryState(queryKeys.messages.unreadCount)?.dataUpdatedAt;
         const sync = await messageApi.sync(latestQuery.current, controller.signal);
         if (controller.signal.aborted) return;
+        markUnreadRefreshed(queryClient);
         setPollError(null);
         if (!untouched(since)) return;
         const unread = queryClient.getQueryState(queryKeys.messages.unreadCount);
@@ -102,7 +103,13 @@ export function useMessagesQuery(query: Partial<ListMessagesQuery>) {
         pending = false;
       }
     };
-    const timer = globalThis.setInterval(() => void check(), POLL_INTERVAL_MS);
+    // The first round waits only for the rest of the interval since the last refresh: switching filters or pages
+    // neither postpones it nor sends an extra one within the interval.
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const firstTimer = globalThis.setTimeout(() => {
+      void check();
+      timer = globalThis.setInterval(() => void check(), POLL_INTERVAL_MS);
+    }, nextUnreadRefreshDelay(queryClient));
     const unsubscribeFocus = focusManager.subscribe((focused) => {
       if (focused) void check();
     });
@@ -114,6 +121,7 @@ export function useMessagesQuery(query: Partial<ListMessagesQuery>) {
     const cached = queryClient.getQueryCache().find<MessageListData>({ queryKey, exact: true });
     if ((cached?.state.data?.pages.length ?? 0) > 1 && cached?.isStale()) void check({ probeOnly: true });
     return () => {
+      globalThis.clearTimeout(firstTimer);
       globalThis.clearInterval(timer);
       unsubscribeFocus();
       unsubscribeOnline();

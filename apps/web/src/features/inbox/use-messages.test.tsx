@@ -6,9 +6,9 @@ import type { ListMessagesQuery, MessageListPage, MessageSummary } from '@hpc-ma
 const api = vi.hoisted(() => ({ list: vi.fn(), sync: vi.fn(), unreadCount: vi.fn() }));
 vi.mock('@/api/resources', () => ({ messageApi: api }));
 import { queryKeys } from '@/api/query-keys';
-import type { MessageListData } from './message-cache';
+import { type MessageListData, syncReadState } from './message-cache';
 import { useMessagesQuery } from './use-messages';
-import { useUnreadCount } from './use-unread-count';
+import { markUnreadRefreshed, nextUnreadRefreshDelay, useUnreadCount } from './use-unread-count';
 
 const query: Partial<ListMessagesQuery> = { direction: 'inbound' };
 const listKey = queryKeys.messages.list(query);
@@ -34,13 +34,17 @@ const wrapperOf = (client: QueryClient) =>
   };
 const renderList = (client: QueryClient) => renderHook(() => useMessagesQuery(query), { wrapper: wrapperOf(client) });
 
-// 接管所有 20 秒的定时器（列表的 sync 轮询与未读数自身的 refetchInterval），由 tick() 手动推进
-const pollTimers = new Map<number, () => void>();
+// 接管轮询定时器（列表 sync 的 20 秒周期与首轮等待、未读数自身的 refetchInterval），由 tick() 手动推进
+const pollTimers = new Map<number, { callback: () => void; delay: number; once: boolean }>();
 let nextTimerId = -1;
-/** 走过一个 20 秒轮询周期 */
+/** 走到下一个轮询点：到期的一次性定时器触发后移除，周期定时器保留 */
 const tick = () => act(() => {
-  [...pollTimers.values()].forEach((callback) => callback());
+  for (const [id, timer] of [...pollTimers]) {
+    if (timer.once) pollTimers.delete(id);
+    timer.callback();
+  }
 });
+const pendingFirstRounds = () => [...pollTimers.values()].filter((timer) => timer.once).map((timer) => timer.delay);
 // 失败后的静默重试延迟（2.5 秒）同样接管，由 fireRetry() 手动推进
 const retryTimers = new Map<number, () => void>();
 const fireRetry = () => act(() => {
@@ -57,7 +61,7 @@ beforeEach(() => {
   vi.spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void, delay?: number, ...args: unknown[]) => {
     if (delay !== 20_000) return realSetInterval(callback, delay, ...args);
     const id = nextTimerId--;
-    pollTimers.set(id, callback);
+    pollTimers.set(id, { callback, delay, once: false });
     return id;
   }) as typeof setInterval);
   vi.spyOn(globalThis, 'clearInterval').mockImplementation(((id?: number) => {
@@ -66,13 +70,14 @@ beforeEach(() => {
   const realSetTimeout = globalThis.setTimeout;
   const realClearTimeout = globalThis.clearTimeout;
   vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay?: number, ...args: unknown[]) => {
-    if (delay !== 2_500) return realSetTimeout(callback, delay, ...args);
     const id = nextTimerId--;
-    retryTimers.set(id, callback);
+    if (delay === 2_500) retryTimers.set(id, callback);
+    else if (delay !== undefined && delay > 2_500 && delay <= 20_000) pollTimers.set(id, { callback, delay, once: true });
+    else return realSetTimeout(callback, delay, ...args);
     return id;
   }) as typeof setTimeout);
   vi.spyOn(globalThis, 'clearTimeout').mockImplementation(((id?: number) => {
-    if (id === undefined || !retryTimers.delete(id)) realClearTimeout(id);
+    if (id === undefined || !(retryTimers.delete(id) || pollTimers.delete(id))) realClearTimeout(id);
   }) as typeof clearTimeout);
 });
 afterEach(() => {
@@ -325,5 +330,78 @@ describe('list polling via /messages/sync', () => {
     await waitFor(() => expect(api.sync).toHaveBeenCalledTimes(1));
     await settle();
     expect(api.list).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-aligns a first page edited in place even when the server head is back to its old value (ABA)', async () => {
+    api.list.mockImplementation(async (params: { cursor?: string }) => (params.cursor === 'older' ? page([2], null) : page([3], 'older', 'h0')));
+    // 本地标为已读后，别处又把它改回未读：服务端首页恢复为 h0
+    api.sync.mockResolvedValue({ unread: 1, head: 'h0' });
+    const client = createClient();
+    const { result } = renderList(client);
+    await waitFor(() => expect(result.current.data?.pages).toHaveLength(1));
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.data?.pages).toHaveLength(2));
+
+    act(() => syncReadState(client, [3], true));
+    const edited = client.getQueryData<MessageListData>(listKey);
+    expect(edited?.pages[0]?.items[0]?.isRead).toBe(true);
+    expect(edited?.pages[0]?.head).toBeUndefined();
+    await tick();
+    await waitFor(() => expect(result.current.data?.pages[0]?.items[0]?.isRead).toBe(false));
+    expect(result.current.data?.pages[0]?.head).toBe('h0');
+  });
+});
+
+describe('first round after a list view mounts', () => {
+  it('waits only for the rest of the interval after a recent sync when switching filters', async () => {
+    api.list.mockResolvedValue(page([3], null, 'h1'));
+    api.sync.mockResolvedValue({ unread: 0, head: 'h1' });
+    const client = createClient();
+    const first = renderList(client);
+    await waitFor(() => expect(first.result.current.data).toBeDefined());
+    await tick();
+    await waitFor(() => expect(api.sync).toHaveBeenCalledTimes(1));
+    first.unmount();
+
+    const unreadOnly = { direction: 'inbound' as const, unread: true };
+    const other = renderHook(() => useMessagesQuery(unreadOnly), { wrapper: wrapperOf(client) });
+    await waitFor(() => expect(other.result.current.data).toBeDefined());
+    await settle();
+    // 刚 sync 过：不立即再发，首轮只等剩余的时间，而不是重新等满 20 秒
+    expect(api.sync).toHaveBeenCalledTimes(1);
+    const [delay] = pendingFirstRounds();
+    expect(delay).toBeLessThan(20_000);
+    expect(delay).toBeGreaterThan(15_000);
+    await tick();
+    await waitFor(() => expect(api.sync).toHaveBeenCalledTimes(2));
+    expect(api.sync.mock.calls[1]?.[0]).toEqual(unreadOnly);
+  });
+
+  it('checks right away when the last refresh is a full interval old', async () => {
+    api.list.mockResolvedValue(page([3], null, 'h1'));
+    api.sync.mockResolvedValue({ unread: 0, head: 'h1' });
+    const client = createClient();
+    markUnreadRefreshed(client, Date.now() - 25_000);
+    renderList(client);
+    await waitFor(() => expect(api.sync).toHaveBeenCalledTimes(1));
+    expect(pendingFirstRounds()).toEqual([]);
+  });
+
+  it('measures from the unread-count refresh too, and waits a full interval without any record', async () => {
+    const client = createClient();
+    expect(nextUnreadRefreshDelay(client)).toBe(20_000);
+    const now = Date.now();
+    markUnreadRefreshed(client, now - 5_000);
+    expect(nextUnreadRefreshDelay(client, now)).toBe(15_000);
+    markUnreadRefreshed(client, now - 25_000);
+    expect(nextUnreadRefreshDelay(client, now)).toBe(0);
+
+    const fresh = createClient();
+    api.unreadCount.mockResolvedValue({ unread: 1 });
+    const unread = renderHook(() => useUnreadCount(), { wrapper: wrapperOf(fresh) });
+    await waitFor(() => expect(unread.result.current.data).toEqual({ unread: 1 }));
+    expect(nextUnreadRefreshDelay(fresh)).toBeLessThan(20_000);
   });
 });
