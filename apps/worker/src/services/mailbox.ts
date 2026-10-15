@@ -55,6 +55,18 @@ export async function listMailboxes(
   return rows.map((r) => serialize(r.mailbox, Number(r.messageCount)));
 }
 
+/** 管理员按 id 读任意邮箱：与 ?all=1 列表同形（含所有者用户名与邮件数），一次查询 */
+export async function getMailbox(env: Env, id: number): Promise<Mailbox> {
+  const row = await createDb(env)
+    .select({ mailbox: mailboxes, username: users.username, messageCount: messageCountSql })
+    .from(mailboxes)
+    .leftJoin(users, eq(users.id, mailboxes.userId))
+    .where(eq(mailboxes.id, id))
+    .get();
+  if (!row) throw new AppError('not_found', '邮箱不存在');
+  return serialize(row.mailbox, Number(row.messageCount), row.username ?? '');
+}
+
 interface ClaimPolicy {
   /** 普通用户的全局/按域认领上限（0=不限；管理员恒为 0），供 INSERT 时原子复核 */
   perUserLimit: number;

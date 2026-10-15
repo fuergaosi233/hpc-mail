@@ -1,12 +1,13 @@
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import type { MailboxShareGrant, MessageDetail, MessageSummary, Page, SharedMailboxView } from '@hpc-mail/shared';
+import type { Mailbox, MailboxShareGrant, MessageDetail, MessageSummary, Page, SharedMailboxView } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { adminAuditLogs, mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
-import { replaceMailboxShares } from '../src/services/mailbox-share.js';
+import { getMailbox } from '../src/services/mailbox.js';
+import { listMailboxShares, replaceMailboxShares } from '../src/services/mailbox-share.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
@@ -142,5 +143,81 @@ describe('所有者共享与管理员全站共享', () => {
     });
     await expect(replaceMailboxShares(racing, f.admin.id, f.box.id, [], true)).rejects.toMatchObject({ code: 'conflict' });
     expect((await db.select().from(mailboxShares).where(eq(mailboxShares.mailboxId, f.box.id))).map((row) => row.userId)).toEqual([f.member.id]);
+  });
+});
+
+/** 统计 D1 往返：每次 batch 与每条单独执行的语句各算一次 */
+function counting(): { env: Env; trips: () => number } {
+  let trips = 0;
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, {
+    get(target, property) {
+      if (property === 'bind') return (...args: unknown[]) => wrap(target.bind(...args));
+      const method = Reflect.get(target, property);
+      if (typeof method !== 'function') return method;
+      return (...args: unknown[]) => {
+        if (['first', 'all', 'run', 'raw'].includes(String(property))) trips++;
+        return method.apply(target, args);
+      };
+    },
+  });
+  return { env: { ...env, db: new Proxy(env.db, { get(target, property) {
+    if (property === 'prepare') return (sql: string) => wrap(target.prepare(sql));
+    if (property === 'batch') return (statements: D1PreparedStatement[]) => { trips++; return target.batch(statements); };
+    const value = Reflect.get(target, property);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } }) }, trips: () => trips };
+}
+
+describe('管理员按 id 读邮箱与按邮箱读共享', () => {
+  it('GET /admin/mailboxes/:id 与全站列表同形（含所有者与邮件数），不存在返回 404，非管理员 403', async () => {
+    const f = await fixture();
+    const box = await data<Mailbox>(await request(`/admin/mailboxes/${f.box.id}`, f.admin.jwt));
+    const all = await data<Mailbox[]>(await request('/mailboxes?all=1', f.admin.jwt));
+    expect(box).toEqual(all.find((entry) => entry.id === f.box.id));
+    expect(box).toMatchObject({ address: f.box.address, ownerUsername: f.owner.username, messageCount: 2 });
+    for (const id of ['999999999', 'abc']) {
+      const missing = await request(`/admin/mailboxes/${id}`, f.admin.jwt);
+      expect(missing.status).toBe(404);
+      expect((await missing.json() as { error: { code: string } }).error.code).toBe('not_found');
+    }
+    expect((await request(`/admin/mailboxes/${f.box.id}`, f.owner.jwt)).status).toBe(403);
+    const probe = counting();
+    await getMailbox(probe.env, f.box.id);
+    expect(probe.trips()).toBe(1);
+  });
+
+  it('?mailboxId= 只返回该邮箱，与全站列表中的同一项一致；不存在为空，非法参数 400', async () => {
+    const f = await fixture();
+    await replaceMailboxShares(env, f.owner.id, f.box.id, [f.stranger.id, f.member.id]);
+    const all = await data<MailboxShareGrant[]>(await request('/admin/mailbox-shares', f.admin.jwt));
+    const one = await data<MailboxShareGrant[]>(await request(`/admin/mailbox-shares?mailboxId=${f.box.id}`, f.admin.jwt));
+    expect(one).toEqual([all.find((item) => item.mailboxId === f.box.id)]);
+    expect(one[0]!.grantees.map((grantee) => grantee.username)).toEqual([f.member.username, f.stranger.username].sort());
+    expect(await data(await request('/admin/mailbox-shares?mailboxId=999999999', f.admin.jwt))).toEqual([]);
+    for (const bad of ['0', '-1', 'abc', '1.5', '', '1e3', '99999999999999999999']) {
+      expect((await request(`/admin/mailbox-shares?mailboxId=${bad}`, f.admin.jwt)).status).toBe(400);
+    }
+    expect((await request(`/admin/mailbox-shares?mailboxId=${f.box.id}`, f.owner.jwt)).status).toBe(403);
+  });
+
+  it('共享列表一次查询：邮箱按地址排序，未共享的也列出，被分享人按用户名排序', async () => {
+    const f = await fixture();
+    const earlier = (await db.insert(mailboxes).values({ address: f.box.address.replace('@', '-a@'),
+      domain: f.box.domain, userId: f.owner.id }).returning().get())!;
+    await replaceMailboxShares(env, f.owner.id, f.box.id, [f.stranger.id, f.member.id, f.admin.id]);
+    const expectedGrantees = [f.admin, f.member, f.stranger].map((user) => user.username).sort();
+    let probe = counting();
+    const owned = await listMailboxShares(probe.env, f.owner.id);
+    expect(probe.trips()).toBe(1);
+    expect(owned.map((grant) => grant.address)).toEqual([earlier.address, f.box.address]);
+    expect(owned[0]).toMatchObject({ mailboxId: earlier.id, ownerUserId: f.owner.id, ownerUsername: f.owner.username, grantees: [] });
+    expect(owned[1]!.grantees.map((grantee) => grantee.username)).toEqual(expectedGrantees);
+    expect(owned[1]!.grantees.every((grantee) => grantee.status === 'active' && !Number.isNaN(Date.parse(grantee.grantedAt)))).toBe(true);
+    probe = counting();
+    const all = await listMailboxShares(probe.env, f.admin.id, true);
+    expect(probe.trips()).toBe(1);
+    const addresses = all.map((grant) => grant.address);
+    expect(addresses).toEqual([...addresses].sort());
+    expect(all.filter((grant) => grant.ownerUserId === f.owner.id)).toEqual(owned);
   });
 });

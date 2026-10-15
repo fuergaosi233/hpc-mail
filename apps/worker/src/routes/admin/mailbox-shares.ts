@@ -1,5 +1,6 @@
 import { replaceMailboxSharesRequestSchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
+import { AppError } from '../../lib/errors.js';
 import { clientIp, ok, parseBody, parseId } from '../../lib/http.js';
 import { requireAdmin, requireAuth } from '../../middleware/auth.js';
 import { logAdminAction } from '../../services/audit.js';
@@ -9,9 +10,15 @@ import type { AppContext } from '../../types.js';
 const app = new Hono<AppContext>();
 app.use('*', requireAuth, requireAdmin);
 
+/** ?mailboxId= 只返回该邮箱（0 或 1 项）；缺省返回全站已认领邮箱 */
 app.get('/', async (c) => {
   const acting = c.get('user')!;
-  return ok(c, await listMailboxShares(c.env, acting.id, true));
+  const raw = c.req.query('mailboxId');
+  const mailboxId = raw === undefined ? undefined : Number(raw);
+  if (raw !== undefined && !(/^[1-9]\d*$/.test(raw) && Number.isSafeInteger(mailboxId))) {
+    throw new AppError('validation_failed', 'mailboxId 需为正整数');
+  }
+  return ok(c, await listMailboxShares(c.env, acting.id, true, mailboxId));
 });
 
 app.put('/', async (c) => {
