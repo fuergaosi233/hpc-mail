@@ -1,13 +1,13 @@
 import { type InfiniteData, useMutation, useQueryClient } from '@tanstack/react-query';
-import type { MessageDetail, MessageSummary, Page } from '@hpc-mail/shared';
+import type { MessageDetail, MessageListPage } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
 import { toast } from '@/components/ui/toast';
 import { getAuthToken } from '@/lib/auth-token';
 import { ApiError } from '@/api/errors';
-import { syncStarState } from './message-cache';
+import { patchListItems, syncStarState } from './message-cache';
 
-type ListData = InfiniteData<Page<MessageSummary>>;
+type ListData = InfiniteData<MessageListPage>;
 
 /** 星标切换：乐观更新列表行与详情缓存（即时高亮），失败或未生效时回滚；成功后不再重拉。 */
 export function useStarMutation(view?: { scope?: 'mine' | 'unclaimed' | 'user'; userId?: number }) {
@@ -31,14 +31,8 @@ export function useStarMutation(view?: { scope?: 'mine' | 'unclaimed' | 'user'; 
         .getQueriesData<ListData>({ queryKey: queryKeys.messages.lists })
         .filter(([, data]) => data?.pages.some((page) => page.items.some((m) => m.id === id)));
       for (const [key, data] of listSnapshots) {
-        if (!data) continue;
-        queryClient.setQueryData<ListData>(key, {
-          ...data,
-          pages: data.pages.map((page) => ({
-            ...page,
-            items: page.items.map((m) => (m.id === id ? { ...m, isStarred: starred } : m)),
-          })),
-        });
+        const next = data && patchListItems(data, (m) => (m.id === id && m.isStarred !== starred ? { ...m, isStarred: starred } : m));
+        if (next) queryClient.setQueryData<ListData>(key, next);
       }
       return { prevDetail, listSnapshots, token };
     },

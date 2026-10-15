@@ -11,6 +11,35 @@ const pageCount = (query: Query): number => (query.state.data as MessageListData
 const isMineList: ListPredicate = (filters) => (filters.scope ?? 'mine') === 'mine' && !filters.trash;
 
 /**
+ * 本地就地改写了首页条目后，首页已不是服务端算 head 时的内容：去掉 head，下一轮 sync 按「有变化」对齐一次。
+ * 否则服务端首页在下一次 sync 前恢复原状（ABA，如在别处又改了回去）时 head 相同，本地改动会一直留着。
+ */
+function dropStaleHead<T extends { pages: Array<{ head?: string }> }>(data: T, previous: T): T {
+  const [first] = data.pages;
+  if (!first || first === previous.pages[0] || first.head === undefined) return data;
+  return { ...data, pages: [{ ...first, head: undefined }, ...data.pages.slice(1)] };
+}
+
+/** 逐条变换一份列表缓存（返回 null 表示移出该列表）；没有条目变化时返回 undefined，调用方据此跳过写入 */
+export function patchListItems<T extends { pages: Array<{ head?: string; items: MessageSummary[] }> }>(
+  data: T,
+  map: (item: MessageSummary) => MessageSummary | null,
+): T | undefined {
+  let changed = false;
+  const pages = data.pages.map((page) => {
+    let pageChanged = false;
+    const items = page.items.flatMap((item) => {
+      const next = map(item);
+      if (next !== item) pageChanged = true;
+      return next ? [next] : [];
+    });
+    changed ||= pageChanged;
+    return pageChanged ? { ...page, items } : page;
+  });
+  return changed ? dropStaleHead({ ...data, pages }, data) : undefined;
+}
+
+/**
  * 逐条变换所有匹配的列表缓存（返回 null 表示移出该列表）。
  * 没有条目变化的列表返回 undefined 跳过写入，避免无谓刷新 dataUpdatedAt 和重渲染。
  */
@@ -22,21 +51,7 @@ function updateLists(
   for (const query of client.getQueryCache().findAll({ queryKey: queryKeys.messages.lists })) {
     const filters = filtersOf(query);
     if (!predicate(filters)) continue;
-    client.setQueryData<MessageListData>(query.queryKey, (data) => {
-      if (!data) return undefined;
-      let changed = false;
-      const pages = data.pages.map((page) => {
-        let pageChanged = false;
-        const items = page.items.flatMap((item) => {
-          const next = map(item, filters);
-          if (next !== item) pageChanged = true;
-          return next ? [next] : [];
-        });
-        changed ||= pageChanged;
-        return pageChanged ? { ...page, items } : page;
-      });
-      return changed ? { ...data, pages } : undefined;
-    });
+    client.setQueryData<MessageListData>(query.queryKey, (data) => data && patchListItems(data, (item) => map(item, filters)));
   }
 }
 
@@ -200,6 +215,7 @@ export function snapshotListMembership(client: QueryClient, ids: readonly number
 function insertById(data: MessageListData, items: MessageSummary[]): MessageListData {
   const present = new Set(data.pages.flatMap((page) => page.items.map((item) => item.id)));
   const pages = data.pages.map((page) => ({ ...page, items: [...page.items] }));
+  const firstLength = pages[0]?.items.length;
   for (const item of items) {
     if (present.has(item.id)) continue;
     let target = pages.findIndex((page) => page.items.some((existing) => existing.id < item.id));
@@ -214,6 +230,8 @@ function insertById(data: MessageListData, items: MessageSummary[]): MessageList
     page.items.splice(position === -1 ? page.items.length : position, 0, item);
     present.add(item.id);
   }
+  // 插回了首页：首页同样不再是服务端算 head 时的内容
+  if (pages[0] && pages[0].items.length !== firstLength) pages[0] = { ...pages[0], head: undefined };
   return { ...data, pages };
 }
 
