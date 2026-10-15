@@ -303,6 +303,18 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     client.clear();
   });
 
+  it('单个认领遇到服务端异常、结果未知：同样刷新我的邮箱，提示以邮箱列表为准', async () => {
+    mocks.claim.mockRejectedValueOnce(new ApiError('服务器内部错误', { code: 'internal', httpStatus: 500 }));
+    const { client } = renderDialog(['one.test']);
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
+    fireEvent.change(screen.getByPlaceholderText('例如 hello'), { target: { value: 'hello' } });
+    fireEvent.click(screen.getByRole('button', { name: '认领' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('服务器内部错误。该地址可能已认领，请以邮箱列表为准');
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['mailboxes'] });
+    expect(mocks.batchClaim).not.toHaveBeenCalled();
+    client.clear();
+  });
+
   it('批量认领在处理前被拒绝（4xx）：确定一个都没认领，只重新核对可用性', async () => {
     mocks.batchClaim.mockRejectedValueOnce(new ApiError('请求过于频繁', { code: 'rate_limited', httpStatus: 429 }));
     const { client } = renderDialog(['one.test']);

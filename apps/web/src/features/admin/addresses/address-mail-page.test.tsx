@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/errors';
@@ -165,6 +165,18 @@ describe('管理员查看单个地址的收发件', () => {
       c.setQueryData(queryKeys.mailboxes.list('all'), [{ ...box, id: 999 }]));
     expect(screen.getByRole('heading', { name: 'existing@example.com' })).toBeInTheDocument();
     expect(await screen.findByText('没有找到这个地址')).toBeInTheDocument();
+    expect(screen.queryByTestId('mail-list')).toBeNull();
+    client.clear();
+  });
+
+  it('已打开的地址随后被释放：刷新返回 404 时即使还保留旧数据也转为空态', async () => {
+    const { client } = mount('/admin/addresses/42/mail');
+    expect(await screen.findByRole('heading', { name: 'existing@example.com' })).toBeInTheDocument();
+    mocks.getMailbox.mockRejectedValue(new ApiError('邮箱不存在', { code: 'not_found', httpStatus: 404 }));
+    await act(() => client.invalidateQueries({ queryKey: queryKeys.mailboxes.root }));
+    expect(client.getQueryData(queryKeys.mailboxes.adminDetail(42))).toEqual(box);
+    expect(await screen.findByText('没有找到这个地址')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'existing@example.com' })).toBeNull();
     expect(screen.queryByTestId('mail-list')).toBeNull();
     client.clear();
   });

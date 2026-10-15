@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
@@ -111,6 +111,34 @@ describe('按地址行共享邮箱', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'active-member' }));
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
     await waitFor(() => expect(mocks.replace).toHaveBeenCalledWith({ mailboxId: 1, userIds: [3], expectedOwnerId: 99 }));
+    view.unmount(); client.clear();
+  });
+
+  it('编辑中遇到后台刷新（如其他写操作触发失效）：不卸载、不重置未保存的勾选，保存仍按打开时的所有者校验', async () => {
+    // TanStack 用 setTimeout 合批通知订阅者：让出一个宏任务，界面才会反映查询状态
+    const flush = () => act(() => new Promise((resolve) => setTimeout(resolve, 10)));
+    const { client, view } = mount();
+    fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'active-member' }));
+    expect(screen.getByRole('checkbox', { name: 'active-member' })).not.toBeChecked();
+
+    let finish!: (value: MailboxShareGrant[]) => void;
+    mocks.list.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    void client.invalidateQueries({ queryKey: queryKeys.admin.mailboxShares });
+    await flush();
+    expect(mocks.list).toHaveBeenCalledTimes(2);
+    // 刷新进行中：仍是编辑中的弹窗，没有闪回加载态
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.getByRole('checkbox', { name: 'active-member' })).not.toBeChecked();
+
+    // 刷新回来的名单仍含该成员，且所有者已变：编辑中的弹窗不能被它替换
+    finish([{ ...grants[1]!, ownerUserId: 200, ownerUsername: 'new-owner' }]);
+    await flush();
+    expect(client.getQueryData(queryKeys.admin.mailboxSharesOf(7))).toMatchObject([{ ownerUserId: 200 }]);
+    expect(screen.getByText('邮箱所有者：second-owner')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'active-member' })).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(mocks.replace).toHaveBeenCalledWith({ mailboxId: 7, userIds: [], expectedOwnerId: 100 }));
     view.unmount(); client.clear();
   });
 
