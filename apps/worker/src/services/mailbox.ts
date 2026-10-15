@@ -465,12 +465,15 @@ export async function getMailboxOwner(env: Env, address: string): Promise<number
   return row?.userId ?? null;
 }
 
-/** 通知归属：已认领 → 主人；未认领 → 全部启用中的管理员。收信当时结算，一次查询完成。 */
-export async function resolveNotifyOwnerIds(env: Env, address: string): Promise<number[]> {
-  const rows = await env.db.prepare(`SELECT user_id AS id FROM mailboxes WHERE address = ?1
+/** 通知归属 SQL（?1 = 收件地址）：收件链路把它并进自己的 batch，必须与 resolveNotifyOwnerIds 同源 */
+export const NOTIFY_OWNER_IDS_SQL = `SELECT user_id AS id FROM mailboxes WHERE address = ?1
     UNION ALL
     SELECT id FROM users WHERE role = 'admin' AND status = 'active'
-      AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE address = ?1)`).bind(address).all<{ id: number }>();
+      AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE address = ?1)`;
+
+/** 通知归属：已认领 → 主人；未认领 → 全部启用中的管理员。收信当时结算，一次查询完成。 */
+export async function resolveNotifyOwnerIds(env: Env, address: string): Promise<number[]> {
+  const rows = await env.db.prepare(NOTIFY_OWNER_IDS_SQL).bind(address).all<{ id: number }>();
   return rows.results.map((row) => Number(row.id));
 }
 

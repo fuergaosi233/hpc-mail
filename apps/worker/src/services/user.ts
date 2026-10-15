@@ -116,6 +116,7 @@ export async function updateUser(
   actingUserId: number,
   id: number,
   req: UpdateUserRequest,
+  ctx?: ExecCtx | null,
 ): Promise<AdminUser> {
   const db = createDb(env);
   const target = await db.select().from(users).where(eq(users.id, id)).get();
@@ -178,7 +179,7 @@ export async function updateUser(
     throw error;
   }
   if (!row) throw new AppError('conflict', '用户或域名配置已改变，请刷新后重试');
-  if (bumpEpoch && row) await mirrorUserEpoch(env, id, row.authVersion);
+  if (bumpEpoch && row) await mirrorUserEpoch(env, id, row.authVersion, ctx);
 
   const count = await db
     .select({ apiKeyCount: apiKeyCountSql })

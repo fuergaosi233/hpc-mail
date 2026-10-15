@@ -153,7 +153,7 @@ app.post('/restore', async (c) => {
 /** 永久删除（回收站里彻底删） */
 app.post('/purge', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, mutationViewerOf(c, req.scope), req.ids);
+  const purged = await purgeMessages(c.env, mutationViewerOf(c, req.scope), req.ids, execCtx(c));
   return ok(c, { purged, changed: purged });
 });
 

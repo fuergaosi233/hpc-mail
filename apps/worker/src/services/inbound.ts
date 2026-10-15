@@ -25,6 +25,7 @@ import { bumpCounter, dayWindow } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { bodyBytes, D1_BODY_LIMIT, storeMailBody } from './mail-body.js';
 import { forwardReceivedMail } from './forwarding.js';
+import { NOTIFY_OWNER_IDS_SQL } from './mailbox.js';
 import { enqueueMailNotifications } from './notification-jobs.js';
 import { attachmentKey, getExt, putObject, sha256Hex16 } from './storage.js';
 import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
@@ -38,15 +39,6 @@ const encoder = new TextEncoder();
 const ATTACHMENT_UPLOAD_CONCURRENCY = 4;
 /** 附件元数据每行 7 个绑定参数，单条 INSERT 不超过 D1 的 100 参数上限 */
 const ATTACHMENT_INSERT_BATCH = 12;
-
-/**
- * 收信当时的归属人：已认领 → 认领用户；未认领 → 全部启用中的管理员。
- * 与 mailbox.ts 的 resolveNotifyOwnerIds 同一条 SQL（?1 = 收件地址），这里与去重查询合批，不单独往返。
- */
-const OWNER_IDS_SQL = `SELECT user_id AS id FROM mailboxes WHERE address = ?1
-    UNION ALL
-    SELECT id FROM users WHERE role = 'admin' AND status = 'active'
-      AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE address = ?1)`;
 
 /** 有限并发执行；任一失败整体 reject（与串行时「任一失败即抛出」语义一致） */
 async function runLimited<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
@@ -100,12 +92,12 @@ interface InboundLookup {
  */
 async function lookupInbound(env: Env, ingestKey: string, address: string): Promise<InboundLookup> {
   const db = createDb(env);
-  // 外层由 drizzle 生成（无绑定参数），子查询沿用 OWNER_IDS_SQL 的 ?1
+  // 外层由 drizzle 生成（无绑定参数），子查询沿用 NOTIFY_OWNER_IDS_SQL 的 ?1
   const ownerUsers = db.select({ id: users.id, status: users.status, role: users.role, notifyPrefs: users.notifyPrefs })
-    .from(users).where(sql`${users.id} IN (${sql.raw(OWNER_IDS_SQL)})`).toSQL();
+    .from(users).where(sql`${users.id} IN (${sql.raw(NOTIFY_OWNER_IDS_SQL)})`).toSQL();
   const [dup, owners, ownerUserRows, legacy] = await env.db.batch([
     d1Statement(env, db.select(duplicateColumns).from(messages).where(eq(messages.ingestKey, ingestKey))),
-    env.db.prepare(OWNER_IDS_SQL).bind(address),
+    env.db.prepare(NOTIFY_OWNER_IDS_SQL).bind(address),
     env.db.prepare(ownerUsers.sql).bind(address),
     d1Statement(env, db.select({ key: settingsTable.key, value: settingsTable.value }).from(settingsTable)
       .where(inArray(settingsTable.key, [...LEGACY_NOTIFY_KEYS]))),

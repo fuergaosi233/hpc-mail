@@ -35,7 +35,7 @@ import { chunk, D1_PAIR_BATCH } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
 import { htmlToText } from '../lib/text.js';
-import type { Env } from '../types.js';
+import type { Env, ExecCtx } from '../types.js';
 import { isAiModelConfigured } from './ai-provider.js';
 import { CODE_SCAN_BODY_CHARS, resolveVerificationCode } from './code-extract.js';
 import { getSettings } from './setting.js';
@@ -986,12 +986,12 @@ export async function restoreMessages(env: Env, viewer: Viewer, ids: number[]): 
 }
 
 /** 永久删除（可见范围内）：D1 行删 + R2 清理（正文/附件/原始 .eml） */
-export async function purgeMessages(env: Env, viewer: Viewer, ids: number[]): Promise<number> {
+export async function purgeMessages(env: Env, viewer: Viewer, ids: number[], ctx?: ExecCtx | null): Promise<number> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
   let changed = 0;
   for (const batch of chunk(ids)) {
-    changed += await purgeMatchingMessages(env, and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt))!, batch.length);
+    changed += await purgeMatchingMessages(env, and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt))!, batch.length, ctx);
   }
   return changed;
 }
