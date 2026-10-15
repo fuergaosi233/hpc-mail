@@ -28,6 +28,7 @@ import { forwardReceivedMail } from './forwarding.js';
 import { NOTIFY_OWNER_IDS_SQL } from './mailbox.js';
 import { enqueueMailNotifications } from './notification-jobs.js';
 import { attachmentKey, getExt, putObject, sha256Hex16 } from './storage.js';
+import { referencedSql } from './storage-cleanup.js';
 import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
 
 /** 未认领 catch-all 转发必须按稳定主体限额，不能让随机 local-part 刷新额度。 */
@@ -413,15 +414,6 @@ export async function handleInbound(
 }
 
 /**
- * 对象仍被引用：附件行、正文溢出、原始 .eml 或 90 天外链。
- * 与 storage-cleanup.ts 的 referencedSql 同一口径（?1 = r2_key），两边需同步修改。
- */
-const R2_KEY_REFERENCED_SQL = `(EXISTS (SELECT 1 FROM attachments WHERE attachments.r2_key = ?1)
-  OR EXISTS (SELECT 1 FROM messages WHERE messages.body_r2_key = ?1)
-  OR EXISTS (SELECT 1 FROM messages WHERE messages.raw_r2_key = ?1)
-  OR EXISTS (SELECT 1 FROM external_attachment_links WHERE external_attachment_links.r2_key = ?1))`;
-
-/**
  * 提前返回的重复投递在 R2 写入落定后，为不再被任何行引用的 key 补一条清理台账（已有台账则忽略），
  * 由存储清理按引用复核后删除。仍被引用的 key 不登记，与正常删除路径互不干扰。
  */
@@ -436,7 +428,7 @@ async function ledgerUnreferencedWrites(
   if (body.status === 'fulfilled' && body.value.bodyR2Key) keys.push(body.value.bodyR2Key);
   try {
     await env.db.batch(keys.map((key) => env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key)
-      SELECT ?1 WHERE NOT ${R2_KEY_REFERENCED_SQL}`).bind(key)));
+      SELECT ?1 WHERE NOT ${referencedSql('?1')}`).bind(key)));
   } catch (error) {
     console.error('重复投递的 R2 清理台账保存失败:', error);
   }
