@@ -49,6 +49,17 @@ describe('mergeHeadPage', () => {
     expect(mergeHeadPage(loaded, page([10, 9, 8], 'c8'))).toBe(loaded);
   });
 
+  it('carries the head fingerprint of the probe into the first page', () => {
+    const merged = mergeHeadPage(loaded, { ...page([12, 11, 10], 'c10'), head: 'h2' });
+    expect(merged.pages[0]?.head).toBe('h2');
+    // 条目没变、只有指纹不同：条目与后续页沿用原引用
+    const sameItems = mergeHeadPage(loaded, { ...page([10, 9, 8], 'c8'), head: 'h3' });
+    expect(sameItems.pages[0]?.head).toBe('h3');
+    expect(sameItems.pages[0]?.items).toBe(loaded.pages[0]?.items);
+    expect(sameItems.pages[1]).toBe(loaded.pages[1]);
+    expect(mergeHeadPage(sameItems, { ...page([10, 9, 8], 'c8'), head: 'h3' })).toBe(sameItems);
+  });
+
   it('keeps only the head when it cannot be spliced onto the loaded pages', () => {
     // 新邮件超过一页：首页与已加载数据之间可能有缺口
     expect(ids(mergeHeadPage(loaded, page([30, 29, 28], 'c28')))).toEqual([[30, 29, 28]]);

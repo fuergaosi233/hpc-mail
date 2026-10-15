@@ -1,8 +1,8 @@
 import type { InfiniteData, Query, QueryClient, QueryKey } from '@tanstack/react-query';
-import type { ListMessagesQuery, MessageDetail, MessageSummary, Page } from '@hpc-mail/shared';
+import type { ListMessagesQuery, MessageDetail, MessageListPage, MessageSummary } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 
-export type MessageListData = InfiniteData<Page<MessageSummary>, string>;
+export type MessageListData = InfiniteData<MessageListPage, string>;
 type ListFilters = Partial<ListMessagesQuery>;
 type ListPredicate = (filters: ListFilters) => boolean;
 
@@ -215,9 +215,9 @@ const sameSummary = (a: MessageSummary, b: MessageSummary) => a === b || JSON.st
  * 所以首页覆盖「id ≥ 首页最后一条」的区间：区间内的已加载条目整体换成首页内容（新邮件插到最前、
  * 状态变化按 id 替换、缺失的视为已删除或移出筛选），区间外保持不动，末页游标依旧有效。
  * 新邮件多到首页接不上已加载数据，或首页已越过全部已加载数据时，无法安全拼接，只保留首页。
- * 未变化的条目沿用旧引用，行组件 memo 不会重渲染。
+ * 未变化的条目沿用旧引用，行组件 memo 不会重渲染。首页的 head 指纹换成探测结果的，供下一轮 sync 比较。
  */
-export function mergeHeadPage(data: MessageListData, head: Page<MessageSummary>): MessageListData {
+export function mergeHeadPage(data: MessageListData, head: MessageListPage): MessageListData {
   const loaded = data.pages.flatMap((page) => page.items);
   const onlyHead = (): MessageListData => ({ pages: [head], pageParams: [data.pageParams[0] ?? ''] });
   const oldestHead = head.items[head.items.length - 1];
@@ -233,9 +233,12 @@ export function mergeHeadPage(data: MessageListData, head: Page<MessageSummary>)
   });
   const pages = data.pages.map((page, index) => {
     const outside = page.items.filter((item) => item.id < oldestHead.id);
-    return { ...page, items: index === 0 ? [...headItems, ...outside] : outside };
+    return index === 0 ? { ...page, head: head.head, items: [...headItems, ...outside] } : { ...page, items: outside };
   });
   const merged = pages.flatMap((page) => page.items);
   const unchanged = merged.length === loaded.length && merged.every((item, index) => item === loaded[index]);
-  return unchanged ? data : { pages, pageParams: data.pageParams };
+  if (!unchanged) return { pages, pageParams: data.pageParams };
+  if (data.pages[0]?.head === head.head) return data;
+  // 条目都没变、只有指纹不同（如本地已就地更新过）：只换指纹，下一轮 sync 不再重复探测
+  return { ...data, pages: data.pages.map((page, index) => (index === 0 ? { ...page, head: head.head } : page)) };
 }
