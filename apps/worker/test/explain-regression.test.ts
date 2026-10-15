@@ -1,0 +1,305 @@
+import { env } from 'cloudflare:test';
+import type { ListMessagesQuery } from '@hpc-mail/shared';
+import { eq } from 'drizzle-orm';
+import { beforeAll, describe, expect, it } from 'vitest';
+import { createDb } from '../src/db/client.js';
+import { mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
+import { encodeCursor } from '../src/lib/pagination.js';
+import { listMailboxes, resolveNotifyOwnerIds } from '../src/services/mailbox.js';
+import {
+  countUnread, getRecentContacts, getThread, listMessages, syncMessages, UNREAD_COUNT_CAP, type Viewer,
+} from '../src/services/message.js';
+
+/**
+ * D1 没有 STAT4，规划器按固定启发式选索引，与数据量无关；小数据上的计划就是线上计划。
+ * 截获服务层经 env.db 发出的每条语句及其绑定参数，逐条取 EXPLAIN QUERY PLAN。
+ */
+async function capturePlans(run: (e: typeof env) => Promise<unknown>): Promise<{ sql: string; plan: string }[]> {
+  const statements: { sql: string; params: unknown[] }[] = [];
+  const db = new Proxy(env.db, {
+    get(target, property) {
+      if (property === 'prepare') return (query: string) => {
+        const entry = { sql: query, params: [] as unknown[] };
+        statements.push(entry);
+        const statement = target.prepare(query);
+        return new Proxy(statement, { get(stmt, key) {
+          if (key === 'bind') return (...args: unknown[]) => { entry.params = args; return stmt.bind(...args); };
+          const value = Reflect.get(stmt, key);
+          return typeof value === 'function' ? value.bind(stmt) : value;
+        } });
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  await run({ ...env, db } as typeof env);
+  const out: { sql: string; plan: string }[] = [];
+  for (const statement of statements) {
+    if (!/^select\b/i.test(statement.sql.trim())) continue;
+    const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${statement.sql}`).bind(...statement.params).all<{ detail: string }>();
+    out.push({ sql: statement.sql, plan: plan.results.map((row) => row.detail).join(' | ') });
+  }
+  return out;
+}
+
+/** 只看读 messages 的语句 */
+const onMessages = (plans: { sql: string; plan: string }[]) => plans.filter((p) => /from "messages"|FROM messages\b/.test(p.sql));
+
+/**
+ * 对 messages 的全表扫描（SCAN messages …）与沿 idx_messages_live 只按 deleted_at 倒扫全站未删除邮件，
+ * 都是读取量随全站邮件量增长的计划
+ */
+function expectNoFullScan(plan: string, label: string) {
+  expect(plan, label).not.toMatch(/SCAN messages\b/);
+  expect(plan, label).not.toMatch(/idx_messages_live \(deleted_at=\?\)/);
+}
+
+const q = (extra: Partial<ListMessagesQuery> = {}) => ({ limit: 30, ...extra }) as ListMessagesQuery;
+
+let sparse: Viewer;
+let admin: Viewer;
+let sparseBox: string;
+let replyTarget: number;
+let subjectTarget: number;
+
+beforeAll(async () => {
+  const db = createDb(env);
+  const [s, a, owner] = await db.insert(users).values([
+    { username: 'explain-sparse', passwordHash: 'x', role: 'user', authVersionMigrated: true },
+    { username: 'explain-admin', passwordHash: 'x', role: 'admin', authVersionMigrated: true },
+    { username: 'explain-owner', passwordHash: 'x', role: 'user', authVersionMigrated: true },
+  ]).returning({ id: users.id });
+  sparse = { userId: s!.id, role: 'user' };
+  admin = { userId: a!.id, role: 'admin' };
+  sparseBox = 'sparse@explain.test';
+  await db.insert(mailboxes).values([
+    { address: sparseBox, domain: 'explain.test', userId: s!.id },
+    { address: 'admin1@explain.test', domain: 'explain.test', userId: a!.id },
+    { address: 'admin2@explain.test', domain: 'explain.test', userId: a!.id },
+    { address: 'owner@explain.test', domain: 'explain.test', userId: owner!.id },
+  ]);
+  const [shared] = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, 'owner@explain.test'));
+  await db.insert(mailboxShares).values([
+    { mailboxId: shared!.id, userId: s!.id, grantedBy: owner!.id },
+    { mailboxId: shared!.id, userId: a!.id, grantedBy: owner!.id },
+  ]);
+  const base = { direction: 'inbound' as const, domain: 'explain.test', fromAddress: 'f@example.net', preview: 'p', status: 'received' };
+  const [root] = await db.insert(messages).values({ ...base, address: sparseBox, subject: 'topic', messageId: '<root@explain>' }).returning({ id: messages.id });
+  replyTarget = root!.id;
+  await db.insert(messages).values({ ...base, address: sparseBox, subject: 'Re: topic', inReplyTo: '<root@explain>' });
+  const [loose] = await db.insert(messages).values({ ...base, address: sparseBox, subject: 'Re: loose' }).returning({ id: messages.id });
+  subjectTarget = loose!.id;
+  await db.insert(messages).values([
+    { ...base, address: 'admin1@explain.test', subject: 'a' },
+    { ...base, address: 'owner@explain.test', subject: 'shared' },
+    { ...base, address: 'nobody@explain.test', subject: 'unclaimed' },
+  ]);
+});
+
+describe('执行计划回归：默认视图按地址取数', () => {
+  const views: [string, Partial<ListMessagesQuery>][] = [
+    ['全部', {}], ['收件', { direction: 'inbound' }], ['已发送', { direction: 'outbound' }], ['未读', { unread: true }],
+    ['翻页', { cursor: encodeCursor(1_000_000) }], ['增量', { afterId: 1 }], ['按地址', { address: 'owner@explain.test' }],
+  ];
+
+  it.each([['稀疏用户', () => sparse], ['管理员', () => admin], ['管理员 scope=mine', () => ({ ...admin, scope: 'mine' as const })]])(
+    '%s：全部/收件/已发送/未读/翻页/按地址走 idx_messages_address_deleted_id，不倒扫全站',
+    async (_label, who) => {
+      for (const [label, query] of views) {
+        const [page] = onMessages(await capturePlans((e) => listMessages(e, who(), q(query))));
+        expect(page!.sql, label).toContain('INDEXED BY idx_messages_address_deleted_id');
+        expect(page!.plan, label).toContain('SEARCH messages USING INDEX idx_messages_address_deleted_id (address=?');
+        expectNoFullScan(page!.plan, label);
+      }
+    },
+  );
+
+  it('sync：未读数与首页同计划，首页与列表同一条语句', async () => {
+    const plans = onMessages(await capturePlans((e) => syncMessages(e, sparse, q())));
+    expect(plans).toHaveLength(2);
+    expect(plans[0]!.plan).toContain('idx_messages_visible');
+    expect(plans[1]!.plan).toContain('idx_messages_address_deleted_id');
+    for (const p of plans) expectNoFullScan(p.plan, p.sql);
+    const [listed] = onMessages(await capturePlans((e) => listMessages(e, sparse, q())));
+    expect(plans[1]!.sql).toBe(listed!.sql);
+  });
+
+  it('domain/星标/搜索/回收站/未认领/审计他人邮箱保持原计划（不加 INDEXED BY）', async () => {
+    const kept: [string, Viewer, Partial<ListMessagesQuery>][] = [
+      ['domain', sparse, { domain: 'explain.test' }], ['星标', sparse, { starred: true }], ['搜索', sparse, { q: 'x' }],
+      ['回收站', sparse, { trash: true }], ['未认领', { ...admin, scope: 'unclaimed' }, {}],
+      ['审计他人', { ...admin, scope: 'user', targetUserId: sparse.userId }, {}],
+    ];
+    for (const [label, who, query] of kept) {
+      const [page] = onMessages(await capturePlans((e) => listMessages(e, who, q(query))));
+      expect(page!.sql, label).not.toContain('INDEXED BY');
+    }
+  });
+
+  it('联系人按地址取最近 400 封', async () => {
+    for (const who of [sparse, admin]) {
+      const [contacts] = onMessages(await capturePlans((e) => getRecentContacts(e, who)));
+      expect(contacts!.plan).toContain('SEARCH messages USING INDEX idx_messages_address_deleted_id (address=?');
+      expectNoFullScan(contacts!.plan, 'contacts');
+    }
+  });
+
+  it('未读数（/api 封顶与 /v1 精确）沿 idx_messages_visible 按地址计数', async () => {
+    for (const who of [sparse, admin]) {
+      for (const cap of [UNREAD_COUNT_CAP, undefined]) {
+        const [count] = onMessages(await capturePlans((e) => countUnread(e, who.userId, who.role, cap)));
+        expect(count!.plan).toContain('SEARCH messages USING COVERING INDEX idx_messages_visible (address=? AND deleted_at=? AND direction=? AND is_read=?)');
+        expectNoFullScan(count!.plan, `cap=${cap}`);
+      }
+    }
+  });
+
+  it('线程：候选按 message_id / in_reply_to 索引取，主题回退按地址取', async () => {
+    const byHeaders = onMessages(await capturePlans((e) => getThread(e, sparse, replyTarget)));
+    expect(byHeaders.map((p) => p.plan).join(' || ')).toMatch(/idx_messages_message_id[\s\S]*idx_messages_in_reply_to/);
+    for (const p of byHeaders) expectNoFullScan(p.plan, p.sql);
+    const bySubject = onMessages(await capturePlans((e) => getThread(e, sparse, subjectTarget)));
+    expect(bySubject.at(-1)!.plan).toContain('idx_messages_address_deleted_id (address=?');
+    for (const p of bySubject) expectNoFullScan(p.plan, p.sql);
+  });
+
+  it('mailboxes 列表的 messageCount 子查询按地址走索引', async () => {
+    for (const opts of [{ userId: admin.userId }, { all: true }]) {
+      const [list] = await capturePlans((e) => listMailboxes(e, opts));
+      expect(list!.plan).toMatch(/CORRELATED SCALAR SUBQUERY \d+ \| SEARCH messages USING COVERING INDEX \w+ \(address=\?\)/);
+      expectNoFullScan(list!.plan, JSON.stringify(opts));
+    }
+  });
+});
+
+describe('执行计划回归：通知归属', () => {
+  it('resolveNotifyOwnerIds 未认领分支只扫启用管理员的部分索引，不扫 users 全表', async () => {
+    const [owners] = await capturePlans((e) => resolveNotifyOwnerIds(e, 'nobody@explain.test'));
+    expect(owners!.plan).toContain('USING COVERING INDEX idx_users_active_admin');
+    expect(owners!.plan).not.toMatch(/SCAN users(?! USING COVERING INDEX idx_users_active_admin)/);
+    expect(await resolveNotifyOwnerIds(env, 'nobody@explain.test')).toContain(admin.userId);
+    expect(await resolveNotifyOwnerIds(env, sparseBox)).toEqual([sparse.userId]);
+  });
+});
+
+/**
+ * 改前的列表语句（readable 用 OR 形式、交给规划器选索引）作为对照：默认视图改走地址索引后，
+ * 每一页的条目、顺序与 nextCursor 都必须与它逐条一致。
+ */
+async function legacyPage(viewer: Viewer, query: ListMessagesQuery, cursorId: number | null) {
+  const owned = 'SELECT address FROM mailboxes WHERE user_id = ?';
+  const shared = `SELECT m.address FROM mailbox_shares s JOIN mailboxes m ON m.id = s.mailbox_id
+    JOIN users u ON u.id = m.user_id WHERE s.user_id = ? AND u.status = 'active'`;
+  const ownedOnly = query.unread || query.direction === 'outbound';
+  const conds = [ownedOnly ? `address IN (${owned})`
+    : `(address IN (${owned}) OR (direction = 'inbound' AND deleted_at IS NULL AND address IN (${shared})))`, 'deleted_at IS NULL'];
+  const params: unknown[] = ownedOnly ? [viewer.userId] : [viewer.userId, viewer.userId];
+  if (query.direction) { conds.push('direction = ?'); params.push(query.direction); }
+  if (query.address) { conds.push('address = ?'); params.push(query.address); }
+  if (query.unread) conds.push('is_read = 0');
+  if (cursorId) { conds.push('id < ?'); params.push(cursorId); }
+  if (query.afterId) { conds.push('id > ?'); params.push(query.afterId); }
+  const rows = await env.db.prepare(`SELECT id FROM messages WHERE ${conds.join(' AND ')} ORDER BY id DESC LIMIT ?`)
+    .bind(...params, query.limit + 1).all<{ id: number }>();
+  const ids = rows.results.map((row) => row.id);
+  const page = ids.slice(0, query.limit);
+  return { ids: page, nextCursor: ids.length > query.limit ? encodeCursor(page.at(-1)!) : null };
+}
+
+describe('默认视图改走地址索引：结果与改前逐条一致', () => {
+  it('认领/共享（含已删除、外发、所有者禁用）/未认领混合数据，各视图逐页一致；联系人一致', async () => {
+    const db = createDb(env);
+    const [u, o, x, ad, y] = await db.insert(users).values([
+      { username: 'cmp-user', passwordHash: 'x', role: 'user', authVersionMigrated: true },
+      { username: 'cmp-owner', passwordHash: 'x', role: 'user', authVersionMigrated: true },
+      { username: 'cmp-disabled', passwordHash: 'x', role: 'user', status: 'disabled', authVersionMigrated: true },
+      { username: 'cmp-admin', passwordHash: 'x', role: 'admin', authVersionMigrated: true },
+      { username: 'cmp-other', passwordHash: 'x', role: 'user', authVersionMigrated: true },
+    ]).returning({ id: users.id });
+    const boxes = await db.insert(mailboxes).values([
+      { address: 'u1@cmp.test', domain: 'cmp.test', userId: u!.id },
+      { address: 'u2@cmp.test', domain: 'cmp.test', userId: u!.id },
+      { address: 'o1@cmp.test', domain: 'cmp.test', userId: o!.id },
+      { address: 'x1@cmp.test', domain: 'cmp.test', userId: x!.id },
+      { address: 'a1@cmp.test', domain: 'cmp.test', userId: ad!.id },
+      { address: 'a2@cmp.test', domain: 'cmp.test', userId: ad!.id },
+      { address: 'y1@cmp.test', domain: 'cmp.test', userId: y!.id },
+    ]).returning({ id: mailboxes.id, address: mailboxes.address });
+    const box = (address: string) => boxes.find((b) => b.address === address)!.id;
+    await db.insert(mailboxShares).values([
+      { mailboxId: box('o1@cmp.test'), userId: u!.id, grantedBy: o!.id },
+      { mailboxId: box('x1@cmp.test'), userId: u!.id, grantedBy: x!.id },
+      { mailboxId: box('o1@cmp.test'), userId: ad!.id, grantedBy: o!.id },
+      { mailboxId: box('u1@cmp.test'), userId: ad!.id, grantedBy: u!.id },
+    ]);
+    // 固定种子的伪随机，失败可复现
+    let seed = 20261015;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) % 2 ** 31; return seed / 2 ** 31; };
+    const addresses = ['u1@cmp.test', 'u2@cmp.test', 'o1@cmp.test', 'x1@cmp.test', 'a1@cmp.test', 'a2@cmp.test', 'y1@cmp.test', 'n1@cmp.test'];
+    const rows = Array.from({ length: 90 }, () => {
+      const outbound = rnd() < 0.3;
+      return {
+        direction: outbound ? 'outbound' as const : 'inbound' as const, address: addresses[Math.floor(rnd() * addresses.length)]!,
+        domain: 'cmp.test', fromAddress: `f${Math.floor(rnd() * 20)}@example.net`, subject: 's', preview: 'p',
+        status: outbound ? 'sent' : 'received', isRead: outbound || rnd() < 0.5, deletedAt: rnd() < 0.15 ? new Date() : null,
+        recipients: { to: [`to${Math.floor(rnd() * 20)}@example.net`], cc: [], bcc: [] },
+      };
+    });
+    const inserted: number[] = [];
+    for (const row of rows) {
+      const [m] = await db.insert(messages).values(row).returning({ id: messages.id });
+      inserted.push(m!.id);
+    }
+
+    const viewers: [string, Viewer][] = [
+      ['user', { userId: u!.id, role: 'user' }], ['owner', { userId: o!.id, role: 'user' }],
+      ['admin', { userId: ad!.id, role: 'admin' }], ['admin mine', { userId: ad!.id, role: 'admin', scope: 'mine' }],
+    ];
+    const views: Partial<ListMessagesQuery>[] = [
+      {}, { direction: 'inbound' }, { direction: 'outbound' }, { unread: true }, { unread: true, direction: 'inbound' },
+      { address: 'u1@cmp.test' }, { address: 'o1@cmp.test' }, { address: 'x1@cmp.test' }, { address: 'y1@cmp.test' },
+      { address: 'n1@cmp.test' }, { address: 'o1@cmp.test', direction: 'outbound' }, { afterId: inserted[45]! },
+    ];
+    let compared = 0;
+    for (const [who, viewer] of viewers) {
+      for (const view of views) {
+        for (const limit of [3, 10, 100]) {
+          const query = { ...view, limit } as ListMessagesQuery;
+          let cursor: string | undefined;
+          for (let pageNo = 0; pageNo < 100; pageNo++) {
+            const label = `${who} ${JSON.stringify(query)} page ${pageNo}`;
+            const page = await listMessages(env, viewer, { ...query, cursor });
+            const expected = await legacyPage(viewer, query, cursor ? Number(atob(cursor)) : null);
+            expect({ ids: page.items.map((item) => item.id), nextCursor: page.nextCursor }, label).toEqual(expected);
+            compared += expected.ids.length;
+            if (!page.nextCursor) break;
+            cursor = page.nextCursor;
+          }
+        }
+      }
+    }
+    // 对照确实覆盖了共享收件，且所有者禁用、已删除、共享地址外发都不可见
+    const byId = new Map(inserted.map((id, index) => [id, rows[index]!]));
+    const userAll = (await legacyPage(viewers[0]![1], { limit: 100 } as ListMessagesQuery, null)).ids.map((id) => byId.get(id)!);
+    expect(userAll.some((row) => row.address === 'o1@cmp.test')).toBe(true);
+    expect(userAll.every((row) => row.address !== 'x1@cmp.test' && row.deletedAt === null)).toBe(true);
+    expect(userAll.every((row) => row.address !== 'o1@cmp.test' || row.direction === 'inbound')).toBe(true);
+    expect(compared).toBeGreaterThan(500);
+
+    // 联系人：与改前「认领地址 + 未删除，最近 400 封」聚合结果一致
+    for (const [who, viewer] of viewers) {
+      const recent = await env.db.prepare(`SELECT direction, recipients, from_address FROM messages
+        WHERE address IN (SELECT address FROM mailboxes WHERE user_id = ?) AND deleted_at IS NULL ORDER BY id DESC LIMIT 400`)
+        .bind(viewer.userId).all<{ direction: string; recipients: string; from_address: string }>();
+      const expected = new Set<string>();
+      for (const row of recent.results) {
+        if (row.direction === 'outbound') {
+          const r = JSON.parse(row.recipients) as { to: string[]; cc: string[] };
+          for (const addr of [...r.to, ...r.cc]) if (addr) expected.add(addr);
+        } else if (row.from_address) expected.add(row.from_address);
+      }
+      expect(expected.size, who).toBeGreaterThan(0);
+      expect(await getRecentContacts(env, viewer), who).toEqual([...expected].slice(0, 100));
+    }
+  });
+});
