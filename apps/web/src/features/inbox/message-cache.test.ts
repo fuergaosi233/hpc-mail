@@ -10,6 +10,7 @@ import {
   snapshotListMembership,
   syncRemovedMessages,
   syncRestoredMessages,
+  syncSentMessage,
   syncStarState,
 } from './message-cache';
 
@@ -211,6 +212,28 @@ describe('cache sync after mutations', () => {
     syncAllRead(client, { q: 'invoice' });
     expect(list(inbox)?.pages[0]?.items.map((m) => m.isRead)).toEqual([true, false, false]);
     expect(listState(inbox)?.isInvalidated).toBe(true);
+  });
+
+  it('a sent mail refreshes the active single-page list and leaves starred, trash, details and unread alone', async () => {
+    const { client, fetchList, fetchUnread, seedList, observeList, listState } = setup();
+    const sent = { direction: 'outbound' as const, scope: 'mine' as const };
+    const inbox = { direction: 'inbound' as const, scope: 'mine' as const };
+    const starred = { scope: 'mine' as const, starred: true };
+    const trash = { scope: 'mine' as const, trash: true };
+    for (const filters of [sent, inbox, starred, trash]) seedList(filters, data(page([3, 2], null)));
+    client.setQueryData(queryKeys.messages.detail(2), mail(2));
+    const stop = observeList(sent);
+
+    syncSentMessage(client, { sourceIds: [], selfDelivered: false });
+
+    await vi.waitFor(() => expect(fetchList).toHaveBeenCalledTimes(1));
+    expect(listState(inbox)?.isInvalidated).toBe(true);
+    expect([listState(starred)?.isInvalidated, listState(trash)?.isInvalidated]).toEqual([false, false]);
+    expect(client.getQueryState(queryKeys.messages.detail(2))?.isInvalidated).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(fetchList).toHaveBeenCalledTimes(1);
+    expect(fetchUnread).not.toHaveBeenCalled();
+    stop();
   });
 
   it('undo puts deleted mail back into the lists it came from, in order', () => {

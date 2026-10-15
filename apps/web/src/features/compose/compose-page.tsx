@@ -22,7 +22,6 @@ import {
   internalSendMailSchema,
 } from '@hpc-mail/shared';
 import { ApiError, isUncertainSendError } from '@/api/errors';
-import { queryKeys } from '@/api/query-keys';
 import { messageApi, uploadsApi } from '@/api/resources';
 import { Progress } from '@/components/ui/progress';
 import { PageHeader } from '@/components/page-header';
@@ -38,6 +37,7 @@ import { formatBytes, formatRelativeTime } from '@/lib/format';
 import { useDomains } from '@/lib/use-config';
 import { useCurrentUser } from '@/lib/use-session';
 import { getAuthToken } from '@/lib/auth-token';
+import { syncSentMessage } from '@/features/inbox/message-cache';
 import { rememberedFilterAddress } from '@/features/inbox/use-inbox-filters';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 import type { ComposeInitial } from './compose-init';
@@ -61,6 +61,9 @@ import { exceedsExternalLimit, hasExternalRecipient } from './compose-attachment
 import { IdentityPicker } from './identity-picker';
 import { RecipientInput } from './recipient-input';
 import { clearSendAttempt, hashSendPayload, persistSendAttempt, readSendAttempt } from './send-attempt';
+
+/** 往来联系人（收件人自动补全）；发信后新收件人会进入联系人，标记过期 */
+const CONTACTS_KEY = ['messages', 'contacts'] as const;
 
 interface AttachmentUpload {
   key: string;
@@ -202,7 +205,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   const { data: visibleDomains } = useDomains();
   const { data: mailboxes } = useMailboxesQuery(false);
   const { data: contactsData } = useQuery({
-    queryKey: ['messages', 'contacts'],
+    queryKey: CONTACTS_KEY,
     queryFn: () => messageApi.contacts(),
     staleTime: 5 * 60_000,
   });
@@ -408,7 +411,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       }
       return messageApi.send(payload, sendIdempotencyKeyRef.current);
     },
-    onSuccess: (result) => {
+    onSuccess: (result, payload) => {
       sentRef.current = true;
       clearSendAttempt(user.id, sendIdempotencyKeyRef.current);
       setRecoveredSendPending(false);
@@ -419,7 +422,12 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       const issue = failures.length > 0 || Boolean(result.errorDetail) || result.status === 'failed';
       toast({ title: issue ? failures.length ? `${failures.length} 个收件人发送失败，请查看并重试失败目标` : '邮件发送有异常，请查看详情' : result.status === 'delivered' ? '站内邮件已送达' : '邮件已提交发送', variant: issue ? 'error' : 'success' });
       clearDraft(draftKey);
-      void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
+      const owned = new Set((mailboxes ?? []).map((box) => box.address.toLowerCase()));
+      syncSentMessage(queryClient, {
+        sourceIds: [payload.replyToMessageId, payload.forwardAttachmentsFrom, initial.sourceMessageId].filter((id) => id !== undefined),
+        selfDelivered: [...payload.to, ...payload.cc, ...payload.bcc].some((address) => owned.has(address.toLowerCase())),
+      });
+      void queryClient.invalidateQueries({ queryKey: CONTACTS_KEY, refetchType: 'none' });
       navigate(result.errorDetail || result.status === 'failed' || result.recipientOutcomes?.some((outcome) => outcome.status === 'failed') ? `/mail/${result.id}` : '/sent');
     },
     onError: (err) => {

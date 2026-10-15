@@ -51,12 +51,13 @@ function patchDetails(client: QueryClient, ids: ReadonlySet<number>, patch: Part
  * 列表统一收尾：全部只标记过期、不立即重拉；仅当前显示且只有 1 页的列表立即重拉（1 个请求）。
  * 多页列表已由就地更新保持一致，过期标记让下次挂载/聚焦/轮询时经首页探测增量对齐，不再串行重拉每一页。
  */
-function refreshLists(client: QueryClient): void {
-  void client.invalidateQueries({ queryKey: queryKeys.messages.lists, refetchType: 'none' });
+function refreshLists(client: QueryClient, predicate: ListPredicate = () => true): void {
+  const matches = (query: Query) => predicate(filtersOf(query));
+  void client.invalidateQueries({ queryKey: queryKeys.messages.lists, predicate: matches, refetchType: 'none' });
   void client.refetchQueries({
     queryKey: queryKeys.messages.lists,
     type: 'active',
-    predicate: (query) => pageCount(query) <= 1,
+    predicate: (query) => matches(query) && pageCount(query) <= 1,
   });
 }
 
@@ -152,6 +153,32 @@ export function syncAllRead(client: QueryClient, scope: ReadAllScope = {}): void
   void client.invalidateQueries({ queryKey: queryKeys.messages.details, refetchType: 'none' });
   refreshLists(client);
   refreshUnreadCount(client);
+}
+
+/**
+ * 发信成功后：新邮件（已发送的一封，以及站内投递到的收件）只会出现在非星标、非回收站的列表里，
+ * 这些列表标记过期（当前显示的单页列表立即重拉），回到列表时经整页重拉或首页探测对齐。
+ * 回复/转发/补发的来源邮件所在会话线程标记过期；详情不受发信影响，保持原样。
+ * 发给自己认领的地址时站内直接投递，未读数一并刷新。
+ */
+export function syncSentMessage(
+  client: QueryClient,
+  { sourceIds, selfDelivered }: { sourceIds: readonly number[]; selfDelivered: boolean },
+): void {
+  refreshLists(client, (filters) => !filters.starred && !filters.trash);
+  const sources = new Set(sourceIds);
+  if (sources.size > 0) {
+    void client.invalidateQueries({
+      queryKey: queryKeys.messages.root,
+      predicate: (query) => {
+        if (query.queryKey[1] !== 'thread') return false;
+        const items = (query.state.data as { items?: MessageSummary[] } | undefined)?.items ?? [];
+        return sources.has(query.queryKey[2] as number) || items.some((item) => sources.has(item.id));
+      },
+      refetchType: 'none',
+    });
+  }
+  if (selfDelivered) refreshUnreadCount(client);
 }
 
 /** 删除前各列表里这批邮件的快照，撤销时据此放回原列表 */
