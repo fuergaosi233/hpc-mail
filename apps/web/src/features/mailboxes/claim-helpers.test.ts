@@ -143,18 +143,24 @@ describe('claimList', () => {
     });
   });
 
-  it('整个批量请求失败时一个都不算认领：ApiError 带出原因，其他异常给通用提示，均不抛出', async () => {
-    const forbidden = vi.fn().mockRejectedValue(new ApiError('请求过于频繁', { code: 'rate_limited', httpStatus: 429 }));
-    expect(await claimList([d('one'), d('two')], { claim: vi.fn(), batchClaim: forbidden })).toEqual({
+  it('批量请求在处理前被拒绝（4xx）：一个都没认领，带出原因，不抛出', async () => {
+    const limited = vi.fn().mockRejectedValue(new ApiError('请求过于频繁', { code: 'rate_limited', httpStatus: 429 }));
+    const result = await claimList([d('one'), d('two')], { claim: vi.fn(), batchClaim: limited });
+    expect(result).toEqual({ claimed: [], remaining: [d('one'), d('two')], stoppedBy: '请求过于频繁' });
+    expect(result.uncertain).toBeUndefined();
+  });
+
+  it.each([
+    ['网络在服务端提交后断开', new ApiError('网络连接失败', { code: 'network' }), '网络连接失败'],
+    ['服务端异常 500', new ApiError('服务器内部错误', { code: 'internal', httpStatus: 500 }), '服务器内部错误'],
+    ['非 ApiError 异常', new TypeError('boom'), '认领失败，请重试'],
+  ])('批量请求整单失败且结果未知（%s）：标记可能已部分认领，提示以邮箱列表为准', async (_name, error, message) => {
+    const batchClaim = vi.fn().mockRejectedValue(error);
+    expect(await claimList([d('one'), d('two')], { claim: vi.fn(), batchClaim })).toEqual({
       claimed: [],
       remaining: [d('one'), d('two')],
-      stoppedBy: '请求过于频繁',
-    });
-    const broken = vi.fn().mockRejectedValue(new TypeError('boom'));
-    expect(await claimList([d('one'), d('two')], { claim: vi.fn(), batchClaim: broken })).toEqual({
-      claimed: [],
-      remaining: [d('one'), d('two')],
-      stoppedBy: '认领失败，请重试',
+      stoppedBy: `${message}。部分地址可能已认领，请以邮箱列表为准`,
+      uncertain: true,
     });
   });
 

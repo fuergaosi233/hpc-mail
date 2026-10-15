@@ -287,6 +287,35 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     client.clear();
   });
 
+  it('批量认领整单失败、结果未知（服务端已提交后断网）：照样刷新我的邮箱，提示以邮箱列表为准', async () => {
+    mocks.batchClaim.mockRejectedValueOnce(new ApiError('网络连接失败，请检查网络后重试', { code: 'network' }));
+    const { client } = renderDialog(['one.test']);
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
+    const reset = vi.spyOn(client, 'resetQueries');
+    setCount('3');
+    fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
+    const values = prefixes();
+    fireEvent.click(screen.getByRole('button', { name: '认领 3 个' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('网络连接失败，请检查网络后重试。部分地址可能已认领，请以邮箱列表为准');
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['mailboxes'] });
+    expect(reset).toHaveBeenCalledWith({ queryKey: ['messages'] });
+    expect(prefixes()).toEqual(values);
+    client.clear();
+  });
+
+  it('批量认领在处理前被拒绝（4xx）：确定一个都没认领，只重新核对可用性', async () => {
+    mocks.batchClaim.mockRejectedValueOnce(new ApiError('请求过于频繁', { code: 'rate_limited', httpStatus: 429 }));
+    const { client } = renderDialog(['one.test']);
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
+    setCount('2');
+    fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
+    fireEvent.click(screen.getByRole('button', { name: '认领 2 个' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/^请求过于频繁$/);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['mailboxes', 'availability'] });
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['mailboxes'] });
+    client.clear();
+  });
+
   it('有地址不可认领或重复时标红该行并禁用认领，修复后恢复', async () => {
     mocks.availableOf.mockImplementation(async (localPart = '') =>
       localPart === 'busy' ? { available: false, reason: 'taken' } : { available: true },
