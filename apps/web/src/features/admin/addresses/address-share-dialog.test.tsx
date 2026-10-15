@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
 import type { MailboxShareGrant } from '@hpc-mail/shared';
+import { queryKeys } from '@/api/query-keys';
 
 const mocks = vi.hoisted(() => ({ list: vi.fn(), replace: vi.fn(), toast: vi.fn(), mobile: false }));
 const grants: MailboxShareGrant[] = [
@@ -41,8 +42,12 @@ vi.mock('@/features/mailboxes/use-mailboxes', () => ({
 }));
 import { AddressesPage } from './addresses-page';
 
-function mount() {
+/** 后端按 mailboxId 过滤：只返回该邮箱（0 或 1 项） */
+const sharesOf = async (mailboxId?: number) => grants.filter((grant) => grant.mailboxId === mailboxId);
+
+function mount(seed?: (client: QueryClient) => void) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  seed?.(client);
   const view = render(<QueryClientProvider client={client}><MemoryRouter><AddressesPage /></MemoryRouter></QueryClientProvider>);
   return { client, view };
 }
@@ -50,7 +55,7 @@ function mount() {
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.mobile = false;
-  mocks.list.mockResolvedValue(grants);
+  mocks.list.mockImplementation(sharesOf);
   mocks.replace.mockImplementation(async ({ userIds }: { userIds: number[] }) => ({ grantees: userIds.map(userId => ({ userId })) }));
 });
 
@@ -60,6 +65,10 @@ describe('按地址行共享邮箱', () => {
     expect(mocks.list).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
     const member = await screen.findByRole('checkbox', { name: 'active-member' });
+    // 只按这一个邮箱读共享名单，缓存在该邮箱自己的 key 下
+    expect(mocks.list.mock.calls).toEqual([[7]]);
+    expect(client.getQueryData(queryKeys.admin.mailboxSharesOf(7))).toEqual([grants[1]]);
+    expect(client.getQueryData(queryKeys.admin.mailboxShares)).toBeUndefined();
     const dialog = screen.getByRole('dialog', { name: '共享邮箱' });
     expect(within(dialog).getByText('second@example.com')).toBeInTheDocument();
     expect(within(dialog).queryByText('first@example.com')).toBeNull();
@@ -112,7 +121,7 @@ describe('按地址行共享邮箱', () => {
   });
 
   it('名单加载失败不能用空名单覆盖，重试后仍打开指定邮箱', async () => {
-    mocks.list.mockRejectedValueOnce(new Error('network unavailable')).mockResolvedValue(grants);
+    mocks.list.mockRejectedValueOnce(new Error('network unavailable'));
     const { client, view } = mount();
     fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
     await screen.findByRole('button', { name: '重新加载' });
@@ -120,6 +129,34 @@ describe('按地址行共享邮箱', () => {
     expect(mocks.replace).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
     expect(await screen.findByRole('checkbox', { name: 'active-member' })).toBeChecked();
+    expect(mocks.list.mock.calls).toEqual([[7], [7]]);
+    view.unmount(); client.clear();
+  });
+
+  it('该邮箱已释放（名单为空）时提示刷新，不能编辑', async () => {
+    mocks.list.mockResolvedValueOnce([]);
+    const { client, view } = mount();
+    fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
+    expect(await screen.findByText('该邮箱已释放或不存在，请关闭并刷新地址列表。')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '保存' })).toBeNull();
+    view.unmount(); client.clear();
+  });
+
+  it('缓存的名单已失效（如刚过户）时，等刷新完成再进入编辑，不拿旧成员覆盖', async () => {
+    let finish!: (value: MailboxShareGrant[]) => void;
+    mocks.list.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const { client, view } = mount((c) => {
+      c.setQueryData(queryKeys.admin.mailboxSharesOf(7), [grants[1]]);
+      void c.invalidateQueries({ queryKey: queryKeys.admin.mailboxShares });
+    });
+    fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('正在加载共享名单…');
+    expect(screen.queryByRole('checkbox', { name: 'active-member' })).toBeNull();
+    finish([{ ...grants[1]!, ownerUserId: 200, ownerUsername: 'new-owner', grantees: [] }]);
+    expect(await screen.findByText('邮箱所有者：new-owner')).toBeInTheDocument();
+    expect(await screen.findByRole('checkbox', { name: 'active-member' })).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(mocks.replace).toHaveBeenCalledWith({ mailboxId: 7, userIds: [], expectedOwnerId: 200 }));
     view.unmount(); client.clear();
   });
 
