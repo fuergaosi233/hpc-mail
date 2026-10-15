@@ -27,9 +27,12 @@ function previewBody(value: string): string {
   return decoder.decode(bytes.subarray(0, end));
 }
 
-/** 大正文必须先持久化全文，成功后才能用截断预览代替 D1 正文。 */
-export async function storeMailBody(env: Env, text: string, html: string, seed?: string) {
-  if (bodyBytes(text, html) <= D1_BODY_LIMIT) {
+/**
+ * 大正文必须先持久化全文，成功后才能用截断预览代替 D1 正文。
+ * `bytes` 为调用方已算好的 bodyBytes(text, html)，避免对大正文重复 UTF-8 编码。
+ */
+export async function storeMailBody(env: Env, text: string, html: string, seed?: string, bytes?: number) {
+  if ((bytes ?? bodyBytes(text, html)) <= D1_BODY_LIMIT) {
     return { bodyText: text, bodyHtml: html, bodyR2Key: null as string | null };
   }
   const key = bodyKey(seed);
