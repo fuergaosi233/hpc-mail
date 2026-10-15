@@ -41,7 +41,7 @@
 
 管理员 JWT 可 `POST /api/admin/mailboxes/:id/transfer`，将任意现有已认领邮箱直接转给指定的启用中用户（普通用户或管理员）。自己或别人认领的均可；此操作不经过未认领状态。目标普通用户有专属邮箱权限时，域名范围、系统保留前缀、总数和单域名数量必须符合其权限，超出时先调整配置。目标用户使用公共配置或为管理员时，保留原有强制过户豁免。它不创建尚未存在的邮箱。
 
-先读 `GET /api/mailboxes?all=1` 核对邮箱 `id,address,userId`，再用 `GET /api/admin/users/search?q=用户名&excludeUserId=当前主人ID` 查找目标用户。q 为 1–32 字符的用户名片段，完全匹配优先，其次前缀和其他包含匹配；hasMore=true 时继续补充用户名缩小范围。body 为 `{userId:目标用户ID,expectedOwnerId:列表中的当前主人ID}`，两者必须是正整数。
+先读 `GET /api/mailboxes?all=1`（已知邮箱 ID 时用 `GET /api/admin/mailboxes/:id`，不存在返回 404）核对邮箱 `id,address,userId`，再用 `GET /api/admin/users/search?q=用户名&excludeUserId=当前主人ID` 查找目标用户。q 为 1–32 字符的用户名片段，完全匹配优先，其次前缀和其他包含匹配；hasMore=true 时继续补充用户名缩小范围。body 为 `{userId:目标用户ID,expectedOwnerId:列表中的当前主人ID}`，两者必须是正整数。
 
 ```bash
 # API="$BASE/api"，AUTH 为管理员 JWT；三个 ID 均来自上面的实际查询

@@ -11,7 +11,9 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD 在 JWT
 | `GET /mailboxes?all=1` | 管理员全站数组；普通用户不能请求全站范围 | 同左，`mailbox.read` 加管理员角色 |
 | `GET /mailboxes/shared` | 分享给自己的只读管理员邮箱数组 | 同左，`mailbox.read` |
 | `GET /mailboxes/availability?localPart=…&domain=…` | `{address,available,reason?}` | 同左，`mailbox.read` |
+| `POST /mailboxes/availability/batch` | `{items:[{localPart,domain}...]}`（1–20 个）→ 按请求顺序的 availability 数组 | 无，JWT 专用 |
 | `POST /mailboxes` | `{localPart,domain}` → 201 邮箱 | 同左，`mailbox.write` |
+| `POST /mailboxes/batch` | `{items:[{localPart,domain}...]}`（1–20 个）→ `{claimed,taken,notAttempted,stoppedBy}`，见下文 | 无，JWT 专用；Key 逐个调用 `POST /mailboxes` |
 | `PUT /mailboxes/:id` | `{displayName}` → 邮箱 | 同左，`mailbox.write` |
 | `DELETE /mailboxes/:id` | `{success:true,deletedMessages}` | 同左，`mailbox.write` |
 
@@ -37,6 +39,8 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 | `domain_limit` | 当前用户已达该域名的每人上限 | 403 |
 | `taken` | 地址已被认领 | 409 `address_taken` |
 
+批量认领按请求顺序逐个执行，规则与单个认领相同：已被占用的地址进 `taken` 并继续下一个；其他错误（额度用尽、域名或权限配置变化等）立即停止，已认领的保留在 `claimed`，触发停止的那一项及其后各项进 `notAttempted`，`stoppedBy` 给出 `{code,message}`。HTTP 200 不代表全部认领成功，要以 `claimed` 为准。
+
 按 `reason` 决定换前缀、换域名或告知用户额度已满，不要对 quota/domain_limit 反复换前缀重试。检查与认领之间状态仍可能变化，认领可能 403、409 `address_taken` 或域名/用户权限配置冲突。普通用户受系统保留前缀、公共或专属配置中的用户总认领上限和每域认领上限；管理员豁免，0 表示该限额不限。并发冲突刷新域名/邮箱状态后按任务要求重试，不能忽略错误声称认领成功。
 
 显示名最多 64 字符，允许空串清除；不是改地址。普通用户仅可改/释放自己的邮箱，管理员可处理全站邮箱；不能凭“共享给我”修改它。普通用户发件可用自己的 `mailboxId` 或已认领 `localPart+domain`；管理员任意发件仍限服务器认可的系统/保留域。
@@ -59,7 +63,7 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 | `PUT /mailboxes/shares` | `{mailboxId,userIds:[...],expectedOwnerId?}` 整体替换自己邮箱的名单；管理员通过此入口也只能修改自己邮箱 |
 | `DELETE /mailboxes/shares/:mailboxId/grantees/:userId` | 所有者撤销一个成员；`{success:true}` |
 | `GET /mailboxes/share-users?q=...&excludeUserId=...&limit=20` | JWT 专用；搜索启用用户，仅返回 `{items:[{id,username,role}],hasMore}`，不含账户隐私或邮箱列表 |
-| `GET /admin/mailbox-shares` | 管理员查看全站已认领邮箱与 `grantees:[{userId,username,status,grantedAt}]`，包含尚未共享邮箱 |
+| `GET /admin/mailbox-shares` | 管理员查看全站已认领邮箱与 `grantees:[{userId,username,status,grantedAt}]`，包含尚未共享邮箱；`?mailboxId=` 只返回该邮箱（0 或 1 项） |
 | `PUT /admin/mailbox-shares` | `{mailboxId,userIds:[...],expectedOwnerId?}` **整体替换任意已认领邮箱**的名单，`[]` 撤销全部；返回更新后的共享邮箱 |
 | `DELETE /admin/mailbox-shares/:mailboxId/grantees/:userId` | 只撤销一人；`{success:true}` |
 

@@ -14,7 +14,8 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`、`BASE`、`UA`、`AP
 | `GET /messages/:id/raw` | `mail.read` | 原始 `.eml` 二进制；仅有原始存档的邮件可下载，404 不代表正文不存在 |
 | `POST /messages/:id/translate` | 仅 JWT（`/api`） | `{translations,cached,skipped}`；把该邮件的文字片段译成简体中文，见下文 |
 | `GET /messages/contacts` | `mail.read` | `{contacts:[邮箱...]}`，自己的近期联系人，不是完整通讯录 |
-| `GET /messages/unread-count` | `mail.read` | `{unread:number}`；未读数只统计你认领的地址，共享邮件的已读状态属于所有者、不计入；不是全站统计 |
+| `GET /messages/unread-count` | `mail.read` | `{unread:number}`；未读数只统计你认领的地址，共享邮件的已读状态属于所有者、不计入；不是全站统计。`/api` 最多数到 1000（界面角标用），`/v1` 返回精确值 |
+| `GET /messages/sync` | 仅 JWT（`/api`） | `{unread,head}`；网页轮询用：参数同列表（忽略 `cursor`、`afterId`），`unread` 同 `/api/messages/unread-count`，`head` 与同筛选列表首页的 `head` 相同即首页没有变化。Agent 等新邮件用 `/v1/messages/wait` |
 | `GET /v1/messages/wait` | `mail.read` | `{message:摘要\|null,scannedThroughId}`，见下文 |
 
 列表支持 `direction=inbound|outbound`、`address`（完整地址）、`domain`、`q`（最长 256 字符，主题/发件地址/发件名/文本正文/收件人子串）、`unread=1`（只匹配你认领的地址，共享邮件不出现在未读筛选里）、`starred=1`、`trash=1`、`afterId`（非负安全整数，0 是合法空基线）、`cursor`、`limit`（1–100）。布尔查询接受 `1/true/0/false`；`unread=0` 与 `starred=0` 表示不筛选，不是“只看已读/未星标”。`trash=1` 只看软删除，未传看非回收站。
@@ -25,7 +26,7 @@ hpc '/messages' --get --data-urlencode 'direction=inbound' \
 hpc '/messages' --get --data-urlencode 'q=验证码' --data-urlencode 'unread=1'
 ```
 
-后续页带 `cursor=<data.nextCursor>`，保留过滤条件。增量查询 `afterId=N` 仍倒序；若一页没读完，先翻完这批所有页，再把已处理的最大 ID 设为新基线。不要只读首屏就推进最大 ID，否则突发邮件会被跳过。
+`/api` 列表首页（不带 `cursor`、`afterId`）另带 `head`，是该页内容的不透明指纹，只用于和 `/api/messages/sync` 比较是否相等；`/v1` 列表没有该字段。后续页带 `cursor=<data.nextCursor>`，保留过滤条件。增量查询 `afterId=N` 仍倒序；若一页没读完，先翻完这批所有页，再把已处理的最大 ID 设为新基线。不要只读首屏就推进最大 ID，否则突发邮件会被跳过。
 
 摘要包含 `id,direction,address,domain,fromAddress,fromName,subject,preview,verificationCode,verificationLink,status,errorDetail,isRead,isStarred,hasAttachments,size,createdAt`，发件还可含 `recipientsTo,recipientOutcomes`；`trash=1` 列表的每项另有 `deletedAt`（进入回收站时间，7 天后永久删除）。`verificationLink` 是收件时识别出的 http/https 验证、登录、激活或重置密码链接，识别不到、发件、关闭自动提取或功能上线前收到的邮件为空串，见[等待本次验证码](#等待本次验证码)的安全要求。详情增加 `recipients:{to,cc,bcc}`、`replyTo` 数组、`bodyText,bodyHtml,attachments,hasRaw`。BCC 不在收件副本中披露。`status=degraded` 表示收件解析/附件降级，应说明 `errorDetail`、核对 `hasRaw`，不能承诺内容完整。
 
