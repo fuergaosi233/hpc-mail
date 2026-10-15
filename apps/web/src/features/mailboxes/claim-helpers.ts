@@ -83,6 +83,8 @@ export interface ClaimListResult {
   remaining: AddressDraft[];
   /** 中途因配额、权限、网络等停止时的原因；仅「被占用」导致的未认领不算 */
   stoppedBy: string | null;
+  /** 批量请求整单失败且结果未知（网络中断、服务端异常）：后端逐个提交，失败前可能已认领了一部分 */
+  uncertain?: true;
 }
 
 const draftKey = (draft: AddressDraft) => `${draft.localPart}@${draft.domain}`;
@@ -128,8 +130,16 @@ export async function claimList(
   try {
     return fromBatchResult(items, await api.batchClaim(items));
   } catch (error) {
-    // 整个请求失败（网络、校验、限流等）：一个都没认领
-    return { claimed: [], remaining: items, stoppedBy: failureText(error) };
+    // 4xx 是请求在处理前就被拒绝（校验、鉴权、限流）：一个都没认领。
+    // 网络中断或服务端异常时结果未知：后端逐个提交，失败前认领的那部分已经生效
+    const rejected = error instanceof ApiError && error.httpStatus !== null && error.httpStatus >= 400 && error.httpStatus < 500;
+    if (rejected) return { claimed: [], remaining: items, stoppedBy: failureText(error) };
+    return {
+      claimed: [],
+      remaining: items,
+      stoppedBy: `${failureText(error)}。部分地址可能已认领，请以邮箱列表为准`,
+      uncertain: true,
+    };
   }
 }
 

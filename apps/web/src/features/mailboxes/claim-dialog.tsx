@@ -210,7 +210,8 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
     const outcome = await claimList(rows, mailboxApi);
     setClaiming(false);
 
-    if (outcome.claimed.length > 0) {
+    // 结果未知时也可能已认领了一部分：同样刷新邮箱列表与归属相关缓存
+    if (outcome.claimed.length > 0 || outcome.uncertain) {
       invalidateMailboxOwnership(queryClient);
     } else {
       // 一个都没认领上：只需让已缓存的可用性重新核对，被占用的行会随即标红
