@@ -1,5 +1,6 @@
 import {
-  batchMailboxRequestSchema, claimMailboxRequestSchema, replaceMailboxSharesRequestSchema, searchUsersQuerySchema, updateMailboxRequestSchema,
+  batchMailboxRequestSchema, claimMailboxRequestSchema, claimPlanQuerySchema, replaceMailboxSharesRequestSchema, searchUsersQuerySchema,
+  updateMailboxRequestSchema,
 } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { execCtx, ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../lib/http.js';
@@ -14,6 +15,7 @@ import {
   releaseMailbox,
   updateMailbox,
 } from '../services/mailbox.js';
+import { planRandomDomains } from '../services/claim-plan.js';
 import { listMailboxShares, listSharedMailboxes, replaceMailboxShares, revokeMailboxShare } from '../services/mailbox-share.js';
 import { searchUsers } from '../services/user.js';
 import type { AppContext } from '../types.js';
@@ -59,6 +61,13 @@ app.post('/availability/batch', async (c) => {
   const req = await parseBody(c, batchMailboxRequestSchema);
   const user = c.get('user')!;
   return ok(c, await checkAvailabilityBatch(c.env, { userId: user.id, role: user.role }, req.items));
+});
+
+/** 随机后缀分配（不认领）：uniform 等概率；claude 按后缀封号数、再按账号数均衡 */
+app.get('/random-plan', async (c) => {
+  const req = parseQuery(c, claimPlanQuerySchema);
+  const user = c.get('user')!;
+  return ok(c, await planRandomDomains(c.env, { userId: user.id, role: user.role }, req.count, req.strategy));
 });
 
 app.get('/availability', async (c) => {

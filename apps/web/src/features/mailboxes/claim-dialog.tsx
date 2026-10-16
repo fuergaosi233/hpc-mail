@@ -1,14 +1,17 @@
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { Check, Shuffle, X } from 'lucide-react';
 import { type FormEvent, useEffect, useId, useRef, useState } from 'react';
-import { claimMailboxRequestSchema, localPartSchema, MAX_BATCH_CLAIM } from '@hpc-mail/shared';
+import { type ClaimPlan, type ClaimPlanStrategy, claimMailboxRequestSchema, localPartSchema, MAX_BATCH_CLAIM } from '@hpc-mail/shared';
+import { ApiError } from '@/api/errors';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { writeClipboard } from '@/components/ui/copy-button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
 import { IconButton } from '@/components/ui/icon-button';
 import { Input } from '@/components/ui/input';
+import { SegmentedControl, type SegmentedOption } from '@/components/ui/segmented-control';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
 import { toast } from '@/components/ui/toast';
@@ -44,6 +47,30 @@ const settledOf = (rows: Row[]): Record<number, AddressDraft> =>
 /** 前缀输入停手多久后才去查可用性 */
 const CHECK_DEBOUNCE_MS = 400;
 
+/** 随机生成时后缀怎么定：固定用最近选的域名，另两种由后端按参与随机的域名分配 */
+type SuffixMode = 'fixed' | ClaimPlanStrategy;
+
+const SUFFIX_MODES: readonly SegmentedOption<SuffixMode>[] = [
+  { value: 'fixed', label: '固定后缀' },
+  { value: 'uniform', label: '均匀随机' },
+  { value: 'claude', label: 'Claude 低风险' },
+];
+
+const SUFFIX_HINTS: Record<SuffixMode, string> = {
+  fixed: '都用当前选择的域名',
+  uniform: '从参与随机的可用域名中等概率选',
+  claude: '按后缀的 Claude 封号数、账号数从少到多均匀分配',
+};
+
+/** 后端没能分配满时的说明 */
+function shortfallText(plan: ClaimPlan): string | null {
+  if (plan.shortfall === 0) return null;
+  const allocated = plan.items.length;
+  if (plan.reason === 'quota') return allocated > 0 ? `额度不足，只分配了 ${allocated} 个` : '认领额度已用完，无法再分配';
+  if (allocated > 0) return `可用后缀的名额不足，只分配了 ${allocated} 个`;
+  return plan.strategy === 'claude' ? '没有可用于 Claude 的低风险后缀，可手动选择域名' : '没有参与随机的可用域名，可手动选择域名';
+}
+
 function announceClaimed(address: string) {
   toast({
     title: '地址认领成功',
@@ -72,8 +99,12 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const [settled, setSettled] = useState<Record<number, AddressDraft>>({});
   const [error, setError] = useState<string | null>(null);
   const [countText, setCountText] = useState('1');
-  /** 勾选后，随机生成的每个地址都从可见域名里随机取后缀 */
-  const [randomDomain, setRandomDomain] = useState(false);
+  const [mode, setMode] = useState<SuffixMode>('fixed');
+  /** 最近一次后端分配：单个重新随机的候选、各后缀封号数与未分配满的说明 */
+  const [plan, setPlan] = useState<ClaimPlan | null>(null);
+  const [planning, setPlanning] = useState(false);
+  /** 关闭对话框后返回的分配结果作废 */
+  const planRequest = useRef(0);
   /** 认领请求进行中：多个地址一次批量请求，只显示整体进行中状态 */
   const [claiming, setClaiming] = useState(false);
   const [result, setResult] = useState<ClaimListResult | null>(null);
@@ -150,7 +181,10 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
     setSettled({});
     setError(null);
     setCountText('1');
-    setRandomDomain(false);
+    setMode('fixed');
+    setPlan(null);
+    setPlanning(false);
+    planRequest.current++;
     setClaiming(false);
     setResult(null);
   }
@@ -172,17 +206,58 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
     setError(null);
   };
 
-  /** 随机地址的域名：勾选「随机邮箱后缀」时每个都从可见域名里随机，否则用最近选的域名 */
-  const pickDomain = () => (randomDomain ? randomPick(domains) : domain);
+  /** 向后端要 n 个后缀；失败显示原因并返回 null */
+  const requestPlan = async (n: number, strategy: ClaimPlanStrategy): Promise<ClaimPlan | null> => {
+    const request = ++planRequest.current;
+    setPlanning(true);
+    setError(null);
+    try {
+      const next = await mailboxApi.randomPlan(n, strategy);
+      if (request !== planRequest.current) return null;
+      setPlan(next);
+      return next;
+    } catch (err) {
+      if (request === planRequest.current) setError(err instanceof ApiError ? err.message : '随机分配失败，请重试');
+      return null;
+    } finally {
+      if (request === planRequest.current) setPlanning(false);
+    }
+  };
 
-  const randomizeAll = () => fillRows(randomAddresses(count, pickDomain).map((draft) => newRow(draft)));
+  const randomizeAll = async () => {
+    if (mode === 'fixed') {
+      fillRows(randomAddresses(count, () => domain).map((draft) => newRow(draft)));
+      return;
+    }
+    const next = await requestPlan(count, mode);
+    // 一个都没分到时保留现有的行，只显示原因
+    if (!next || next.items.length === 0) return;
+    const seen = new Set<string>();
+    fillRows(
+      next.items.map(({ domain: itemDomain }) => {
+        let draft: AddressDraft = { localPart: randomLocalPart(), domain: itemDomain };
+        while (seen.has(addressOf(draft))) draft = { ...draft, localPart: randomLocalPart() };
+        seen.add(addressOf(draft));
+        return newRow(draft);
+      }),
+    );
+  };
 
-  const rerollRow = (id: number) => {
+  /** 单个重新随机：均匀模式从参与随机的域名里换后缀；Claude 模式与固定后缀只换前缀，保持整批分配 */
+  const rerollRow = async (id: number) => {
+    let pool: string[] | null = null;
+    if (mode === 'uniform') {
+      pool = (plan ?? (await requestPlan(1, 'uniform')))?.pool.filter((item) => domains.includes(item)) ?? [];
+      if (pool.length === 0) return;
+    }
     const taken = new Set(rows.map(addressOf));
     const current = rows.find((row) => row.id === id);
-    let next: AddressDraft = { localPart: randomLocalPart(), domain: randomDomain ? pickDomain() : (current?.domain ?? domain) };
+    let next: AddressDraft = { localPart: randomLocalPart(), domain: pool ? randomPick(pool) : (current?.domain ?? domain) };
     while (taken.has(addressOf(next))) next = { ...next, localPart: randomLocalPart() };
-    fillRows(rows.map((row) => (row.id === id ? { ...row, ...next } : row)));
+    // 随机值无需等防抖；等待分配期间其他行可能已被修改，只替换这一行
+    setRows((latest) => latest.map((row) => (row.id === id ? { ...row, ...next } : row)));
+    setSettled((latest) => ({ ...latest, [id]: next }));
+    setError(null);
   };
 
   const changeDomain = (id: number, value: string) => {
@@ -250,6 +325,12 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
     );
 
   const multiple = rows.length > 1;
+  /** Claude 模式分配后，各后缀收到过封号信的地址数（按当前每行的后缀计，手动改过的行也算） */
+  const suspendedOf = (rowDomain: string) =>
+    plan?.strategy === 'claude' ? (plan.items.find((item) => item.domain === rowDomain)?.suspended ?? 0) : 0;
+  const riskyCount = rows.filter((row) => suspendedOf(row.domain) > 0).length;
+  const planShortfall = plan ? shortfallText(plan) : null;
+  const busy = claiming || planning;
 
   return (
     <Dialog
@@ -312,8 +393,8 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                     <span className="ml-0.5 text-critical">*</span>
                   </label>
                   <div className="flex items-center gap-1">
-                    <Button type="button" variant="ghost" size="sm" disabled={claiming} onClick={randomizeAll}>
-                      <Shuffle className="size-4" />
+                    <Button type="button" variant="ghost" size="sm" loading={planning} disabled={busy} onClick={() => void randomizeAll()}>
+                      {!planning && <Shuffle className="size-4" />}
                       随机生成
                     </Button>
                     <Input
@@ -322,7 +403,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                       inputMode="numeric"
                       autoComplete="off"
                       value={countText}
-                      disabled={claiming}
+                      disabled={busy}
                       className="h-8 w-12 px-1 text-center"
                       onChange={(event) => setCountText(event.target.value.replace(/\D/g, '').slice(0, 2))}
                       onBlur={() => setCountText(String(count))}
@@ -330,7 +411,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                         // 回车不提交表单（那会直接认领），等同点击旁边的随机生成
                         if (event.key !== 'Enter') return;
                         event.preventDefault();
-                        randomizeAll();
+                        if (!planning) void randomizeAll();
                       }}
                     />
                     <span className="text-sm text-ink-secondary">个</span>
@@ -338,17 +419,26 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                 </div>
 
                 {domains.length > 1 && (
-                  <label className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-ink-secondary">
-                    <input
-                      type="checkbox"
-                      className="size-4 accent-accent"
-                      checked={randomDomain}
-                      disabled={claiming}
-                      onChange={(event) => setRandomDomain(event.target.checked)}
-                    />
-                    <span className="whitespace-nowrap">随机邮箱后缀</span>
-                    <span className="text-xs text-ink-tertiary">（每个地址从 {domains.length} 个可用域名中随机选）</span>
-                  </label>
+                  <div className="flex flex-col gap-1">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-ink-secondary">
+                      <span className="whitespace-nowrap">随机后缀</span>
+                      <SegmentedControl
+                        aria-label="随机后缀模式"
+                        value={mode}
+                        onValueChange={(value) => {
+                          if (!busy) setMode(value);
+                        }}
+                        options={SUFFIX_MODES}
+                        className="h-8"
+                      />
+                    </div>
+                    <p className="text-xs text-ink-tertiary">{SUFFIX_HINTS[mode]}</p>
+                  </div>
+                )}
+                {(planShortfall || riskyCount > 0) && (
+                  <p className="text-xs font-medium text-caution">
+                    {[planShortfall, riskyCount > 0 && `其中 ${riskyCount} 个落在有封号记录的后缀`].filter(Boolean).join('；')}
+                  </p>
                 )}
 
                 <ul className={cn('flex flex-col gap-2', multiple && 'max-h-72 gap-3 overflow-y-auto p-1 -m-1 sm:gap-2')}>
@@ -410,14 +500,19 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                                 {row.domain}
                               </span>
                             )}
+                            {suspendedOf(row.domain) > 0 && (
+                              <Badge tone="caution" title={`该后缀历史上有 ${suspendedOf(row.domain)} 个地址收到 Claude 封号信`}>
+                                封 {suspendedOf(row.domain)}
+                              </Badge>
+                            )}
                           </div>
                           {multiple && (
                             <div className="order-2 flex items-center gap-1 sm:order-3">
                               <IconButton
                                 size="sm"
                                 aria-label={`重新随机第 ${index + 1} 个`}
-                                disabled={claiming}
-                                onClick={() => rerollRow(row.id)}
+                                disabled={busy}
+                                onClick={() => void rerollRow(row.id)}
                               >
                                 <Shuffle className="size-4" />
                               </IconButton>

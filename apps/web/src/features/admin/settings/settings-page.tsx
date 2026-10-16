@@ -242,6 +242,8 @@ export function SettingsPage() {
       setDraft(structuredClone(saved));
       setReservedText(null);
       void queryClient.invalidateQueries({ queryKey: queryKeys.config });
+      // 排除阈值与未注册天数会改变各域名的 Claude 统计与排除原因
+      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.domainClaudeStats });
       toast({ title: '设置已保存', variant: 'success' });
     },
     onError: (err) => toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' }),
@@ -432,6 +434,30 @@ export function SettingsPage() {
             <span className="text-xs text-ink-tertiary">共 {draft.mailbox_policy.reservedLocalParts.length} 个</span>
           </label>
         </Section>
+
+        {draft.claim_random && (
+          <Section
+            title="随机认领规则"
+            description="认领时选「Claude 低风险」，按后缀的 Claude 封号数、账号数从少到多均匀分配。全军覆没的后缀始终排除；哪些域名参与随机请在「收件域名」页逐个设置。"
+          >
+            <NumberRow
+              label="付费被封排除阈值"
+              description="后缀上付费后被封的地址达到这个数就不再分配。0 表示不按此条排除。"
+              value={draft.claim_random.paidSuspendedLimit}
+              onChange={(v) => patch((s) => void (s.claim_random.paidSuspendedLimit = v))}
+              max={1000}
+              suffix="个"
+            />
+            <NumberRow
+              label="未注册邮箱计入天数"
+              description="近 N 天认领、还没收到 Claude 来信的邮箱算进后缀的账号数，避免连续几批堆在同一后缀。0 表示不计。"
+              value={draft.claim_random.pendingDays}
+              onChange={(v) => patch((s) => void (s.claim_random.pendingDays = v))}
+              max={90}
+              suffix="天"
+            />
+          </Section>
+        )}
       </div>
 
       {dirty && (

@@ -54,6 +54,7 @@ function describeDomains(before: Settings['domains'], after: Settings['domains']
     const changes: string[] = [];
     if (prev.public !== entry.public) changes.push(entry.public ? '改为公开' : '改为仅管理员');
     if (prev.perUserLimit !== entry.perUserLimit) changes.push(`每人上限 ${prev.perUserLimit}→${entry.perUserLimit}`);
+    if ((prev.random !== false) !== (entry.random !== false)) changes.push(entry.random !== false ? '参与随机' : '不参与随机');
     if (changes.length) parts.push(`${domain} ${changes.join('，')}`);
   }
   // 只调整顺序也算一次写入，留痕但不展开

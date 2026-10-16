@@ -11,6 +11,7 @@ import { AppError } from '../../lib/errors.js';
 import { clientIp, execCtx, ok, parseBody } from '../../lib/http.js';
 import { requireAdmin, requireAuth } from '../../middleware/auth.js';
 import { describeSettingsChange, logAdminAction } from '../../services/audit.js';
+import { getDomainClaudeStats } from '../../services/claim-plan.js';
 import { checkDomainOnboarding } from '../../services/domain-check.js';
 import { getSettingsFresh, maskSettings, updateSettings } from '../../services/setting.js';
 import { AiProviderError, isAiModelConfigured } from '../../services/ai-provider.js';
@@ -48,6 +49,9 @@ app.get('/domain-status', async (c) => {
   const status = await checkDomainOnboarding(parsed.data, inList);
   return ok(c, status);
 });
+
+/** 每个系统域名的 Claude 账号/封号统计与 Claude 低风险模式的排除原因（根据历史官方来信判定） */
+app.get('/domain-claude-stats', async (c) => ok(c, await getDomainClaudeStats(c.env)));
 
 const AI_MODEL_TEST_SAMPLE = 'Your verification code is 123456. It expires in 10 minutes.';
 

@@ -82,11 +82,11 @@ interface OwnedCounts {
 }
 
 /** 一条 GROUP BY 同时给出合计与按域计数（走 idx_mailboxes_user） */
-function ownedCountsStatement(db: D1Database, userId: number): D1PreparedStatement {
+export function ownedCountsStatement(db: D1Database, userId: number): D1PreparedStatement {
   return db.prepare('SELECT domain, COUNT(*) AS n FROM mailboxes WHERE user_id = ? GROUP BY domain').bind(userId);
 }
 
-function ownedCountsFromResult(result: D1Result | undefined): OwnedCounts {
+export function ownedCountsFromResult(result: D1Result | undefined): OwnedCounts {
   const byDomain = new Map<string, number>();
   let total = 0;
   for (const row of (result?.results ?? []) as { domain: string; n: number }[]) {
