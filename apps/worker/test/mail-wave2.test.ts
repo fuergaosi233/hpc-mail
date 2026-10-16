@@ -507,6 +507,10 @@ describe('管理设置审计', () => {
     expect(result.detail).toContain('mailbox_policy.reservedLocalParts +ceo');
     expect(result.detail).not.toContain('expectedDomainsRevision');
     expect(describeSettingsChange(before, before, ['site'])).toEqual({ target: 'site', detail: '无实际变更' });
+    // random 缺省视为参与随机：从缺省改成 true 不算变化，改成 false 才记录
+    const randomOff: Settings = { ...before, domains: { list: [{ ...before.domains.list[0]!, random: false }, { ...before.domains.list[1]!, random: true }] } };
+    expect(describeSettingsChange(before, randomOff, ['domains']).detail).toBe('a.test 不参与随机');
+    expect(describeSettingsChange(randomOff, before, ['domains']).detail).toBe('a.test 参与随机');
     // 字段新增/缺失（升级前存量值）也能描述，不抛错
     const legacy = { ...before, security: {} as Settings['security'] };
     expect(describeSettingsChange(legacy, before, ['security']).detail).toBe('security.require2fa: undefined→false');

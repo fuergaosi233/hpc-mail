@@ -11,7 +11,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { type FormEvent, type ReactNode, useEffect, useState } from 'react';
-import { type DomainEntry, type DomainOnboardingStatus, domainSchema } from '@hpc-mail/shared';
+import { type DomainClaudeStats, type DomainEntry, type DomainOnboardingStatus, domainSchema } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
@@ -90,24 +90,42 @@ function StatusBadge({
   );
 }
 
+/** 该域名的 Claude 账号与封号统计；全为 0 时只给一句说明 */
+function ClaudeStatsLine({ stats }: { stats: DomainClaudeStats | undefined }) {
+  if (!stats) return null;
+  const empty = stats.accounts === 0 && stats.pending === 0;
+  return (
+    <p className="text-xs text-ink-tertiary">
+      Claude：
+      {empty
+        ? '暂无记录'
+        : `账号 ${stats.accounts} · 封 ${stats.suspended} · 付费 ${stats.paid} · 付费封 ${stats.paidSuspended} · 未注册 ${stats.pending}`}
+    </p>
+  );
+}
+
 interface DomainRowProps {
   entry: DomainEntry;
   status: DomainOnboardingStatus | undefined;
+  stats: DomainClaudeStats | undefined;
   isFetching: boolean;
   busy: boolean;
   onTogglePublic: (domain: string, next: boolean) => void;
+  onToggleRandom: (domain: string, next: boolean) => void;
   onSetLimit: (domain: string, next: number) => void;
   onRefetch: () => void;
   onRemove: (domain: string) => void;
 }
 
-/** 单个域名行：接入状态 + 公开开关 + 按域名认领上限。上限输入本地暂存，失焦提交。 */
+/** 单个域名行：接入状态 + 公开开关 + 按域名认领上限 + 是否参与随机。上限输入本地暂存，失焦提交。 */
 function DomainRow({
   entry,
   status,
+  stats,
   isFetching,
   busy,
   onTogglePublic,
+  onToggleRandom,
   onSetLimit,
   onRefetch,
   onRemove,
@@ -137,6 +155,13 @@ function DomainRow({
           <span className="truncate text-sm font-medium text-ink">{entry.domain}</span>
           <StatusBadge isFetching={isFetching} status={status} />
           {entry.public && <Badge tone="accent">公开</Badge>}
+          {entry.random === false && <Badge>不参与随机</Badge>}
+          {stats?.risk === 'wiped' && (
+            <Badge tone="critical" title="账号全被封，或付费账号全被封；Claude 低风险模式不会分配这个后缀">
+              全军覆没
+            </Badge>
+          )}
+          {stats?.risk === 'paid_suspended' && <Badge tone="caution">付费被封达阈值，已排除</Badge>}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           <IconButton size="sm" aria-label={`重新检测 ${entry.domain}`} disabled={isFetching} onClick={onRefetch}>
@@ -171,7 +196,13 @@ function DomainRow({
             <span className="text-ink-tertiary">个（0=不限）</span>
           </div>
         )}
+        <label className="flex cursor-pointer items-center gap-2 text-ink-secondary">
+          <Switch aria-label={`${entry.domain} 参与随机生成`} checked={entry.random !== false} disabled={busy} onCheckedChange={(v) => onToggleRandom(entry.domain, v)} />
+          <span>{entry.random !== false ? '参与随机生成' : '不参与随机生成'}</span>
+        </label>
       </div>
+
+      <ClaudeStatsLine stats={stats} />
 
       {detail && <p className="text-xs text-ink-tertiary">{detail}</p>}
     </li>
@@ -204,6 +235,15 @@ export function DomainsPage() {
       retry: false,
     })),
   });
+
+  // Claude 统计只用于展示与参考，查询失败不影响域名管理
+  const statsQuery = useQuery({
+    queryKey: queryKeys.admin.domainClaudeStats,
+    queryFn: () => adminApi.domainClaudeStats(),
+    staleTime: 60_000,
+    retry: false,
+  });
+  const statsByDomain = new Map((statsQuery.data ?? []).map((item) => [item.domain, item]));
 
   const persist = useMutation({
     mutationFn: (nextList: DomainEntry[]) => {
@@ -248,7 +288,7 @@ export function DomainsPage() {
       return;
     }
     // 新域名默认「仅管理员」，需管理员显式打开公开开关
-    persist.mutate([...list, { domain: parsed.data, public: false, perUserLimit: 0 }], {
+    persist.mutate([...list, { domain: parsed.data, public: false, perUserLimit: 0, random: true }], {
       onSuccess: () => {
         toast({ title: '域名已添加（默认仅管理员可用）', variant: 'success' });
         setNewDomain('');
@@ -362,6 +402,11 @@ export function DomainsPage() {
           <p className="mt-0.5 text-[13px] text-ink-secondary">
             系统只检测 MX 是否已指向 Cloudflare；请另外确认 Catch-all 指向本 Worker，并发送测试邮件验证完整链路。
             <b>公开</b>开关决定普通用户是否可见并认领该域名；<b>每人可认领</b>限制普通用户在该域名下的地址数（管理员不受限）。
+            <b>参与随机生成</b>关掉后，认领时的「均匀随机」和「Claude 低风险」都不会分配这个域名，仍可手动选择。
+          </p>
+          <p className="mt-1 text-xs text-ink-tertiary">
+            Claude 统计根据历史官方来信判定，可能有约 5 分钟延迟；全军覆没（账号全被封或付费账号全被封）的后缀在 Claude 低风险模式下始终排除。
+            {statsQuery.isError && ' Claude 统计暂时加载失败。'}
           </p>
         </div>
 
@@ -400,9 +445,11 @@ export function DomainsPage() {
                   key={entry.domain}
                   entry={entry}
                   status={q?.data}
+                  stats={statsByDomain.get(entry.domain)}
                   isFetching={q?.isFetching ?? false}
                   busy={!canEdit}
                   onTogglePublic={(domain, next) => updateEntry(domain, { public: next })}
+                  onToggleRandom={(domain, next) => updateEntry(domain, { random: next })}
                   onSetLimit={(domain, next) => updateEntry(domain, { perUserLimit: next })}
                   onRefetch={() => q?.refetch()}
                   onRemove={setRemoving}

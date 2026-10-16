@@ -14,12 +14,16 @@ import type { Env } from '../types.js';
 import { dayWindow, minuteWindow, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
+import { harvestRecentClaudeFacts } from './claude-facts.js';
 import { processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases } from './storage-cleanup.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** Claude 地址事实归纳窗口：5 分钟一次扫最近 1 小时，每日再扫最近 3 天，重叠窗口兜住漏跑 */
+const CLAUDE_FACTS_WINDOW_MS = 60 * 60 * 1000;
+const CLAUDE_FACTS_CATCHUP_MS = 3 * DAY_MS;
 /** 回收站保留天数：软删除超过此天数由 scheduled 硬删 */
 const TRASH_RETENTION_DAYS = 7;
 /** 单次清理批量上限，防止单次 cron 运行过久（下一次继续清剩余） */
@@ -153,6 +157,7 @@ export async function runScheduled(env: Env, maintenance = true): Promise<void> 
     for (const row of tokens.results) await env.db.batch(purgeStatements(env, row.token));
     return tokens.results.length;
   });
+  await step(report, 'claude_facts.harvest', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_WINDOW_MS));
   await step(report, 'storage.leases', () => expireDeliveryObjectLeases(env));
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
@@ -161,6 +166,7 @@ export async function runScheduled(env: Env, maintenance = true): Promise<void> 
 }
 
 async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
+  await step(report, 'claude_facts.catchup', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_CATCHUP_MS));
   await step(report, 'notification.cleanup', () => cleanupNotificationJobs(env));
   const db = createDb(env);
   const cutoff = new Date(Date.now() - NINETY_DAYS_MS);

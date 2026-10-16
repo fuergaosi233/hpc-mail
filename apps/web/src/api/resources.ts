@@ -10,12 +10,15 @@ import type {
   ApiRequestLogEntry,
   ChangePasswordRequest,
   ClaimMailboxRequest,
+  ClaimPlan,
+  ClaimPlanStrategy,
   CompleteMultipartUploadRequest,
   CreateApiKeyRequest,
   CreatedApiKey,
   CreateInviteRequest,
   CreateUserRequest,
   DisableTwoFactorRequest,
+  DomainClaudeStats,
   DomainOnboardingStatus,
   InitMultipartUploadRequest,
   InternalSendMailRequest,
@@ -112,6 +115,9 @@ export const mailboxApi = {
     api.post<MailboxAvailability[], BatchMailboxRequest>('/mailboxes/availability/batch', { items }),
   batchClaim: (items: ClaimMailboxRequest[]) =>
     api.post<BatchClaimMailboxResult, BatchMailboxRequest>('/mailboxes/batch', { items }),
+  /** 随机后缀分配：只返回为当前用户分好的后缀，不认领 */
+  randomPlan: (count: number, strategy: ClaimPlanStrategy) =>
+    api.get<ClaimPlan>('/mailboxes/random-plan', { query: { count, strategy } }),
   shared: () => api.get<SharedMailboxView[]>('/mailboxes/shared'),
   listShares: () => api.get<MailboxShareGrant[]>('/mailboxes/shares'),
   replaceShares: (body: ReplaceMailboxSharesRequest) =>
@@ -243,6 +249,7 @@ export const adminApi = {
     api.put<Settings, UpdateSettingsRequest>('/admin/settings', body),
   domainStatus: (domain: string) =>
     api.get<DomainOnboardingStatus>('/admin/settings/domain-status', { query: { domain } }),
+  domainClaudeStats: () => api.get<DomainClaudeStats[]>('/admin/settings/domain-claude-stats'),
   listInvites: () => api.get<Invite[]>('/admin/invites'),
   createInvites: (body: CreateInviteRequest) => api.post<Invite[], CreateInviteRequest>('/admin/invites', body),
   revokeInvite: (id: number) => api.delete<void>(`/admin/invites/${id}`),

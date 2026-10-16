@@ -134,6 +134,13 @@
       "when": 1792036381300,
       "tag": "0018_active_admin_index",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1792169522494,
+      "tag": "0019_claude_address_facts",
+      "breakpoints": true
     }
   ]
 }

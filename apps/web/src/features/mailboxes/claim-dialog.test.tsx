@@ -40,6 +40,14 @@ const mocks = vi.hoisted(() => {
     }),
     availability: vi.fn((localPart: string, domain: string) => availableOf(localPart, domain)),
     batchAvailability: vi.fn((items: Draft[]) => Promise.all(items.map((item) => availableOf(item.localPart, item.domain)))),
+    /** 后端随机后缀分配：默认按 a/b/c 轮流分配、都没有封号记录 */
+    randomPlan: vi.fn(async (count: number, strategy: 'uniform' | 'claude') => ({
+      strategy,
+      items: Array.from({ length: count }, (_, i) => ({ domain: ['a.test', 'b.test', 'c.test'][i % 3]!, suspended: 0 })),
+      pool: ['a.test', 'b.test', 'c.test'],
+      shortfall: 0,
+      reason: null as 'quota' | 'no_candidates' | null,
+    })),
     toast: vi.fn(),
     writeClipboard: vi.fn(async () => true),
   };
@@ -50,6 +58,7 @@ vi.mock('@/api/resources', () => ({
     batchClaim: mocks.batchClaim,
     availability: mocks.availability,
     batchAvailability: mocks.batchAvailability,
+    randomPlan: mocks.randomPlan,
   },
 }));
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
@@ -437,11 +446,12 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
   });
 });
 
-describe('随机邮箱后缀', () => {
+describe('随机后缀模式', () => {
   const DOMAINS = ['a.test', 'b.test', 'c.test'];
+  const RANDOM = /^[a-z][a-z2-9]{7}$/;
   const setCount = (value: string) => fireEvent.change(screen.getByLabelText('随机生成个数'), { target: { value } });
   const randomize = () => fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
-  const toggle = () => fireEvent.click(screen.getByRole('checkbox', { name: /随机邮箱后缀/ }));
+  const selectMode = (label: string) => fireEvent.click(screen.getByRole('radio', { name: label }));
   /** 各行当前显示的域名（每行一个域名下拉） */
   const rowDomains = () => screen.getAllByRole('combobox').map((box) => box.textContent);
   const prefixes = () => screen.getAllByLabelText(/^前缀/).map((input) => (input as HTMLInputElement).value);
@@ -449,74 +459,80 @@ describe('随机邮箱后缀', () => {
     fireEvent.click(screen.getByRole('combobox', { name: `域名 ${row}` }));
     fireEvent.click(within(await screen.findByRole('listbox')).getByRole('option', { name: domain }));
   };
+  /** 后端返回的分配结果 */
+  const planOf = (
+    strategy: 'uniform' | 'claude',
+    items: Array<[string, number]>,
+    extra: { pool?: string[]; shortfall?: number; reason?: 'quota' | 'no_candidates' | null } = {},
+  ) => ({
+    strategy,
+    items: items.map(([domain, suspended]) => ({ domain, suspended })),
+    pool: extra.pool ?? DOMAINS,
+    shortfall: extra.shortfall ?? 0,
+    reason: extra.reason ?? null,
+  });
+  /** 等后端分配返回、各行换成指定的域名 */
+  const waitRows = (domains: string[]) => waitFor(() => expect(rowDomains()).toEqual(domains));
 
-  it('只有一个可见域名时没有这个选项，行尾直接显示域名', () => {
+  it('只有一个可见域名时没有模式选项，行尾直接显示域名', () => {
     const { client } = renderDialog(['only.test']);
-    expect(screen.queryByRole('checkbox', { name: /随机邮箱后缀/ })).toBeNull();
+    expect(screen.queryByRole('radiogroup', { name: '随机后缀模式' })).toBeNull();
     expect(screen.queryByRole('combobox')).toBeNull();
     expect(screen.getByText('only.test')).toBeInTheDocument();
     client.clear();
   });
 
-  it('有多个可见域名时出现该选项，默认不勾选，并说明候选个数', () => {
+  it('有多个可见域名时出现三种模式，默认固定后缀', () => {
     const { client } = renderDialog(DOMAINS);
-    expect(screen.getByRole('checkbox', { name: /随机邮箱后缀/ })).not.toBeChecked();
-    expect(screen.getByText('（每个地址从 3 个可用域名中随机选）')).toBeInTheDocument();
+    expect(screen.getAllByRole('radio').map((radio) => radio.textContent)).toEqual(['固定后缀', '均匀随机', 'Claude 低风险']);
+    expect(screen.getByRole('radio', { name: '固定后缀' })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByText('都用当前选择的域名')).toBeInTheDocument();
     client.clear();
   });
 
-  it('不勾选时，批量生成的地址都用同一个域名（默认第一个）', () => {
+  it('固定后缀：批量生成的地址都用同一个域名（默认第一个），不请求后端分配', () => {
     const { client } = renderDialog(DOMAINS);
     setCount('10');
     randomize();
     expect(new Set(rowDomains())).toEqual(new Set(['a.test']));
+    expect(mocks.randomPlan).not.toHaveBeenCalled();
     client.clear();
   });
 
-  it('勾选后，生成的地址后缀从可见域名里随机取，且不会出现候选之外的域名', () => {
+  it('均匀随机：按个数向后端要分配，逐行用返回的域名，前缀随机且不认领', async () => {
+    mocks.randomPlan.mockResolvedValueOnce(planOf('uniform', [['b.test', 0], ['c.test', 0], ['b.test', 0]]));
     const { client } = renderDialog(DOMAINS);
-    toggle();
-    setCount('20');
+    selectMode('均匀随机');
+    setCount('3');
     randomize();
-    const used = rowDomains();
-    expect(used).toHaveLength(20);
-    for (const domain of used) expect(DOMAINS).toContain(domain);
-    expect(new Set(used).size).toBeGreaterThan(1);
-    client.clear();
-  });
-
-  it('候选严格取决于传入的可见域名：只有两个时只会出现这两个', () => {
-    const { client } = renderDialog(['x.test', 'y.test']);
-    toggle();
-    setCount('20');
-    randomize();
-    expect([...new Set(rowDomains())].sort()).toEqual(['x.test', 'y.test']);
-    client.clear();
-  });
-
-  it('勾选后个数为 1 也会随机后缀；点生成只展示并按地址查可用性，不会认领', async () => {
-    const { client } = renderDialog(DOMAINS);
-    toggle();
-    const seen = new Set<string>();
-    for (let i = 0; i < 40; i++) {
-      randomize();
-      seen.add(rowDomains()[0]!);
-    }
-    expect(seen.size).toBeGreaterThan(1);
-    const [domain] = rowDomains();
-    const [prefix] = prefixes();
-    // 同一轮里连点 40 次生成的查询会合批，这里只关心最终显示的地址查过可用性
-    await waitFor(() => expect(mocks.availableOf).toHaveBeenCalledWith(prefix, domain));
-    expect(await screen.findByText(`${prefix}@${domain} 可以认领`)).toBeInTheDocument();
+    await waitRows(['b.test', 'c.test', 'b.test']);
+    expect(mocks.randomPlan).toHaveBeenCalledWith(3, 'uniform');
+    const values = prefixes();
+    values.forEach((value) => expect(value).toMatch(RANDOM));
+    expect(new Set(values).size).toBe(3);
+    await waitFor(() => expect(mocks.availableOf).toHaveBeenCalledWith(values[1], 'c.test'));
     expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.batchClaim).not.toHaveBeenCalled();
+    client.clear();
+  });
+
+  it('后端一个都没分到时保留现有的行，并说明原因', async () => {
+    mocks.randomPlan.mockResolvedValueOnce(planOf('uniform', [], { pool: [], shortfall: 3, reason: 'no_candidates' }));
+    const { client } = renderDialog(DOMAINS);
+    selectMode('均匀随机');
+    setCount('3');
+    randomize();
+    expect(await screen.findByText('没有参与随机的可用域名，可手动选择域名')).toBeInTheDocument();
+    expect(screen.getAllByLabelText(/^前缀/)).toHaveLength(1);
     client.clear();
   });
 
   it('确认认领时，每个地址用它自己显示的域名', async () => {
     const { client } = renderDialog(DOMAINS);
-    toggle();
+    selectMode('均匀随机');
     setCount('8');
     randomize();
+    await waitFor(() => expect(prefixes()).toHaveLength(8));
     const shown = prefixes().map((prefix, index) => ({ localPart: prefix, domain: rowDomains()[index]! }));
     fireEvent.click(screen.getByRole('button', { name: '认领 8 个' }));
     await screen.findByText('已认领 8 个地址');
@@ -529,22 +545,20 @@ describe('随机邮箱后缀', () => {
 
   it('随机出来的后缀也可以手动改：改哪一行就只影响哪一行', async () => {
     const { client } = renderDialog(DOMAINS);
-    toggle();
+    selectMode('均匀随机');
     setCount('3');
     randomize();
-    const before = rowDomains();
-    const target = before[1] === 'c.test' ? 'a.test' : 'c.test';
-    fireEvent.click(screen.getByRole('combobox', { name: '域名 2' }));
-    fireEvent.click(within(await screen.findByRole('listbox')).getByRole('option', { name: target }));
-    expect(rowDomains()).toEqual([before[0], target, before[2]]);
+    await waitRows(['a.test', 'b.test', 'c.test']);
+    await pickDomainOfRow(2, 'c.test');
+    expect(rowDomains()).toEqual(['a.test', 'c.test', 'c.test']);
     const typed = prefixes();
-    await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(typed[1], target));
+    await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(typed[1], 'c.test'));
     fireEvent.click(screen.getByRole('button', { name: '认领 3 个' }));
     await screen.findByText('已认领 3 个地址');
     expect(mocks.batchClaim).toHaveBeenCalledWith([
-      { localPart: typed[0], domain: before[0] },
-      { localPart: typed[1], domain: target },
-      { localPart: typed[2], domain: before[2] },
+      { localPart: typed[0], domain: 'a.test' },
+      { localPart: typed[1], domain: 'c.test' },
+      { localPart: typed[2], domain: 'c.test' },
     ]);
     client.clear();
   });
@@ -556,13 +570,13 @@ describe('随机邮箱后缀', () => {
     fireEvent.change(screen.getByLabelText('前缀 1'), { target: { value: 'same' } });
     fireEvent.change(screen.getByLabelText('前缀 2'), { target: { value: 'same' } });
     expect(screen.getAllByText('与其他地址重复')).toHaveLength(2);
-    fireEvent.click(screen.getByRole('combobox', { name: '域名 2' }));
-    fireEvent.click(within(await screen.findByRole('listbox')).getByRole('option', { name: 'b.test' }));
+    await pickDomainOfRow(2, 'b.test');
     expect(screen.queryByText('与其他地址重复')).toBeNull();
     client.clear();
   });
 
-  it('单个重新随机：勾选时连后缀一起换，不勾选时只换前缀、保留这一行的域名', async () => {
+  it('单个重新随机：固定后缀只换前缀、保留这一行的域名；均匀随机从上次返回的候选里换后缀', async () => {
+    mocks.randomPlan.mockResolvedValueOnce(planOf('uniform', [['b.test', 0], ['b.test', 0]], { pool: ['b.test', 'c.test'] }));
     const { client } = renderDialog(DOMAINS);
     setCount('2');
     randomize();
@@ -571,31 +585,36 @@ describe('随机邮箱后缀', () => {
     await pickDomainOfRow(2, 'c.test');
     const [firstPrefix] = prefixes();
     for (let i = 0; i < 15; i++) fireEvent.click(screen.getByRole('button', { name: '重新随机第 1 个' }));
-    expect(prefixes()[0]).not.toBe(firstPrefix);
+    await waitFor(() => expect(prefixes()[0]).not.toBe(firstPrefix));
     expect(rowDomains()).toEqual(['b.test', 'c.test']);
 
-    toggle();
+    selectMode('均匀随机');
+    randomize();
+    await waitRows(['b.test', 'b.test']);
+    // 两个候选都出现即可停；上限 40 次，漏掉其中一个的概率约 2^-40
     const seen = new Set<string>();
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 40 && seen.size < 2; i++) {
       fireEvent.click(screen.getByRole('button', { name: '重新随机第 1 个' }));
+      await waitFor(() => expect(screen.getByRole('button', { name: '重新随机第 1 个' })).toBeEnabled());
       seen.add(rowDomains()[0]!);
     }
-    expect(seen.size).toBeGreaterThan(1);
+    expect([...seen].sort()).toEqual(['b.test', 'c.test']);
+    expect(mocks.randomPlan).toHaveBeenCalledTimes(1);
     client.clear();
   });
 
-  it('取消勾选后再生成，回到统一域名（最近一次手动选的域名）', async () => {
+  it('切回固定后缀再生成，回到统一域名（最近一次手动选的域名）', async () => {
     const { client } = renderDialog(DOMAINS);
-    toggle();
-    setCount('10');
+    selectMode('均匀随机');
+    setCount('6');
     randomize();
-    toggle();
-    // 选一个与第 1 行当前随机结果不同的域名，保证一定触发变更
+    await waitFor(() => expect(prefixes()).toHaveLength(6));
+    selectMode('固定后缀');
     const picked = rowDomains()[0] === 'c.test' ? 'b.test' : 'c.test';
-    fireEvent.click(screen.getByRole('combobox', { name: '域名 1' }));
-    fireEvent.click(within(await screen.findByRole('listbox')).getByRole('option', { name: picked }));
+    await pickDomainOfRow(1, picked);
     randomize();
     expect(new Set(rowDomains())).toEqual(new Set([picked]));
+    expect(mocks.randomPlan).toHaveBeenCalledTimes(1);
     client.clear();
   });
 
@@ -606,8 +625,7 @@ describe('随机邮箱后缀', () => {
     const { client } = renderDialog(DOMAINS);
     setCount('2');
     randomize();
-    fireEvent.click(screen.getByRole('combobox', { name: '域名 2' }));
-    fireEvent.click(within(await screen.findByRole('listbox')).getByRole('option', { name: 'b.test' }));
+    await pickDomainOfRow(2, 'b.test');
     expect(await screen.findByText(/该域名下的认领数已达上限/, {}, { timeout: 2000 })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '认领 2 个' })).toBeDisabled();
     expect(screen.getByLabelText('前缀 1')).not.toHaveAttribute('aria-invalid', 'true');
@@ -637,13 +655,112 @@ describe('随机邮箱后缀', () => {
     client.clear();
   });
 
-  it('关闭再打开后，选项恢复为不勾选', () => {
+  it('关闭再打开后，模式恢复为固定后缀', async () => {
+    mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['b.test', 3], ['a.test', 0]]));
     const { client, view } = renderDialog(DOMAINS);
-    toggle();
-    expect(screen.getByRole('checkbox', { name: /随机邮箱后缀/ })).toBeChecked();
+    selectMode('Claude 低风险');
+    setCount('2');
+    randomize();
+    expect(await screen.findByText('其中 1 个落在有封号记录的后缀')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '取消' }));
-    expect(screen.getByRole('checkbox', { name: /随机邮箱后缀/ })).not.toBeChecked();
+    expect(screen.getByRole('radio', { name: '固定后缀' })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.queryByText('其中 1 个落在有封号记录的后缀')).toBeNull();
     view.unmount();
     client.clear();
+  });
+
+  describe('Claude 低风险', () => {
+    it('按个数向后端要 Claude 分配，有封号记录的后缀在行内标出并统计个数', async () => {
+      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0], ['b.test', 2], ['c.test', 0], ['b.test', 2]]));
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 低风险');
+      expect(screen.getByText('按后缀的 Claude 封号数、账号数从少到多均匀分配')).toBeInTheDocument();
+      setCount('4');
+      randomize();
+      await waitRows(['a.test', 'b.test', 'c.test', 'b.test']);
+      expect(mocks.randomPlan).toHaveBeenCalledWith(4, 'claude');
+      const badges = screen.getAllByText('封 2');
+      expect(badges).toHaveLength(2);
+      expect(badges[0]).toHaveAttribute('title', '该后缀历史上有 2 个地址收到 Claude 封号信');
+      expect(screen.getByText('其中 2 个落在有封号记录的后缀')).toBeInTheDocument();
+      client.clear();
+    });
+
+    it('全部落在 0 封号后缀时不显示风险提示', async () => {
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 低风险');
+      setCount('3');
+      randomize();
+      await waitRows(['a.test', 'b.test', 'c.test']);
+      expect(screen.queryByText(/落在有封号记录的后缀/)).toBeNull();
+      expect(screen.queryByText(/^封 /)).toBeNull();
+      client.clear();
+    });
+
+    it('额度不足只分到一部分时，按分到的个数生成并说明', async () => {
+      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0], ['c.test', 0]], { shortfall: 3, reason: 'quota' }));
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 低风险');
+      setCount('5');
+      randomize();
+      await waitRows(['a.test', 'c.test']);
+      expect(screen.getByText('额度不足，只分配了 2 个')).toBeInTheDocument();
+      client.clear();
+    });
+
+    it('没有可用的低风险后缀时保留现有的行，提示手动选择', async () => {
+      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [], { pool: DOMAINS, shortfall: 2, reason: 'no_candidates' }));
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 低风险');
+      setCount('2');
+      randomize();
+      expect(await screen.findByText('没有可用于 Claude 的低风险后缀，可手动选择域名')).toBeInTheDocument();
+      expect(rowDomains()).toEqual(['a.test']);
+      client.clear();
+    });
+
+    it('分配请求失败时显示原因，不改动现有的行', async () => {
+      mocks.randomPlan.mockRejectedValueOnce(new ApiError('服务暂时不可用', { code: 'internal', httpStatus: 500 }));
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 低风险');
+      setCount('3');
+      randomize();
+      expect(await screen.findByRole('alert')).toHaveTextContent('服务暂时不可用');
+      expect(prefixes()).toEqual(['']);
+      client.clear();
+    });
+
+    it('分配进行中按钮禁用，连点不会重复请求', async () => {
+      let resolve: (value: ReturnType<typeof planOf>) => void = () => {};
+      mocks.randomPlan.mockImplementationOnce(() => new Promise((done) => (resolve = done)));
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 低风险');
+      setCount('2');
+      randomize();
+      // 加载中按钮名带上转圈的「加载中」
+      await waitFor(() => expect(screen.getByRole('button', { name: /随机生成/ })).toBeDisabled());
+      fireEvent.click(screen.getByRole('button', { name: /随机生成/ }));
+      fireEvent.keyDown(screen.getByLabelText('随机生成个数'), { key: 'Enter' });
+      expect(mocks.randomPlan).toHaveBeenCalledTimes(1);
+      resolve(planOf('claude', [['b.test', 0], ['c.test', 0]]));
+      await waitRows(['b.test', 'c.test']);
+      client.clear();
+    });
+
+    it('单个重新随机只换前缀、保留分配好的后缀，不再请求后端', async () => {
+      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0], ['c.test', 1]]));
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 低风险');
+      setCount('2');
+      randomize();
+      await waitRows(['a.test', 'c.test']);
+      const [, second] = prefixes();
+      for (let i = 0; i < 10; i++) fireEvent.click(screen.getByRole('button', { name: '重新随机第 2 个' }));
+      await waitFor(() => expect(prefixes()[1]).not.toBe(second));
+      expect(rowDomains()).toEqual(['a.test', 'c.test']);
+      expect(screen.getByText('封 1')).toBeInTheDocument();
+      expect(mocks.randomPlan).toHaveBeenCalledTimes(1);
+      client.clear();
+    });
   });
 });

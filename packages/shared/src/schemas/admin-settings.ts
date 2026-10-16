@@ -64,6 +64,7 @@ export const securitySettingSchema = z.object({
  * 单个系统域名条目。
  * - `public`：是否对普通用户开放（可见 + 可认领）。默认 false = 仅管理员可用。
  * - `perUserLimit`：普通用户在**该域名**下最多可认领的地址数（0=不限，仅受全局 mailbox_policy.perUserLimit 约束）；管理员豁免。
+ * - `random`：是否参与认领弹窗的随机后缀（均匀随机与 Claude 低风险两种模式）。缺省视为参与；false 时只能手动选择。
  * preprocess：兼容历史存储的纯字符串形态（`"example.com"` → `{ domain: "example.com" }`），
  * 老数据升级后自动落到 public=false（默认仅管理员），不影响存量已认领地址。
  */
@@ -73,6 +74,7 @@ export const domainEntrySchema = z.preprocess(
     domain: domainSchema,
     public: z.boolean().default(false),
     perUserLimit: z.number().int().min(0).max(10000).default(0),
+    random: z.boolean().optional(),
   }),
 );
 export type DomainEntry = z.infer<typeof domainEntrySchema>;
@@ -105,6 +107,17 @@ export const mailboxPolicySettingSchema = z.object({
   perUserLimit: z.number().int().min(0).max(10000),
   /** 保留前缀：普通用户禁止认领（大小写不敏感），admin 不受限 */
   reservedLocalParts: z.array(z.string().trim().toLowerCase().max(64)).max(200),
+});
+
+/**
+ * 随机认领规则（Claude 低风险模式）：按后缀的 Claude 账号与封号统计分配随机后缀。
+ * 全军覆没（账号全被封或付费号全被封）的后缀始终排除；哪些域名参与随机由 domains.list[].random 决定。
+ */
+export const claimRandomSettingSchema = z.object({
+  /** 付费被封数达到该值的后缀也排除（0=不按此条排除） */
+  paidSuspendedLimit: z.number().int().min(0).max(1000).default(2),
+  /** 近 N 天认领、尚未收到 Claude 来信的邮箱计入后缀账号负载（0=不计） */
+  pendingDays: z.number().int().min(0).max(90).default(7),
 });
 
 /**
@@ -161,6 +174,7 @@ export const SETTING_SCHEMAS = {
   security: securitySettingSchema,
   ai_model: aiModelSettingSchema,
   translation: translationSettingSchema,
+  claim_random: claimRandomSettingSchema,
 } as const;
 export type SettingKey = keyof typeof SETTING_SCHEMAS;
 
@@ -185,6 +199,7 @@ export const DEFAULT_SETTINGS: Settings = {
   security: { require2fa: false },
   ai_model: { baseUrl: '', apiKey: '', model: '' },
   translation: { enabled: false, dailyCharsPerUser: 200_000 },
+  claim_random: { paidSuspendedLimit: 2, pendingDays: 7 },
 };
 
 export const updateSettingsRequestSchema = z
@@ -201,11 +216,26 @@ export const updateSettingsRequestSchema = z
     security: securitySettingSchema.optional(),
     ai_model: aiModelSettingSchema.optional(),
     translation: translationSettingSchema.optional(),
+    claim_random: claimRandomSettingSchema.optional(),
   })
   .refine((v) => Object.keys(SETTING_SCHEMAS).some((key) => v[key as SettingKey] !== undefined), {
     message: '至少提供一个待更新配置',
   });
 export type UpdateSettingsRequest = z.infer<typeof updateSettingsRequestSchema>;
+
+/** 管理员查看的每域 Claude 统计（GET /api/admin/settings/domain-claude-stats），根据历史来信判定 */
+export interface DomainClaudeStats {
+  domain: string;
+  /** 收到过欢迎信、收据、订阅确认、封号信或 Claude 产品邮件的地址数 */
+  accounts: number;
+  suspended: number;
+  paid: number;
+  paidSuspended: number;
+  /** 近 claim_random.pendingDays 天认领、还没收到 Claude 来信的邮箱数 */
+  pending: number;
+  /** wiped：全军覆没；paid_suspended：付费被封达到阈值；两者都会被 Claude 低风险模式排除 */
+  risk: 'wiped' | 'paid_suspended' | null;
+}
 
 /** 公开配置（无鉴权 GET /api/config） */
 export interface PublicConfig {

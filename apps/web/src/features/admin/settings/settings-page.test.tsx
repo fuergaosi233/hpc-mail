@@ -16,6 +16,7 @@ const SETTINGS = {
   mailbox_policy: { perUserLimit: 5, reservedLocalParts: ['admin', 'root'] },
   ai_model: { baseUrl: 'https://api.deepseek.com', apiKey: '******', model: 'deepseek-flash' },
   translation: { enabled: true, dailyCharsPerUser: 200000 },
+  claim_random: { paidSuspendedLimit: 2, pendingDays: 7 },
 } as unknown as Settings;
 
 const mocks = vi.hoisted(() => ({
@@ -200,6 +201,45 @@ describe('SettingsPage AI 翻译开关', () => {
       translation: { enabled: true, dailyCharsPerUser: 50000 },
       ai_model: { apiKey: '' },
     });
+    client.clear();
+  });
+});
+
+describe('SettingsPage 随机认领规则', () => {
+  it('显示当前阈值，修改后随整页保存提交完整的 claim_random', async () => {
+    const { client } = mount();
+    const limit = await screen.findByRole('spinbutton', { name: /付费被封排除阈值/ });
+    const days = screen.getByRole('spinbutton', { name: /未注册邮箱计入天数/ });
+    expect(limit).toHaveValue(2);
+    expect(days).toHaveValue(7);
+    expect(screen.getByText(/哪些域名参与随机请在「收件域名」页逐个设置/)).toBeInTheDocument();
+
+    fireEvent.change(limit, { target: { value: '0' } });
+    fireEvent.change(days, { target: { value: '120' } });
+    // 超过上限按 90 天截断
+    expect(days).toHaveValue(90);
+    fireEvent.click(screen.getByRole('button', { name: '保存更改' }));
+    await waitFor(() =>
+      expect(mocks.update).toHaveBeenCalledWith(
+        expect.objectContaining({ claim_random: { paidSuspendedLimit: 0, pendingDays: 90 } }),
+      ),
+    );
+    expect(mocks.update.mock.calls.at(-1)![0]).not.toHaveProperty('domains');
+    client.clear();
+  });
+
+  it('旧服务端没有这一块时不显示该分区', async () => {
+    const { claim_random: _omit, ...legacy } = structuredClone(SETTINGS);
+    mocks.get.mockResolvedValue(legacy);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const router = createMemoryRouter([{ path: '/', element: <SettingsPage /> }]);
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    await screen.findByText('邮箱认领策略');
+    expect(screen.queryByText('随机认领规则')).toBeNull();
     client.clear();
   });
 });

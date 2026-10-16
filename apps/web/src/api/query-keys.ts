@@ -47,6 +47,7 @@ export const queryKeys = {
     settings: ['admin', 'settings'] as const,
     invites: ['admin', 'invites'] as const,
     domainStatus: (domain: string) => ['admin', 'domain-status', domain] as const,
+    domainClaudeStats: ['admin', 'domain-claude-stats'] as const,
     mailboxShares: ['admin', 'mailbox-shares'] as const,
     mailboxSharesOf: (mailboxId: number) => ['admin', 'mailbox-shares', mailboxId] as const,
   },

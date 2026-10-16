@@ -257,6 +257,23 @@ export const messageTranslations = sqliteTable(
   (t) => [primaryKey({ columns: [t.messageId, t.cacheKey] })],
 );
 
+/**
+ * 按收件地址记录的 Claude 账号事实，由官方来信归纳（services/claude-facts.ts）。
+ * 不随邮件删除：邮件硬删后后缀的账号与封号统计仍然保留。标志只会由否变是。
+ */
+export const claudeAddressFacts = sqliteTable(
+  'claude_address_facts',
+  {
+    address: text('address').primaryKey(),
+    domain: text('domain').notNull(),
+    paid: integer('paid', { mode: 'boolean' }).notNull().default(false),
+    suspended: integer('suspended', { mode: 'boolean' }).notNull().default(false),
+    firstSeenAt: integer('first_seen_at', { mode: 'timestamp_ms' }).notNull(),
+    suspendedAt: integer('suspended_at', { mode: 'timestamp_ms' }),
+  },
+  (t) => [index('idx_claude_facts_domain').on(t.domain)],
+);
+
 export const settings = sqliteTable('settings', {
   key: text('key').primaryKey(),
   value: text('value').notNull(),

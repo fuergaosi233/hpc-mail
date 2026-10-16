@@ -51,6 +51,8 @@ send['x-max-attachment-bytes'] = 50 * 1024 * 1024;
 const domains = fromZod(SETTING_SCHEMAS.domains, 'output');
 const domainEntry = ((domains.properties as Record<string, Schema>).list!.items) as Schema;
 (domainEntry.properties as Record<string, Schema>).domain = domainName;
+(domainEntry.properties as Record<string, Schema>).random = { ...bool,
+  description: 'Whether random suffix generation in the claim dialog (uniform and Claude low-risk) may pick this domain. Omitted means true; false keeps it available for manual selection only.' };
 const settingsUpdate = fromZod(updateSettingsRequestSchema);
 (settingsUpdate.properties as Record<string, Schema>).domains = object({ list: { ...array({ anyOf: [domainName, domainEntry] }), maxItems: 64, 'x-unique-normalized-domain': true }, revision: int }, ['revision']);
 settingsUpdate.description = 'Partial settings update. A domains replacement requires expectedDomainsRevision from the latest GET; stale revisions return 409. Adding a domain does not configure DNS or Cloudflare Email Routing. Removing a domain only removes new-claim availability, and preserves existing mailbox routing. At least one setting key is required.';
@@ -61,6 +63,7 @@ for (const schema of [settingsResponse, settingsUpdate]) {
   properties.ai_model!.description = 'The single OpenAI-compatible Chat Completions model used by every AI feature: message translation and the inbound verification-code fallback. Configured means baseUrl, apiKey and model are all nonempty; baseUrl must be https and excludes /chat/completions. When translation is enabled, segments a user chooses to translate are sent to it; when code_extract.aiEnabled is on, the subject and first 6000 body characters of inbound mail that the regex could not resolve and that mentions a code-related keyword are sent to it. Unconfigured: translation is unavailable and code extraction uses regex only.';
   const aiFields = properties.ai_model!.properties as Record<string, Schema>;
   aiFields.apiKey = { ...aiFields.apiKey, description: 'Write-only provider key. Responses return ****** when a key is stored (empty string when none). Submitting ****** keeps the stored key; an empty string clears it.' };
+  properties.claim_random!.description = 'Rules for the Claude low-risk random suffix strategy. Domains where every Claude account, or every paid account, was suspended are always excluded. paidSuspendedLimit also excludes domains with at least that many suspended paid accounts (0 disables this rule). pendingDays counts mailboxes claimed within that many days that have not yet received Claude mail as load (0 disables). Which domains take part in random generation is set per domain with domains.list[].random.';
   properties.translation!.description = 'AI translation switch and quota. Enabling requires a configured ai_model (checked against the merged result when both are submitted). dailyCharsPerUser limits characters sent per user per UTC day, administrators included; 0 is unlimited.';
 }
 const notifyPrefs = fromZod(userNotifyPrefsSchema, 'output');
@@ -106,6 +109,18 @@ export const schemas: Record<string, Schema> = {
   MailboxShareGrant: object({ mailboxId: positiveId, address: str, domain: str, displayName: str,
     ownerUserId: positiveId, ownerUsername: str,
     grantees: array(object({ userId: positiveId, username: str, grantedAt: date, status: { type: 'string', enum: ['active', 'disabled'] } })) }),
+  ClaimPlan: object({
+    strategy: { type: 'string', enum: ['uniform', 'claude'] },
+    items: { ...array(object({ domain: str, suspended: { ...int, description: 'Addresses on this domain that received a Claude suspension email, judged from historical official mail.' } })),
+      description: 'Allocated domains in allocation order; at most count items. Prefixes are chosen by the client.' },
+    pool: { ...array(str), description: 'Domains the caller can claim that take part in random generation and still have quota.' },
+    shortfall: { ...int, description: 'count minus items length.' },
+    reason: nullable({ type: 'string', enum: ['quota', 'no_candidates'], description: 'quota: per-user or per-domain claim limits ran out; no_candidates: no eligible domain.' }) }),
+  DomainClaudeStats: object({ domain: str,
+    accounts: { ...int, description: 'Addresses that received a Claude welcome, receipt, subscription confirmation, suspension or Claude product email from official senders.' },
+    suspended: int, paid: int, paidSuspended: int,
+    pending: { ...int, description: 'Mailboxes claimed within claim_random.pendingDays that have not received Claude mail.' },
+    risk: nullable({ type: 'string', enum: ['wiped', 'paid_suspended'], description: 'wiped: every account or every paid account was suspended; paid_suspended: suspended paid accounts reached claim_random.paidSuspendedLimit. Both are excluded from the Claude low-risk strategy.' }) }),
   MailboxAvailability: object({ address: str, available: bool,
     reason: { type: 'string', enum: ['taken', 'reserved', 'quota', 'domain_limit', 'domain_unavailable'],
       description: 'Present only when available=false. taken: already claimed; reserved: system-reserved prefix; quota: caller reached the per-user claim limit; domain_limit: caller reached this domain’s per-user limit; domain_unavailable: domain not configured or not allowed by the caller’s public/dedicated policy. Same rules and order as claiming.' } }, ['reason']),

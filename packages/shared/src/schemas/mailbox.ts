@@ -29,6 +29,37 @@ export const batchMailboxRequestSchema = z.object({
 });
 export type BatchMailboxRequest = z.infer<typeof batchMailboxRequestSchema>;
 
+/**
+ * 随机后缀分配（GET /api/mailboxes/random-plan）：只返回为当前用户分好的后缀，不认领。
+ * uniform：在参与随机的可认领域名里等概率选；claude：按后缀的 Claude 封号数、再按账号数均衡分配。
+ */
+export const CLAIM_PLAN_STRATEGIES = ['uniform', 'claude'] as const;
+export type ClaimPlanStrategy = (typeof CLAIM_PLAN_STRATEGIES)[number];
+
+export const claimPlanQuerySchema = z.object({
+  count: z.coerce.number().int().min(1).max(MAX_BATCH_CLAIM),
+  strategy: z.enum(CLAIM_PLAN_STRATEGIES),
+});
+export type ClaimPlanQuery = z.infer<typeof claimPlanQuerySchema>;
+
+export interface ClaimPlanItem {
+  domain: string;
+  /** 该后缀上收到过 Claude 封号信的地址数（根据历史来信统计） */
+  suspended: number;
+}
+
+export interface ClaimPlan {
+  strategy: ClaimPlanStrategy;
+  /** 按分配顺序排列，长度不超过 count */
+  items: ClaimPlanItem[];
+  /** 参与随机且当前用户可认领的域名（单个地址重新随机时从中选） */
+  pool: string[];
+  /** 没能分配的个数 */
+  shortfall: number;
+  /** shortfall 的原因：quota 额度不足；no_candidates 没有可用的后缀 */
+  reason: 'quota' | 'no_candidates' | null;
+}
+
 export const updateMailboxRequestSchema = z.object({
   displayName: z.string().trim().max(64),
 });
