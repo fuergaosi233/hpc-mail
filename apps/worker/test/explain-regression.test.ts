@@ -351,5 +351,5 @@ describe('默认视图改走地址索引：结果与改前逐条一致', () => {
       expect(expected.size, who).toBeGreaterThan(0);
       expect(await getRecentContacts(env, viewer), who).toEqual([...expected].slice(0, 100));
     }
-  });
+  }, 20_000); // 逐视图逐页回放，CI 慢机上整文件曾到 5 秒以上
 });
