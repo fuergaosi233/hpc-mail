@@ -591,8 +591,9 @@ describe('随机后缀模式', () => {
     selectMode('均匀随机');
     randomize();
     await waitRows(['b.test', 'b.test']);
+    // 两个候选都出现即可停；上限 40 次，漏掉其中一个的概率约 2^-40
     const seen = new Set<string>();
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 40 && seen.size < 2; i++) {
       fireEvent.click(screen.getByRole('button', { name: '重新随机第 1 个' }));
       await waitFor(() => expect(screen.getByRole('button', { name: '重新随机第 1 个' })).toBeEnabled());
       seen.add(rowDomains()[0]!);
