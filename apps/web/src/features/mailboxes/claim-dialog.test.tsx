@@ -1,6 +1,7 @@
 import { QueryClient, type QueryClientConfig, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { ClaimPlan } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 type Draft = { localPart: string; domain: string };
 const mocks = vi.hoisted(() => {
@@ -46,7 +47,7 @@ const mocks = vi.hoisted(() => {
       items: Array.from({ length: count }, (_, i) => ({ domain: ['a.test', 'b.test', 'c.test'][i % 3]!, suspended: 0 })),
       pool: ['a.test', 'b.test', 'c.test'],
       shortfall: 0,
-      reason: null as 'quota' | 'no_candidates' | null,
+      reason: null as ClaimPlan['reason'],
     })),
     toast: vi.fn(),
     writeClipboard: vi.fn(async () => true),
@@ -463,7 +464,7 @@ describe('随机后缀模式', () => {
   const planOf = (
     strategy: 'uniform' | 'claude',
     items: Array<[string, number]>,
-    extra: { pool?: string[]; shortfall?: number; reason?: 'quota' | 'no_candidates' | null } = {},
+    extra: { pool?: string[]; shortfall?: number; reason?: ClaimPlan['reason'] } = {},
   ) => ({
     strategy,
     items: items.map(([domain, suspended]) => ({ domain, suspended })),
@@ -674,7 +675,7 @@ describe('随机后缀模式', () => {
       mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0], ['b.test', 2], ['c.test', 0], ['b.test', 2]]));
       const { client } = renderDialog(DOMAINS);
       selectMode('Claude 低风险');
-      expect(screen.getByText('按后缀的 Claude 封号数、账号数从少到多均匀分配')).toBeInTheDocument();
+      expect(screen.getByText('排除高风险后缀，按 Claude 封号数、账号数从少到多分配，每个后缀每天限量')).toBeInTheDocument();
       setCount('4');
       randomize();
       await waitRows(['a.test', 'b.test', 'c.test', 'b.test']);
@@ -705,6 +706,20 @@ describe('随机后缀模式', () => {
       randomize();
       await waitRows(['a.test', 'c.test']);
       expect(screen.getByText('额度不足，只分配了 2 个')).toBeInTheDocument();
+      client.clear();
+    });
+
+    it('低风险后缀今天的名额或每域名额用完时说明原因', async () => {
+      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0]], { shortfall: 2, reason: 'daily_limit' }));
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 低风险');
+      setCount('3');
+      randomize();
+      await waitRows(['a.test']);
+      expect(screen.getByText('低风险后缀今天的新增名额已用完，只分配了 1 个，可稍后再试或手动选择域名')).toBeInTheDocument();
+      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [], { shortfall: 3, reason: 'domain_quota' }));
+      randomize();
+      expect(await screen.findByText('可选后缀的每域名额已用完，可手动选择其他域名')).toBeInTheDocument();
       client.clear();
     });
 
