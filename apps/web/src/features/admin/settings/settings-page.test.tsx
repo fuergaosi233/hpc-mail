@@ -16,7 +16,7 @@ const SETTINGS = {
   mailbox_policy: { perUserLimit: 5, reservedLocalParts: ['admin', 'root'] },
   ai_model: { baseUrl: 'https://api.deepseek.com', apiKey: '******', model: 'deepseek-flash' },
   translation: { enabled: true, dailyCharsPerUser: 200000 },
-  claim_random: { paidSuspendedLimit: 2, pendingDays: 7 },
+  claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 50, dailyLimit: 3 },
 } as unknown as Settings;
 
 const mocks = vi.hoisted(() => ({
@@ -210,18 +210,25 @@ describe('SettingsPage 随机认领规则', () => {
     const { client } = mount();
     const limit = await screen.findByRole('spinbutton', { name: /付费被封排除阈值/ });
     const days = screen.getByRole('spinbutton', { name: /未注册邮箱计入天数/ });
+    const percent = screen.getByRole('spinbutton', { name: /封号率排除阈值/ });
+    const daily = screen.getByRole('spinbutton', { name: /每个后缀每日新增上限/ });
     expect(limit).toHaveValue(2);
     expect(days).toHaveValue(7);
+    expect(percent).toHaveValue(50);
+    expect(daily).toHaveValue(3);
     expect(screen.getByText(/哪些域名参与随机请在「收件域名」页逐个设置/)).toBeInTheDocument();
 
     fireEvent.change(limit, { target: { value: '0' } });
     fireEvent.change(days, { target: { value: '120' } });
     // 超过上限按 90 天截断
     expect(days).toHaveValue(90);
+    fireEvent.change(percent, { target: { value: '150' } });
+    expect(percent).toHaveValue(100);
+    fireEvent.change(daily, { target: { value: '0' } });
     fireEvent.click(screen.getByRole('button', { name: '保存更改' }));
     await waitFor(() =>
       expect(mocks.update).toHaveBeenCalledWith(
-        expect.objectContaining({ claim_random: { paidSuspendedLimit: 0, pendingDays: 90 } }),
+        expect.objectContaining({ claim_random: { paidSuspendedLimit: 0, pendingDays: 90, suspendedPercent: 100, dailyLimit: 0 } }),
       ),
     );
     expect(mocks.update.mock.calls.at(-1)![0]).not.toHaveProperty('domains');

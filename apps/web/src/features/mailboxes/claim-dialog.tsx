@@ -59,14 +59,17 @@ const SUFFIX_MODES: readonly SegmentedOption<SuffixMode>[] = [
 const SUFFIX_HINTS: Record<SuffixMode, string> = {
   fixed: '都用当前选择的域名',
   uniform: '从参与随机的可用域名中等概率选',
-  claude: '按后缀的 Claude 封号数、账号数从少到多均匀分配',
+  claude: '排除高风险后缀，按 Claude 封号数、账号数从少到多分配，每个后缀每天限量',
 };
 
 /** 后端没能分配满时的说明 */
 function shortfallText(plan: ClaimPlan): string | null {
   if (plan.shortfall === 0) return null;
   const allocated = plan.items.length;
+  const partial = allocated > 0 ? `，只分配了 ${allocated} 个` : '';
   if (plan.reason === 'quota') return allocated > 0 ? `额度不足，只分配了 ${allocated} 个` : '认领额度已用完，无法再分配';
+  if (plan.reason === 'daily_limit') return `低风险后缀今天的新增名额已用完${partial}，可稍后再试或手动选择域名`;
+  if (plan.reason === 'domain_quota') return `可选后缀的每域名额已用完${partial}，可手动选择其他域名`;
   if (allocated > 0) return `可用后缀的名额不足，只分配了 ${allocated} 个`;
   return plan.strategy === 'claude' ? '没有可用于 Claude 的低风险后缀，可手动选择域名' : '没有参与随机的可用域名，可手动选择域名';
 }

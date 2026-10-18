@@ -31,7 +31,7 @@ export type BatchMailboxRequest = z.infer<typeof batchMailboxRequestSchema>;
 
 /**
  * 随机后缀分配（GET /api/mailboxes/random-plan）：只返回为当前用户分好的后缀，不认领。
- * uniform：在参与随机的可认领域名里等概率选；claude：按后缀的 Claude 封号数、再按账号数均衡分配。
+ * uniform：在参与随机的可认领域名里等概率选；claude：排除高风险后缀，按 Claude 封号数、再按账号数均衡分配，每个后缀每天新增有上限。
  */
 export const CLAIM_PLAN_STRATEGIES = ['uniform', 'claude'] as const;
 export type ClaimPlanStrategy = (typeof CLAIM_PLAN_STRATEGIES)[number];
@@ -56,8 +56,11 @@ export interface ClaimPlan {
   pool: string[];
   /** 没能分配的个数 */
   shortfall: number;
-  /** shortfall 的原因：quota 额度不足；no_candidates 没有可用的后缀 */
-  reason: 'quota' | 'no_candidates' | null;
+  /**
+   * shortfall 的原因：quota 用户总认领额度不足；domain_quota 候选后缀的每域额度用完；
+   * daily_limit 候选后缀近 24 小时新增都已达上限；no_candidates 没有可用的后缀
+   */
+  reason: 'quota' | 'domain_quota' | 'daily_limit' | 'no_candidates' | null;
 }
 
 export const updateMailboxRequestSchema = z.object({

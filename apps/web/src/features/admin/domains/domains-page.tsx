@@ -93,13 +93,13 @@ function StatusBadge({
 /** 该域名的 Claude 账号与封号统计；全为 0 时只给一句说明 */
 function ClaudeStatsLine({ stats }: { stats: DomainClaudeStats | undefined }) {
   if (!stats) return null;
-  const empty = stats.accounts === 0 && stats.pending === 0;
+  const empty = stats.accounts === 0 && stats.pending === 0 && stats.recent === 0;
   return (
     <p className="text-xs text-ink-tertiary">
       Claude：
       {empty
         ? '暂无记录'
-        : `账号 ${stats.accounts} · 封 ${stats.suspended} · 付费 ${stats.paid} · 付费封 ${stats.paidSuspended} · 未注册 ${stats.pending}`}
+        : `账号 ${stats.accounts} · 封 ${stats.suspended} · 付费 ${stats.paid} · 付费封 ${stats.paidSuspended} · 未注册 ${stats.pending} · 24 小时新增 ${stats.recent}`}
     </p>
   );
 }
@@ -108,6 +108,8 @@ interface DomainRowProps {
   entry: DomainEntry;
   status: DomainOnboardingStatus | undefined;
   stats: DomainClaudeStats | undefined;
+  /** claim_random.dailyLimit；0 表示不限 */
+  dailyLimit: number;
   isFetching: boolean;
   busy: boolean;
   onTogglePublic: (domain: string, next: boolean) => void;
@@ -122,6 +124,7 @@ function DomainRow({
   entry,
   status,
   stats,
+  dailyLimit,
   isFetching,
   busy,
   onTogglePublic,
@@ -162,6 +165,10 @@ function DomainRow({
             </Badge>
           )}
           {stats?.risk === 'paid_suspended' && <Badge tone="caution">付费被封达阈值，已排除</Badge>}
+          {stats?.risk === 'suspended_rate' && <Badge tone="caution">封号率达阈值，已排除</Badge>}
+          {stats && stats.risk === null && entry.random !== false && dailyLimit > 0 && stats.recent >= dailyLimit && (
+            <Badge tone="caution" title="近 24 小时新增已达每日上限，Claude 低风险模式暂不分配这个后缀">今日新增已满</Badge>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           <IconButton size="sm" aria-label={`重新检测 ${entry.domain}`} disabled={isFetching} onClick={onRefetch}>
@@ -405,7 +412,7 @@ export function DomainsPage() {
             <b>参与随机生成</b>关掉后，认领时的「均匀随机」和「Claude 低风险」都不会分配这个域名，仍可手动选择。
           </p>
           <p className="mt-1 text-xs text-ink-tertiary">
-            Claude 统计根据历史官方来信判定，可能有约 5 分钟延迟；全军覆没（账号全被封或付费账号全被封）的后缀在 Claude 低风险模式下始终排除。
+            Claude 统计根据历史官方来信判定，可能有约 5 分钟延迟；全军覆没（账号全被封或付费账号全被封）的后缀在 Claude 低风险模式下始终排除，付费被封、封号率与每日新增上限见「系统设置 · 随机认领规则」。
             {statsQuery.isError && ' Claude 统计暂时加载失败。'}
           </p>
         </div>
@@ -446,6 +453,7 @@ export function DomainsPage() {
                   entry={entry}
                   status={q?.data}
                   stats={statsByDomain.get(entry.domain)}
+                  dailyLimit={settings?.claim_random?.dailyLimit ?? 0}
                   isFetching={q?.isFetching ?? false}
                   busy={!canEdit}
                   onTogglePublic={(domain, next) => updateEntry(domain, { public: next })}

@@ -118,6 +118,10 @@ export const claimRandomSettingSchema = z.object({
   paidSuspendedLimit: z.number().int().min(0).max(1000).default(2),
   /** 近 N 天认领、尚未收到 Claude 来信的邮箱计入后缀账号负载（0=不计） */
   pendingDays: z.number().int().min(0).max(90).default(7),
+  /** 封号数至少 2 且封号率（封号数 / 账号数）达到该百分比的后缀也排除（0=不按此条排除） */
+  suspendedPercent: z.number().int().min(0).max(100).default(50),
+  /** 每个后缀近 24 小时新增（新注册的 Claude 账号 + 新认领的未注册邮箱）达到该数后当天不再分配（0=不限） */
+  dailyLimit: z.number().int().min(0).max(1000).default(3),
 });
 
 /**
@@ -199,7 +203,7 @@ export const DEFAULT_SETTINGS: Settings = {
   security: { require2fa: false },
   ai_model: { baseUrl: '', apiKey: '', model: '' },
   translation: { enabled: false, dailyCharsPerUser: 200_000 },
-  claim_random: { paidSuspendedLimit: 2, pendingDays: 7 },
+  claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 50, dailyLimit: 3 },
 };
 
 export const updateSettingsRequestSchema = z
@@ -233,8 +237,10 @@ export interface DomainClaudeStats {
   paidSuspended: number;
   /** 近 claim_random.pendingDays 天认领、还没收到 Claude 来信的邮箱数 */
   pending: number;
-  /** wiped：全军覆没；paid_suspended：付费被封达到阈值；两者都会被 Claude 低风险模式排除 */
-  risk: 'wiped' | 'paid_suspended' | null;
+  /** 近 24 小时新增：新注册的 Claude 账号 + 新认领、还没收到 Claude 来信的邮箱；达到 claim_random.dailyLimit 当天不再分配 */
+  recent: number;
+  /** wiped：全军覆没；paid_suspended：付费被封达到阈值；suspended_rate：封号率达到阈值；都会被 Claude 低风险模式排除 */
+  risk: 'wiped' | 'paid_suspended' | 'suspended_rate' | null;
 }
 
 /** 公开配置（无鉴权 GET /api/config） */

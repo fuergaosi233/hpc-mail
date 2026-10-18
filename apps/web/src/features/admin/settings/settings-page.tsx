@@ -438,13 +438,29 @@ export function SettingsPage() {
         {draft.claim_random && (
           <Section
             title="随机认领规则"
-            description="认领时选「Claude 低风险」，按后缀的 Claude 封号数、账号数从少到多均匀分配。全军覆没的后缀始终排除；哪些域名参与随机请在「收件域名」页逐个设置。"
+            description="认领时选「Claude 低风险」，先排除高风险后缀，再按 Claude 封号数、账号数从少到多分配，每个后缀每天新增有上限。全军覆没的后缀始终排除；哪些域名参与随机请在「收件域名」页逐个设置。"
           >
             <NumberRow
               label="付费被封排除阈值"
               description="后缀上付费后被封的地址达到这个数就不再分配。0 表示不按此条排除。"
               value={draft.claim_random.paidSuspendedLimit}
               onChange={(v) => patch((s) => void (s.claim_random.paidSuspendedLimit = v))}
+              max={1000}
+              suffix="个"
+            />
+            <NumberRow
+              label="封号率排除阈值"
+              description="后缀上至少 2 个地址被封、且被封地址占 Claude 账号的比例达到这个值就不再分配。0 表示不按此条排除。"
+              value={draft.claim_random.suspendedPercent}
+              onChange={(v) => patch((s) => void (s.claim_random.suspendedPercent = v))}
+              max={100}
+              suffix="%"
+            />
+            <NumberRow
+              label="每个后缀每日新增上限"
+              description="近 24 小时新注册的 Claude 账号加新认领、还没收到 Claude 来信的邮箱达到这个数，该后缀当天不再分配，避免同一后缀短时间集中注册。0 表示不限。"
+              value={draft.claim_random.dailyLimit}
+              onChange={(v) => patch((s) => void (s.claim_random.dailyLimit = v))}
               max={1000}
               suffix="个"
             />
