@@ -458,7 +458,7 @@ export function SettingsPage() {
             />
             <NumberRow
               label="每个后缀每日新增上限"
-              description="近 24 小时新注册的 Claude 账号加新认领、还没收到 Claude 来信的邮箱达到这个数，该后缀当天不再分配，避免同一后缀短时间集中注册。0 表示不限。"
+              description="近 24 小时新注册的 Claude 账号加新认领、还没收到 Claude 来信的邮箱达到这个数，该后缀当天不再分配；封号最少的后缀都满了就停止，不挪到封号更多的后缀。0 表示不限。"
               value={draft.claim_random.dailyLimit}
               onChange={(v) => patch((s) => void (s.claim_random.dailyLimit = v))}
               max={1000}

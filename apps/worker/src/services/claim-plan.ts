@@ -86,17 +86,19 @@ function randomIndex(n: number): number {
 /**
  * Claude 低风险分配：逐个分配，每次取（封号数, 负载）最小的后缀，平局随机；分到后负载 +1。
  * 效果是先用封号最少的后缀，并把这些后缀的负载拉平，单个后缀上的账号尽量少。
- * dailyLimit 大于 0 时，近 24 小时新增达到上限的后缀当天不再分配，分不满就如实返回 shortfall：
- * 同一后缀一天内集中注册多个号，历史上多次当天就被成批封掉。
+ * 每域额度用完才轮到封号更多的后缀。dailyLimit 大于 0 时，近 24 小时新增达到上限的后缀当天不再分配；
+ * 封号最少的这一档都满了就停，不因每日上限挪到封号更多的后缀：同一后缀一天内集中注册多个号，
+ * 历史上多次当天就被成批封掉，宁可少分。
  */
 export function allocateLowRisk(candidates: PlanCandidate[], count: number, dailyLimit = 0, random = randomIndex): ClaimPlanItem[] {
   const pool = candidates.map((candidate) => ({ ...candidate }));
   const items: ClaimPlanItem[] = [];
   while (items.length < count) {
-    const open = pool.filter((candidate) => candidate.remaining > 0 && (dailyLimit === 0 || candidate.recent < dailyLimit));
+    const open = pool.filter((candidate) => candidate.remaining > 0);
     if (open.length === 0) break;
     const best = Math.min(...open.map((candidate) => candidate.suspended));
-    const safest = open.filter((candidate) => candidate.suspended === best);
+    const safest = open.filter((candidate) => candidate.suspended === best && (dailyLimit === 0 || candidate.recent < dailyLimit));
+    if (safest.length === 0) break;
     const lightest = Math.min(...safest.map((candidate) => candidate.load));
     const ties = safest.filter((candidate) => candidate.load === lightest);
     const picked = ties[random(ties.length)]!;
@@ -184,7 +186,7 @@ function shortfallReason(eligible: PlanCandidate[], items: ClaimPlanItem[], targ
   if (items.length === target && target < count) return 'quota';
   const allocated = new Map<string, number>();
   for (const item of items) allocated.set(item.domain, (allocated.get(item.domain) ?? 0) + 1);
-  // 分配停在没有可分的后缀：还剩每域额度的后缀只可能是被每日上限挡住
+  // 分配停在没有可分的后缀：还有剩余每域额度，说明是封号最少的那一档都到了每日上限
   return eligible.some((candidate) => candidate.remaining > (allocated.get(candidate.domain) ?? 0)) ? 'daily_limit' : 'domain_quota';
 }
 

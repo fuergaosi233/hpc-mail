@@ -58,7 +58,7 @@ export interface ClaimPlan {
   shortfall: number;
   /**
    * shortfall 的原因：quota 用户总认领额度不足；domain_quota 候选后缀的每域额度用完；
-   * daily_limit 候选后缀近 24 小时新增都已达上限；no_candidates 没有可用的后缀
+   * daily_limit 封号最少的那一档候选后缀近 24 小时新增都已达上限；no_candidates 没有可用的后缀
    */
   reason: 'quota' | 'domain_quota' | 'daily_limit' | 'no_candidates' | null;
 }

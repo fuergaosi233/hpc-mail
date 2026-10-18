@@ -37,11 +37,12 @@ describe('分配算法', () => {
     ]);
   });
 
-  it('每日上限：近 24 小时新增达到上限的后缀当天不再分配，本批分到的也计入；都满了就停', () => {
-    const items = allocateLowRisk([candidate('a', 0, 0, Infinity, 2), candidate('b', 0, 5), candidate('one', 1, 0, Infinity, 3)], 6, 3, first);
+  it('每日上限：近 24 小时新增达到上限的后缀当天不再分配，本批分到的也计入；封号最少的一档都满了就停', () => {
+    const items = allocateLowRisk([candidate('a', 0, 0, Infinity, 2), candidate('b', 0, 5), candidate('one', 1, 0)], 6, 3, first);
     expect(tally(items)).toEqual({ a: 1, b: 3 });
-    // 0 封号后缀满了，按原顺序轮到还没满的有封号后缀
-    expect(tally(allocateLowRisk([candidate('safe', 0, 0, Infinity, 3), candidate('one', 1, 0)], 2, 3, first))).toEqual({ one: 2 });
+    // 每日上限不会把分配挪到封号更多的后缀；每域额度用完才轮到下一档
+    expect(allocateLowRisk([candidate('safe', 0, 0, Infinity, 3), candidate('one', 1, 0)], 2, 3, first)).toEqual([]);
+    expect(tally(allocateLowRisk([candidate('safe', 0, 0, 0), candidate('one', 1, 0)], 2, 3, first))).toEqual({ one: 2 });
     // 0 表示不限
     expect(tally(allocateLowRisk([candidate('a', 0, 0, Infinity, 9)], 2, 0, first))).toEqual({ a: 2 });
   });
@@ -207,9 +208,9 @@ describe('GET /api/mailboxes/random-plan', () => {
     await f.facts(2, 1, { suspended: true, firstSeenAt: twoDaysAgo });
     await f.facts(2, 3, { firstSeenAt: twoDaysAgo });                    // d2：1 个封号，未被排除
     const result = await plan(f.admin.jwt, 10, 'claude');
-    // d0 已满；0 封号的 d1 分到上限，之后按原顺序轮到 d2；都满了如实返回
-    expect(tally(result.items)).toEqual({ [f.domains[1]!]: 3, [f.domains[2]!]: 3 });
-    expect(result).toMatchObject({ shortfall: 4, reason: 'daily_limit' });
+    // d0 已满；0 封号的 d1 分到上限后停止，不挪到有封号的 d2
+    expect(tally(result.items)).toEqual({ [f.domains[1]!]: 3 });
+    expect(result).toMatchObject({ shortfall: 7, reason: 'daily_limit' });
     expect((await plan(f.admin.jwt, 10, 'uniform')).items).toHaveLength(10);
     await updateSettings(env, { claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 0, dailyLimit: 0 } });
     expect((await plan(f.admin.jwt, 10, 'claude')).shortfall).toBe(0);
