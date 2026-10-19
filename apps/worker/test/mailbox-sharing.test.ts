@@ -369,6 +369,17 @@ describe('所有者批量共享多只邮箱', () => {
     }
   });
 
+  it('校验后到写入前的并发替换或追加不报 409，按主键合并', async () => {
+    const f = await fixture();
+    const [a, b] = await ownedBoxes(f, f.admin.id, 'a', 'b');
+    const racing = beforeBatch(async () => {
+      await replaceMailboxShares(env, f.admin.id, a!.id, [f.member.id, f.stranger.id]);
+    }, 2);
+    const grants = await shareMailboxes(racing, f.admin.id, [a!.id, b!.id], [f.member.id]);
+    expect(grants.map((grant) => grant.grantees.map((grantee) => grantee.userId)))
+      .toEqual([[f.member.id, f.stranger.id], [f.member.id]]);
+  });
+
   it('返回值在写入的同一事务里读回：提交后再过户或释放不会让已生效的请求报冲突', async () => {
     const f = await fixture();
     const [a, b, c] = await ownedBoxes(f, f.admin.id, 'a', 'b', 'c');
