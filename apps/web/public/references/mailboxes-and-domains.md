@@ -64,6 +64,7 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 |---|---|
 | `GET /mailboxes/shares` | 当前用户自有邮箱与共享名单，包含尚未共享邮箱；JWT 专用 |
 | `PUT /mailboxes/shares` | `{mailboxId,userIds:[...],expectedOwnerId?}` 整体替换自己邮箱的名单；管理员通过此入口也只能修改自己邮箱 |
+| `POST /mailboxes/shares/batch` | `{mailboxIds:[...],userIds:[...]}`（各 1–100 个）把自己的多只邮箱一次**追加**共享给同一批用户：已在名单的保留原授权时间，不移除任何人，重复调用幂等；每只邮箱追加后最多 100 人。任一邮箱不归自己（管理员也一样）返回 403，用户含自己、不存在或已禁用返回 400，写入前归属、用户状态或名单被并发改变返回 409，均不写入任何邮箱。返回各邮箱更新后的完整名单，顺序同请求 |
 | `DELETE /mailboxes/shares/:mailboxId/grantees/:userId` | 所有者撤销一个成员；`{success:true}` |
 | `GET /mailboxes/share-users?q=...&excludeUserId=...&limit=20` | JWT 专用；搜索启用用户，仅返回 `{items:[{id,username,role}],hasMore}`，不含账户隐私或邮箱列表 |
 | `GET /admin/mailbox-shares` | 管理员查看全站已认领邮箱与 `grantees:[{userId,username,status,grantedAt}]`，包含尚未共享邮箱；`?mailboxId=` 只返回该邮箱（0 或 1 项） |

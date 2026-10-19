@@ -5,7 +5,7 @@ import {
   initMultipartUploadSchema, completeMultipartUploadSchema, loginRequestSchema, registerRequestSchema,
   changePasswordRequestSchema, uploadAvatarRequestSchema, enableTwoFactorRequestSchema, disableTwoFactorRequestSchema,
   createUserRequestSchema, updateUserRequestSchema, userMailboxPolicySchema, createApiKeyRequestSchema, updateApiKeyRequestSchema,
-  createInviteRequestSchema, replaceMailboxSharesRequestSchema, updateSettingsRequestSchema,
+  createInviteRequestSchema, replaceMailboxSharesRequestSchema, batchShareMailboxesRequestSchema, updateSettingsRequestSchema,
   updateNotifyPrefsRequestSchema, userNotifyPrefsSchema, translateMessageRequestSchema, aiModelTestRequestSchema,
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
 } from '@hpc-mail/shared';
@@ -179,6 +179,7 @@ export const schemas: Record<string, Schema> = {
     ...fromZod(updateUserRequestSchema), dependentRequired: { mailboxPolicy: ['expectedMailboxPolicyRevision'] },
   }, CreateApiKeyRequest: fromZod(createApiKeyRequestSchema),
   UpdateApiKeyRequest: fromZod(updateApiKeyRequestSchema), CreateInviteRequest: fromZod(createInviteRequestSchema), ReplaceMailboxSharesRequest: fromZod(replaceMailboxSharesRequestSchema),
+  BatchShareMailboxesRequest: fromZod(batchShareMailboxesRequestSchema),
   UpdateSettingsRequest: settingsUpdate, UpdateNotifyPrefsRequest: fromZod(updateNotifyPrefsRequestSchema),
   SingleUploadResult: object({ token: str, filename: str, size: int, mimeType: str }),
   MultipartInitResult: object({ token: str, uploadId: str, partBytes: positiveId, partCount: positiveId }),
