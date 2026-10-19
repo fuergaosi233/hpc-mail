@@ -1,6 +1,6 @@
 import {
-  batchMailboxRequestSchema, claimMailboxRequestSchema, claimPlanQuerySchema, replaceMailboxSharesRequestSchema, searchUsersQuerySchema,
-  updateMailboxRequestSchema,
+  batchMailboxRequestSchema, batchShareMailboxesRequestSchema, claimMailboxRequestSchema, claimPlanQuerySchema,
+  replaceMailboxSharesRequestSchema, searchUsersQuerySchema, updateMailboxRequestSchema,
 } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { execCtx, ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../lib/http.js';
@@ -16,7 +16,9 @@ import {
   updateMailbox,
 } from '../services/mailbox.js';
 import { planRandomDomains } from '../services/claim-plan.js';
-import { listMailboxShares, listSharedMailboxes, replaceMailboxShares, revokeMailboxShare } from '../services/mailbox-share.js';
+import {
+  listMailboxShares, listSharedMailboxes, replaceMailboxShares, revokeMailboxShare, shareMailboxes,
+} from '../services/mailbox-share.js';
 import { searchUsers } from '../services/user.js';
 import type { AppContext } from '../types.js';
 
@@ -49,6 +51,12 @@ app.get('/share-users', async (c) => {
 app.put('/shares', async (c) => {
   const req = await parseBody(c, replaceMailboxSharesRequestSchema);
   return ok(c, await replaceMailboxShares(c.env, c.get('user')!.id, req.mailboxId, req.userIds, false, req.expectedOwnerId));
+});
+
+/** 所有者把自己的多只邮箱一次追加共享给同一批用户；管理员也只能共享自己的邮箱 */
+app.post('/shares/batch', async (c) => {
+  const req = await parseBody(c, batchShareMailboxesRequestSchema);
+  return ok(c, await shareMailboxes(c.env, c.get('user')!.id, req.mailboxIds, req.userIds));
 });
 
 app.delete('/shares/:mailboxId/grantees/:userId', async (c) => {
