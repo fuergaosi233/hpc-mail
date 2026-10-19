@@ -79,6 +79,8 @@ export function randomAddresses(
 
 export interface ClaimListResult {
   claimed: string[];
+  /** 认领成功的邮箱 id，与 claimed 同顺序一一对应；仅单个认领未拿到返回体时为空 */
+  claimedIds: number[];
   /** 没能认领的地址（被占用的 + 因中途停止而没试的），保持用户给出的顺序 */
   remaining: AddressDraft[];
   /** 中途因配额、权限、网络等停止时的原因；仅「被占用」导致的未认领不算 */
@@ -96,8 +98,8 @@ const failureText = (error: unknown) => (error instanceof ApiError ? error.messa
  */
 function claimFailure(items: AddressDraft[], error: unknown, hint: string): ClaimListResult {
   const rejected = error instanceof ApiError && error.httpStatus !== null && error.httpStatus >= 400 && error.httpStatus < 500;
-  if (rejected) return { claimed: [], remaining: items, stoppedBy: failureText(error) };
-  return { claimed: [], remaining: items, stoppedBy: `${failureText(error)}。${hint}`, uncertain: true };
+  if (rejected) return { claimed: [], claimedIds: [], remaining: items, stoppedBy: failureText(error) };
+  return { claimed: [], claimedIds: [], remaining: items, stoppedBy: `${failureText(error)}。${hint}`, uncertain: true };
 }
 
 /**
@@ -112,6 +114,7 @@ export function fromBatchResult(drafts: AddressDraft[], result: BatchClaimMailbo
     .sort((a, b) => position(a) - position(b));
   return {
     claimed: result.claimed.map((mailbox) => mailbox.address),
+    claimedIds: result.claimed.map((mailbox) => mailbox.id),
     remaining,
     stoppedBy: result.stoppedBy?.message ?? null,
     ...(result.stoppedBy?.code === 'internal' ? { uncertain: true as const } : {}),
@@ -126,7 +129,7 @@ export function fromBatchResult(drafts: AddressDraft[], result: BatchClaimMailbo
 export async function claimList(
   drafts: AddressDraft[],
   api: {
-    claim: (body: ClaimMailboxRequest) => Promise<Pick<Mailbox, 'address'> | undefined>;
+    claim: (body: ClaimMailboxRequest) => Promise<Pick<Mailbox, 'id' | 'address'> | undefined>;
     batchClaim: (items: ClaimMailboxRequest[]) => Promise<BatchClaimMailboxResult>;
   },
 ): Promise<ClaimListResult> {
@@ -135,9 +138,16 @@ export async function claimList(
     const draft = items[0]!;
     try {
       const created = await api.claim(draft);
-      return { claimed: [created?.address ?? draftKey(draft)], remaining: [], stoppedBy: null };
+      return {
+        claimed: [created?.address ?? draftKey(draft)],
+        claimedIds: created ? [created.id] : [],
+        remaining: [],
+        stoppedBy: null,
+      };
     } catch (error) {
-      if (error instanceof ApiError && error.code === 'address_taken') return { claimed: [], remaining: [draft], stoppedBy: null };
+      if (error instanceof ApiError && error.code === 'address_taken') {
+        return { claimed: [], claimedIds: [], remaining: [draft], stoppedBy: null };
+      }
       return claimFailure([draft], error, '该地址可能已认领，请以邮箱列表为准');
     }
   }
