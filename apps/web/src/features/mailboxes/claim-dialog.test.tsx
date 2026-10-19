@@ -1,24 +1,34 @@
 import { QueryClient, type QueryClientConfig, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { ClaimPlan } from '@hpc-mail/shared';
+import type { ClaimPlan, SessionUser } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
+import { CurrentUserContext } from '@/lib/use-session';
 type Draft = { localPart: string; domain: string };
 const mocks = vi.hoisted(() => {
+  /** 后端给每个地址分配的邮箱 id：同一地址固定，用来核对共享时提交的 mailboxIds */
+  const ids = new Map<string, number>();
+  const idOf = (address: string) => {
+    if (!ids.has(address)) ids.set(address, 100 + ids.size);
+    return ids.get(address)!;
+  };
+  const mailbox = (body: Draft) => ({ id: idOf(`${body.localPart}@${body.domain}`), address: `${body.localPart}@${body.domain}` });
   /** 后端对单个地址的认领结果：单个认领接口与批量认领的模拟共用这一份 */
-  const claimOne = vi.fn(async (body: Draft) => ({ address: `${body.localPart}@${body.domain}` }));
+  const claimOne = vi.fn(async (body: Draft) => mailbox(body));
   /** 后端对单个地址的可用性结果：单个与批量查询共用 */
   const availableOf = vi.fn(
     async (_localPart = '', _domain = ''): Promise<{ available: boolean; reason?: string }> => ({ available: true }),
   );
   return {
+    idOf,
+    mailbox,
     claimOne,
     availableOf,
     claim: vi.fn((body: Draft) => claimOne(body)),
     /** 模拟后端批量认领：按顺序逐个处理，被占用的跳过，其他错误停止 */
     batchClaim: vi.fn(async (items: Draft[]) => {
       const result = {
-        claimed: [] as Array<{ address: string }>,
+        claimed: [] as Array<{ id: number; address: string }>,
         taken: [] as Draft[],
         notAttempted: [] as Draft[],
         stoppedBy: null as { code: string; message: string } | null,
@@ -49,6 +59,16 @@ const mocks = vi.hoisted(() => {
       shortfall: 0,
       reason: null as ClaimPlan['reason'],
     })),
+    /** 管理员的用户列表：含自己（root）、已禁用的 carol */
+    listUsers: vi.fn(async () => [
+      { id: 1, username: 'root', role: 'admin', status: 'active' },
+      { id: 2, username: 'alice', role: 'user', status: 'active' },
+      { id: 3, username: 'bob', role: 'user', status: 'active' },
+      { id: 4, username: 'carol', role: 'user', status: 'disabled' },
+      { id: 5, username: 'ops', role: 'admin', status: 'active' },
+    ]),
+    batchShare: vi.fn(async (body: { mailboxIds: number[]; userIds: number[] }) =>
+      body.mailboxIds.map((mailboxId) => ({ mailboxId, grantees: body.userIds.map((userId) => ({ userId })) }))),
     toast: vi.fn(),
     writeClipboard: vi.fn(async () => true),
   };
@@ -60,7 +80,9 @@ vi.mock('@/api/resources', () => ({
     availability: mocks.availability,
     batchAvailability: mocks.batchAvailability,
     randomPlan: mocks.randomPlan,
+    batchShare: mocks.batchShare,
   },
+  adminApi: { listUsers: mocks.listUsers },
 }));
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
 vi.mock('@/components/ui/copy-button', () => ({ writeClipboard: mocks.writeClipboard }));
@@ -257,7 +279,7 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
   it('某个地址刚被别人占用：其余照常认领，可返回修改只保留未认领的', async () => {
     mocks.claimOne.mockImplementation(async (body) => {
       if (body.localPart === 'taken-one') throw new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 });
-      return { address: `${body.localPart}@${body.domain}` };
+      return mocks.mailbox(body);
     });
     const { client } = renderDialog(['one.test']);
     setCount('2');
@@ -274,7 +296,7 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
 
   it('中途配额用尽：保留已认领的并说明原因，不再继续请求，也不提供返回修改', async () => {
     mocks.claimOne
-      .mockImplementationOnce(async (body) => ({ address: `${body.localPart}@${body.domain}` }))
+      .mockImplementationOnce(async (body) => mocks.mailbox(body))
       .mockRejectedValueOnce(new ApiError('认领地址数已达上限（1）', { code: 'forbidden', httpStatus: 403 }));
     const { client } = renderDialog(['one.test']);
     setCount('5');
@@ -423,7 +445,7 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     mocks.batchClaim.mockImplementationOnce(
       (items) => new Promise((resolve) => {
         release = () => resolve({
-          claimed: items.map((item) => ({ address: `${item.localPart}@${item.domain}` })),
+          claimed: items.map((item) => mocks.mailbox(item)),
           taken: [], notAttempted: [], stoppedBy: null,
         });
       }),
@@ -637,7 +659,7 @@ describe('随机后缀模式', () => {
   it('认领中途被占用后「返回修改」，保留各自的域名', async () => {
     mocks.claimOne.mockImplementation(async (body) => {
       if (body.localPart === 'busy') throw new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 });
-      return { address: `${body.localPart}@${body.domain}` };
+      return mocks.mailbox(body);
     });
     const { client } = renderDialog(DOMAINS);
     setCount('2');
@@ -652,7 +674,7 @@ describe('随机后缀模式', () => {
     fireEvent.click(screen.getByRole('button', { name: '返回修改' }));
     expect(prefixes()).toEqual(['busy']);
     expect(rowDomains()).toEqual(['c.test']);
-    mocks.claimOne.mockImplementation(async (body) => ({ address: `${body.localPart}@${body.domain}` }));
+    mocks.claimOne.mockImplementation(async (body) => mocks.mailbox(body));
     client.clear();
   });
 
@@ -777,5 +799,172 @@ describe('随机后缀模式', () => {
       expect(mocks.randomPlan).toHaveBeenCalledTimes(1);
       client.clear();
     });
+  });
+});
+
+describe('管理员把认领结果一键共享给其他人', () => {
+  const admin: SessionUser = { id: 1, username: 'root', role: 'admin', createdAt: '', avatarUrl: null, twoFactorEnabled: false };
+  const member: SessionUser = { ...admin, id: 6, username: 'member', role: 'user' };
+  const setCount = (value: string) => fireEvent.change(screen.getByLabelText('随机生成个数'), { target: { value } });
+  const claimedAddresses = () => screen.getAllByRole('listitem').map((item) => item.textContent!);
+  const userOptions = () => screen.getAllByRole('checkbox').map((box) => box.closest('label')!.textContent);
+
+  function renderAs(user: SessionUser | null, onOpenChange = vi.fn()) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <CurrentUserContext.Provider value={user}>
+          <ClaimDialog open onOpenChange={onOpenChange} domains={['one.test']} />
+        </CurrentUserContext.Provider>
+      </QueryClientProvider>,
+    );
+    return { client, onOpenChange, invalidate: vi.spyOn(client, 'invalidateQueries') };
+  }
+
+  /** 随机生成 count 个并认领，停在结果页 */
+  async function claimBatch(count: number, edit?: () => void) {
+    setCount(String(count));
+    fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
+    edit?.();
+    fireEvent.click(screen.getByRole('button', { name: `认领 ${count} 个` }));
+    await screen.findByText(/^已认领 \d+ 个地址/);
+  }
+
+  async function openShare(count: number) {
+    fireEvent.click(screen.getByRole('button', { name: '共享给…' }));
+    expect(await screen.findByRole('dialog', { name: `把刚认领的 ${count} 个邮箱共享给…` })).toBeInTheDocument();
+    await screen.findByRole('checkbox', { name: 'alice' });
+  }
+
+  it('批量认领后可共享给选中的用户：候选只含启用中的其他用户，提交认领成功的邮箱 id', async () => {
+    const { client, invalidate } = renderAs(admin);
+    await claimBatch(3);
+    const addresses = claimedAddresses();
+    await openShare(3);
+    // 排除自己（root）与已禁用的 carol
+    expect(userOptions()).toEqual(['alice', 'bob', 'ops']);
+    expect(screen.getByRole('button', { name: '共享 3 个邮箱' })).toBeDisabled();
+    const search = screen.getByRole('textbox', { name: '搜索共享用户' });
+    fireEvent.change(search, { target: { value: 'BO' } });
+    expect(userOptions()).toEqual(['bob']);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'bob' }));
+    fireEvent.change(search, { target: { value: 'ali' } });
+    // 已选的人在搜索别人时仍保留
+    expect(userOptions()).toEqual(['alice', 'bob']);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
+    expect(screen.getByText('已选 2/100 人，已有的共享成员会保留。')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '共享 3 个邮箱' }));
+
+    expect(await screen.findByText('已共享给：alice、bob')).toBeInTheDocument();
+    expect(mocks.batchShare).toHaveBeenCalledTimes(1);
+    expect(mocks.batchShare).toHaveBeenCalledWith({ mailboxIds: addresses.map(mocks.idOf), userIds: [2, 3] });
+    expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({ title: '已将 3 个邮箱共享给 alice、bob', variant: 'success' }));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['mailboxes'] });
+    expect(screen.getByRole('dialog', { name: '认领邮箱地址' })).toBeInTheDocument();
+    expect(claimedAddresses()).toEqual(addresses);
+
+    // 可以再共享给其他人，结果页的名单随之累加
+    await openShare(3);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'ops' }));
+    fireEvent.click(screen.getByRole('button', { name: '共享 3 个邮箱' }));
+    expect(await screen.findByText('已共享给：alice、bob、ops')).toBeInTheDocument();
+    expect(mocks.batchShare).toHaveBeenLastCalledWith({ mailboxIds: addresses.map(mocks.idOf), userIds: [5] });
+    client.clear();
+  });
+
+  it('普通用户、以及读不到当前用户时，结果页没有「共享给…」', async () => {
+    for (const user of [member, null]) {
+      const { client } = renderAs(user);
+      await claimBatch(2);
+      expect(screen.getByRole('button', { name: '复制全部地址' })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '共享给…' })).toBeNull();
+      cleanup();
+      client.clear();
+    }
+    expect(mocks.listUsers).not.toHaveBeenCalled();
+  });
+
+  it('部分认领（有未认领的）时只共享已认领的邮箱', async () => {
+    mocks.claimOne.mockImplementation(async (body) => {
+      if (body.localPart === 'taken-two') throw new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 });
+      return mocks.mailbox(body);
+    });
+    const { client } = renderAs(admin);
+    await claimBatch(3, () => fireEvent.change(screen.getByLabelText('前缀 2'), { target: { value: 'taken-two' } }));
+    expect(screen.getByText('已认领 2 个地址，还有 1 个未认领')).toBeInTheDocument();
+    const addresses = claimedAddresses();
+    expect(addresses).toHaveLength(2);
+    expect(screen.getByRole('button', { name: '返回修改' })).toBeInTheDocument();
+    await openShare(2);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
+    fireEvent.click(screen.getByRole('button', { name: '共享 2 个邮箱' }));
+    await screen.findByText('已共享给：alice');
+    expect(mocks.batchShare).toHaveBeenCalledWith({ mailboxIds: addresses.map(mocks.idOf), userIds: [2] });
+    mocks.claimOne.mockImplementation(async (body) => mocks.mailbox(body));
+    client.clear();
+  });
+
+  it('共享失败时留在共享步骤显示原因，可重试；冲突时刷新邮箱归属', async () => {
+    mocks.batchShare.mockRejectedValueOnce(new ApiError('邮箱归属已变化，请刷新后重试', { code: 'conflict', httpStatus: 409 }));
+    mocks.batchShare.mockRejectedValueOnce(new TypeError('boom'));
+    const { client, invalidate } = renderAs(admin);
+    await claimBatch(2);
+    invalidate.mockClear();
+    await openShare(2);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'bob' }));
+    fireEvent.click(screen.getByRole('button', { name: '共享 2 个邮箱' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('邮箱归属已变化，请刷新后重试');
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['mailboxes'] });
+    expect(screen.getByRole('dialog', { name: '把刚认领的 2 个邮箱共享给…' })).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'bob' })).toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: '共享 2 个邮箱' }));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('共享失败，请重试'));
+    fireEvent.click(screen.getByRole('button', { name: '共享 2 个邮箱' }));
+    expect(await screen.findByText('已共享给：bob')).toBeInTheDocument();
+    expect(mocks.batchShare).toHaveBeenCalledTimes(3);
+    client.clear();
+  });
+
+  it('共享进行中不能关闭弹窗也不能返回；「返回」回到结果页，关闭后共享状态清空', async () => {
+    let release!: () => void;
+    mocks.batchShare.mockImplementationOnce(
+      (body) => new Promise((resolve) => {
+        release = () => resolve(body.mailboxIds.map((mailboxId) => ({ mailboxId, grantees: [] })));
+      }),
+    );
+    const { client, onOpenChange } = renderAs(admin);
+    await claimBatch(2);
+    await openShare(2);
+    fireEvent.click(screen.getByRole('button', { name: '返回' }));
+    expect(screen.getByRole('dialog', { name: '认领邮箱地址' })).toBeInTheDocument();
+    await openShare(2);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
+    fireEvent.click(screen.getByRole('button', { name: '共享 2 个邮箱' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /共享 2 个邮箱/ })).toBeDisabled());
+    expect(screen.getByRole('button', { name: '返回' })).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: 'alice' })).toBeDisabled();
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    expect(onOpenChange).not.toHaveBeenCalled();
+    release();
+    expect(await screen.findByText('已共享给：alice')).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    // 弹窗由外部保持打开时，关闭动作已把对话框重置回空白表单
+    expect(screen.queryByText(/已共享给/)).toBeNull();
+    expect(screen.getByRole('button', { name: '认领' })).toBeInTheDocument();
+    client.clear();
+  });
+
+  it('用户列表加载失败时可重新加载', async () => {
+    mocks.listUsers.mockRejectedValueOnce(new ApiError('服务暂时不可用', { code: 'internal', httpStatus: 503 }));
+    const { client } = renderAs(admin);
+    await claimBatch(2);
+    fireEvent.click(screen.getByRole('button', { name: '共享给…' }));
+    expect(await screen.findByText('服务暂时不可用')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '共享 2 个邮箱' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
+    expect(await screen.findByRole('checkbox', { name: 'alice' })).toBeInTheDocument();
+    client.clear();
   });
 });
