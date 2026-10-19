@@ -1,16 +1,21 @@
 import { type QueryClient, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
-import type { AdminUser } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
+import { useEffect, useState } from 'react';
+import { type AdminUser, MAX_MAILBOX_GRANTEES } from '@hpc-mail/shared';
+import { ApiError, isRejectedRequest } from '@/api/errors';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { adminApi, mailboxApi } from '@/api/resources';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
-import { DialogBody, DialogFooter, DialogHeader } from '@/components/ui/dialog';
+import { DialogBody, DialogFooter } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 
-/** 一次最多选多少人，与后端每只邮箱的共享名单上限一致 */
-const MAX_SHARE_USERS = 100;
+/** 共享步骤的对话框标题与说明，由所在弹窗的标题栏显示 */
+export const batchShareTitle = (count: number) => `把刚认领的 ${count} 个邮箱共享给…`;
+export const BATCH_SHARE_DESCRIPTION =
+  '成员可只读查看这些邮箱的全部未删除来信、验证码及附件，已读状态仍由你管理；共享不授予发信、删除权限，也不触发成员通知。';
+
+/** 候选：启用中的用户，排除自己 */
+const isCandidate = (user: AdminUser, currentUserId: number) => user.status === 'active' && user.id !== currentUserId;
 
 /** 共享名单变化只影响这两处缓存，不涉及邮件、未读与归属 */
 function invalidateShares(client: QueryClient) {
@@ -24,8 +29,7 @@ function invalidateShares(client: QueryClient) {
  */
 function failureText(error: unknown): { message: string; uncertain: boolean } {
   const message = error instanceof ApiError ? error.message : '共享失败，请重试';
-  const rejected = error instanceof ApiError && error.httpStatus !== null && error.httpStatus >= 400 && error.httpStatus < 500;
-  return rejected ? { message, uncertain: false } : { message: `${message}。共享可能已生效，请以共享名单为准`, uncertain: true };
+  return isRejectedRequest(error) ? { message, uncertain: false } : { message: `${message}。共享可能已生效，请以共享名单为准`, uncertain: true };
 }
 
 export interface BatchSharePanelProps {
@@ -42,7 +46,7 @@ export interface BatchSharePanelProps {
 
 /**
  * 管理员把一批自己的邮箱一次共享给选中的用户：追加到各邮箱名单，不移除已有成员。
- * 渲染为对话框的标题、正文与底栏，由所在弹窗切换步骤，不再叠一层对话框。
+ * 渲染为对话框的正文与底栏，标题由所在弹窗切换，不再叠一层对话框。
  */
 export function BatchSharePanel({ mailboxIds, currentUserId, onBack, onShared, onPendingChange }: BatchSharePanelProps) {
   const queryClient = useQueryClient();
@@ -50,11 +54,17 @@ export function BatchSharePanel({ mailboxIds, currentUserId, onBack, onShared, o
   const [selected, setSelected] = useState<number[]>([]);
   const users = useQuery({ queryKey: queryKeys.admin.users, queryFn: () => adminApi.listUsers() });
 
-  // 只列启用中的用户、排除自己；名单刷新后失效的人随之移出已选
-  const candidates = (users.data ?? []).filter((user) => user.status === 'active' && user.id !== currentUserId);
+  const candidates = (users.data ?? []).filter((user) => isCandidate(user, currentUserId));
   const chosen = candidates.filter((user) => selected.includes(user.id));
   const term = userQuery.trim().toLowerCase();
   const visible = candidates.filter((user) => selected.includes(user.id) || user.username.toLowerCase().includes(term));
+
+  // 名单刷新后把已选裁剪到当前候选：被禁用而隐藏的人之后重新启用，也不会以已勾选状态悄悄带回来
+  useEffect(() => {
+    if (!users.data) return;
+    const ids = new Set(users.data.filter((user) => isCandidate(user, currentUserId)).map((user) => user.id));
+    setSelected((prev) => (prev.every((id) => ids.has(id)) ? prev : prev.filter((id) => ids.has(id))));
+  }, [users.data, currentUserId]);
 
   const share = useMutation({
     mutationFn: (targets: AdminUser[]) => mailboxApi.batchShare({ mailboxIds, userIds: targets.map((user) => user.id) }),
@@ -83,10 +93,6 @@ export function BatchSharePanel({ mailboxIds, currentUserId, onBack, onShared, o
 
   return (
     <>
-      <DialogHeader
-        title={`把刚认领的 ${mailboxIds.length} 个邮箱共享给…`}
-        description="成员可只读查看这些邮箱的全部来信、验证码及附件，已读状态仍由你管理；共享不授予发信、删除权限，也不触发成员通知。"
-      />
       <DialogBody className="flex flex-col gap-3">
         <Input
           aria-label="搜索共享用户"
@@ -97,8 +103,9 @@ export function BatchSharePanel({ mailboxIds, currentUserId, onBack, onShared, o
           onChange={(event) => setUserQuery(event.target.value)}
           placeholder="搜索用户名"
         />
+        {users.isPaused && <p className="text-xs text-caution">当前处于离线状态，恢复网络后会自动加载用户列表。</p>}
         <div className="max-h-64 overflow-y-auto rounded-md border border-line">
-          {users.isLoading ? (
+          {users.isPending ? (
             <p className="px-3 py-4 text-sm text-ink-tertiary">正在加载用户…</p>
           ) : users.isError ? (
             <QueryErrorState error={users.error} onRetry={() => void users.refetch()} />
@@ -113,7 +120,7 @@ export function BatchSharePanel({ mailboxIds, currentUserId, onBack, onShared, o
                 <input
                   type="checkbox"
                   className="size-4 accent-accent"
-                  disabled={pending || (!selected.includes(user.id) && chosen.length >= MAX_SHARE_USERS)}
+                  disabled={pending || (!selected.includes(user.id) && chosen.length >= MAX_MAILBOX_GRANTEES)}
                   checked={selected.includes(user.id)}
                   onChange={() => toggle(user.id)}
                 />
@@ -122,7 +129,7 @@ export function BatchSharePanel({ mailboxIds, currentUserId, onBack, onShared, o
             ))
           )}
         </div>
-        <p className="text-xs text-ink-tertiary">已选 {chosen.length}/{MAX_SHARE_USERS} 人，已有的共享成员会保留。</p>
+        <p className="text-xs text-ink-tertiary">已选 {chosen.length}/{MAX_MAILBOX_GRANTEES} 人，已有的共享成员会保留。</p>
         {share.isError && (
           <p role="alert" className="text-sm text-critical">
             {failureText(share.error).message}

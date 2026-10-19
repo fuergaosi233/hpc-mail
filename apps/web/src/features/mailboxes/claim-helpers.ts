@@ -6,7 +6,7 @@ import {
   type MailboxUnavailableReason,
   MAX_BATCH_CLAIM,
 } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
+import { ApiError, isRejectedRequest } from '@/api/errors';
 
 /** 去掉易混字符（0/o、1/l/i）的小写字母表，读出来、抄下来都不容易错 */
 const LETTERS = 'abcdefghjkmnpqrstuvwxyz';
@@ -77,10 +77,11 @@ export function randomAddresses(
   return drafts;
 }
 
+/** 认领成功的邮箱：地址用于展示与复制，id 用于后续共享 */
+export type ClaimedMailbox = Pick<Mailbox, 'id' | 'address'>;
+
 export interface ClaimListResult {
-  claimed: string[];
-  /** 认领成功的邮箱 id，与 claimed 同顺序一一对应；仅单个认领未拿到返回体时为空 */
-  claimedIds: number[];
+  claimed: ClaimedMailbox[];
   /** 没能认领的地址（被占用的 + 因中途停止而没试的），保持用户给出的顺序 */
   remaining: AddressDraft[];
   /** 中途因配额、权限、网络等停止时的原因；仅「被占用」导致的未认领不算 */
@@ -97,9 +98,8 @@ const failureText = (error: unknown) => (error instanceof ApiError ? error.messa
  * 网络中断、超时或服务端异常时结果未知，后端可能已经提交，标为 uncertain 让调用方以邮箱列表为准。
  */
 function claimFailure(items: AddressDraft[], error: unknown, hint: string): ClaimListResult {
-  const rejected = error instanceof ApiError && error.httpStatus !== null && error.httpStatus >= 400 && error.httpStatus < 500;
-  if (rejected) return { claimed: [], claimedIds: [], remaining: items, stoppedBy: failureText(error) };
-  return { claimed: [], claimedIds: [], remaining: items, stoppedBy: `${failureText(error)}。${hint}`, uncertain: true };
+  if (isRejectedRequest(error)) return { claimed: [], remaining: items, stoppedBy: failureText(error) };
+  return { claimed: [], remaining: items, stoppedBy: `${failureText(error)}。${hint}`, uncertain: true };
 }
 
 /**
@@ -113,8 +113,7 @@ export function fromBatchResult(drafts: AddressDraft[], result: BatchClaimMailbo
     .map(({ localPart, domain }) => ({ localPart, domain }))
     .sort((a, b) => position(a) - position(b));
   return {
-    claimed: result.claimed.map((mailbox) => mailbox.address),
-    claimedIds: result.claimed.map((mailbox) => mailbox.id),
+    claimed: result.claimed.map(({ id, address }) => ({ id, address })),
     remaining,
     stoppedBy: result.stoppedBy?.message ?? null,
     ...(result.stoppedBy?.code === 'internal' ? { uncertain: true as const } : {}),
@@ -129,7 +128,7 @@ export function fromBatchResult(drafts: AddressDraft[], result: BatchClaimMailbo
 export async function claimList(
   drafts: AddressDraft[],
   api: {
-    claim: (body: ClaimMailboxRequest) => Promise<Pick<Mailbox, 'id' | 'address'> | undefined>;
+    claim: (body: ClaimMailboxRequest) => Promise<ClaimedMailbox>;
     batchClaim: (items: ClaimMailboxRequest[]) => Promise<BatchClaimMailboxResult>;
   },
 ): Promise<ClaimListResult> {
@@ -137,17 +136,10 @@ export async function claimList(
   if (items.length === 1) {
     const draft = items[0]!;
     try {
-      const created = await api.claim(draft);
-      return {
-        claimed: [created?.address ?? draftKey(draft)],
-        claimedIds: created ? [created.id] : [],
-        remaining: [],
-        stoppedBy: null,
-      };
+      const { id, address } = await api.claim(draft);
+      return { claimed: [{ id, address }], remaining: [], stoppedBy: null };
     } catch (error) {
-      if (error instanceof ApiError && error.code === 'address_taken') {
-        return { claimed: [], claimedIds: [], remaining: [draft], stoppedBy: null };
-      }
+      if (error instanceof ApiError && error.code === 'address_taken') return { claimed: [], remaining: [draft], stoppedBy: null };
       return claimFailure([draft], error, '该地址可能已认领，请以邮箱列表为准');
     }
   }
@@ -180,8 +172,7 @@ export function createAvailabilityLoader(
 
   const request = async (items: ClaimMailboxRequest[]) =>
     items.length === 1 ? [await api.one(items[0]!)] : api.many(items);
-  const retryable = (error: unknown) =>
-    !(error instanceof ApiError && error.httpStatus !== null && error.httpStatus >= 400 && error.httpStatus < 500);
+  const retryable = (error: unknown) => !isRejectedRequest(error);
 
   const run = async (batch: Pending[]) => {
     const items = batch.map((pending) => pending.item);

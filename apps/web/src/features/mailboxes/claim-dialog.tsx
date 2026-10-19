@@ -1,6 +1,6 @@
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { Check, Share2, Shuffle, X } from 'lucide-react';
-import { type FormEvent, useContext, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { type FormEvent, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { type ClaimPlan, type ClaimPlanStrategy, claimMailboxRequestSchema, localPartSchema, MAX_BATCH_CLAIM } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
@@ -16,8 +16,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Spinner } from '@/components/ui/spinner';
 import { toast } from '@/components/ui/toast';
 import { cn } from '@/lib/cn';
-import { CurrentUserContext } from '@/lib/use-session';
-import { BatchSharePanel } from './batch-share-panel';
+import { useCurrentUser } from '@/lib/use-session';
+import { BATCH_SHARE_DESCRIPTION, BatchSharePanel, batchShareTitle } from './batch-share-panel';
 import {
   type AddressDraft,
   claimList,
@@ -120,8 +120,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   /** 回到结果页后把焦点还给「共享给…」，否则落在对话框容器上 */
   const shareButton = useRef<HTMLButtonElement>(null);
   const refocusShare = useRef(false);
-  /** 可空读取：没有当前用户上下文（如单测直接渲染）时按普通用户处理 */
-  const currentUser = useContext(CurrentUserContext);
+  const currentUser = useCurrentUser();
   const count = parseBatchCount(countText);
   /** 同一轮发起的可用性查询（随机生成一批）合成一次批量请求 */
   const [checkAvailability] = useState(() =>
@@ -319,7 +318,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       return;
     }
     if (rows.length === 1) {
-      announceClaimed(outcome.claimed[0]!);
+      announceClaimed(outcome.claimed[0]!.address);
       close();
       return;
     }
@@ -338,7 +337,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   };
 
   const copyAll = () =>
-    void writeClipboard(result?.claimed.join('\n') ?? '').then((ok) =>
+    void writeClipboard(result?.claimed.map((mailbox) => mailbox.address).join('\n') ?? '').then((ok) =>
       toast(ok ? { title: '已复制全部地址', variant: 'success' } : { title: '复制失败，请手动选择', variant: 'error' }),
     );
 
@@ -349,8 +348,8 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const riskyCount = rows.filter((row) => suspendedOf(row.domain) > 0).length;
   const planShortfall = plan ? shortfallText(plan) : null;
   const busy = claiming || planning;
-  /** 管理员认领多个后，可把认领成功的这批邮箱一键共享给其他人 */
-  const canShare = currentUser?.role === 'admin' && (result?.claimedIds.length ?? 0) > 0;
+  /** 管理员认领多个后，可把认领成功的这批邮箱一键共享给其他人（结果页只在认领成功后出现） */
+  const canShare = currentUser.role === 'admin' && result !== null;
   const leaveShare = () => {
     refocusShare.current = true;
     setSharing(false);
@@ -360,20 +359,13 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
     refocusShare.current = false;
     shareButton.current?.focus();
   }, [sharing]);
-  /** 共享步骤在同一个弹窗内切换，不再叠一层对话框 */
-  const sharePanel =
-    sharing && canShare && result && currentUser ? (
-      <BatchSharePanel
-        mailboxIds={result.claimedIds}
-        currentUserId={currentUser.id}
-        onBack={leaveShare}
-        onShared={(names) => {
-          setSharedWith((prev) => [...new Set([...prev, ...names])]);
-          leaveShare();
-        }}
-        onPendingChange={setSharePending}
-      />
-    ) : null;
+  const header =
+    sharing && result
+      ? { title: batchShareTitle(result.claimed.length), description: BATCH_SHARE_DESCRIPTION }
+      : {
+          title: '认领邮箱地址',
+          description: result ? '新认领的地址已加入「我的邮箱」。' : '认领后即可收发该地址的邮件，并可见其全部历史邮件。',
+        };
 
   return (
     <Dialog
@@ -381,7 +373,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       onOpenChange={(next) => {
         // 认领或共享进行中不允许关闭，否则结果无处可看
         if (!next && (claiming || sharePending)) return;
-        // 共享步骤里按 Esc、点 X 或遮罩只回到结果页，不丢掉这批认领结果
+        // 共享步骤里按 Esc 或点遮罩只回到结果页，不丢掉这批认领结果
         if (!next && sharing) {
           leaveShare();
           return;
@@ -390,32 +382,33 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
         if (!next) reset();
       }}
     >
-      <DialogContent className="max-w-lg">
-        {!sharePanel && (
-          <DialogHeader
-            title="认领邮箱地址"
-            description={result ? '新认领的地址已加入「我的邮箱」。' : '认领后即可收发该地址的邮件，并可见其全部历史邮件。'}
-          />
-        )}
-        {sharePanel ?? (result ? (
+      <DialogContent className="max-w-lg" showClose={!sharing}>
+        <DialogHeader {...header} />
+        {result ? (
           <>
-            <DialogBody className="flex flex-col gap-3">
+            {/* 共享结果的播报区放在两个步骤之外、始终挂载，名单更新时读屏才能可靠播报 */}
+            <p
+              role="status"
+              className={cn(
+                'break-words border-b border-line bg-canvas px-6 py-2 text-sm text-ink-secondary',
+                sharedWith.length === 0 && 'sr-only',
+              )}
+            >
+              {sharedWith.length > 0 && `已共享给：${sharedWith.join('、')}`}
+            </p>
+            {/* 共享步骤期间结果页只隐藏不卸载：回来时不重建，提示不会被重复播报 */}
+            <DialogBody hidden={sharing} className="flex flex-col gap-3">
               <p role="status" className="text-sm text-ink">
                 已认领 {result.claimed.length} 个地址
                 {result.remaining.length > 0 && `，还有 ${result.remaining.length} 个未认领`}
               </p>
               <ul className="max-h-60 divide-y divide-line overflow-y-auto rounded-lg border border-line bg-surface">
-                {result.claimed.map((address) => (
-                  <li key={address} className="break-all px-3 py-2 text-sm text-ink">
-                    {address}
+                {result.claimed.map((mailbox) => (
+                  <li key={mailbox.id} className="break-all px-3 py-2 text-sm text-ink">
+                    {mailbox.address}
                   </li>
                 ))}
               </ul>
-              {sharedWith.length > 0 && (
-                <p role="status" className="break-words text-sm text-ink-secondary">
-                  已共享给：{sharedWith.join('、')}
-                </p>
-              )}
               {result.remaining.length > 0 && (
                 <p role="alert" className="text-sm text-critical">
                   {result.stoppedBy
@@ -424,7 +417,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                 </p>
               )}
             </DialogBody>
-            <DialogFooter className="flex-wrap">
+            <DialogFooter hidden={sharing} className="flex-wrap">
               <Button type="button" variant="secondary" onClick={copyAll}>
                 复制全部地址
               </Button>
@@ -443,6 +436,18 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                 完成
               </Button>
             </DialogFooter>
+            {sharing && (
+              <BatchSharePanel
+                mailboxIds={result.claimed.map((mailbox) => mailbox.id)}
+                currentUserId={currentUser.id}
+                onBack={leaveShare}
+                onShared={(names) => {
+                  setSharedWith((prev) => [...new Set([...prev, ...names])]);
+                  leaveShare();
+                }}
+                onPendingChange={setSharePending}
+              />
+            )}
           </>
         ) : (
           <form onSubmit={(event) => void handleSubmit(event)}>
@@ -620,7 +625,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
               </Button>
             </DialogFooter>
           </form>
-        ))}
+        )}
       </DialogContent>
     </Dialog>
   );
