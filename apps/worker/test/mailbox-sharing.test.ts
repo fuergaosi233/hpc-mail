@@ -329,18 +329,29 @@ describe('所有者批量共享多只邮箱', () => {
     expect(probe.trips()).toBe(0);
   });
 
-  it('被分享人用户行缺失的共享在 GET 名单与批量返回中都不展示', async () => {
-    const f = await fixture();
+  /** 被分享人用户行已不存在的共享（残留数据） */
+  async function orphanShare(f: Awaited<ReturnType<typeof fixture>>) {
     await env.db.prepare('INSERT INTO mailbox_shares (mailbox_id, user_id, granted_by) VALUES (?, ?, ?)')
       .bind(f.box.id, 999999999, f.owner.id).run();
+  }
+
+  it('被分享人用户行缺失的共享不出现在 GET 名单中', async () => {
+    const f = await fixture();
+    await replaceMailboxShares(env, f.owner.id, f.box.id, [f.member.id]);
+    await orphanShare(f);
     const owned = await data<MailboxShareGrant[]>(await request('/mailboxes/shares', f.owner.jwt));
-    expect(owned.find((grant) => grant.mailboxId === f.box.id)!.grantees).toEqual([]);
+    const admin = await data<MailboxShareGrant[]>(await request(`/admin/mailbox-shares?mailboxId=${f.box.id}`, f.admin.jwt));
+    expect(owned.find((grant) => grant.mailboxId === f.box.id)!.grantees.map((grantee) => grantee.userId)).toEqual([f.member.id]);
+    expect(admin).toEqual(owned.filter((grant) => grant.mailboxId === f.box.id));
+  });
+
+  it('被分享人用户行缺失的共享不出现在批量共享的返回中', async () => {
+    const f = await fixture();
+    await orphanShare(f);
     const grants = await data<MailboxShareGrant[]>(await request('/mailboxes/shares/batch', f.owner.jwt, 'POST', {
       mailboxIds: [f.box.id], userIds: [f.member.id],
     }));
     expect(grants[0]!.grantees.map((grantee) => grantee.userId)).toEqual([f.member.id]);
-    const admin = await data<MailboxShareGrant[]>(await request(`/admin/mailbox-shares?mailboxId=${f.box.id}`, f.admin.jwt));
-    expect(admin).toEqual(grants);
   });
 
   it('追加后任一邮箱超过 100 人返回 400，已在名单的用户不重复计数', async () => {
