@@ -322,6 +322,36 @@ describe('所有者批量共享多只邮箱', () => {
       expect((await request('/mailboxes/shares/batch', f.owner.jwt, 'POST', body)).status).toBe(400);
     }
     expect(await shareRows(...mailboxIds)).toEqual([]);
+    // 含自己在任何 D1 往返之前就拒绝
+    const probe = counting();
+    await expect(shareMailboxes(probe.env, f.owner.id, mailboxIds, [f.member.id, f.owner.id]))
+      .rejects.toMatchObject({ code: 'validation_failed', message: '邮箱所有者已经拥有访问权限，无需共享' });
+    expect(probe.trips()).toBe(0);
+  });
+
+  /** 被分享人用户行已不存在的共享（残留数据） */
+  async function orphanShare(f: Awaited<ReturnType<typeof fixture>>) {
+    await env.db.prepare('INSERT INTO mailbox_shares (mailbox_id, user_id, granted_by) VALUES (?, ?, ?)')
+      .bind(f.box.id, 999999999, f.owner.id).run();
+  }
+
+  it('被分享人用户行缺失的共享不出现在 GET 名单中', async () => {
+    const f = await fixture();
+    await replaceMailboxShares(env, f.owner.id, f.box.id, [f.member.id]);
+    await orphanShare(f);
+    const owned = await data<MailboxShareGrant[]>(await request('/mailboxes/shares', f.owner.jwt));
+    const admin = await data<MailboxShareGrant[]>(await request(`/admin/mailbox-shares?mailboxId=${f.box.id}`, f.admin.jwt));
+    expect(owned.find((grant) => grant.mailboxId === f.box.id)!.grantees.map((grantee) => grantee.userId)).toEqual([f.member.id]);
+    expect(admin).toEqual(owned.filter((grant) => grant.mailboxId === f.box.id));
+  });
+
+  it('被分享人用户行缺失的共享不出现在批量共享的返回中', async () => {
+    const f = await fixture();
+    await orphanShare(f);
+    const grants = await data<MailboxShareGrant[]>(await request('/mailboxes/shares/batch', f.owner.jwt, 'POST', {
+      mailboxIds: [f.box.id], userIds: [f.member.id],
+    }));
+    expect(grants[0]!.grantees.map((grantee) => grantee.userId)).toEqual([f.member.id]);
   });
 
   it('追加后任一邮箱超过 100 人返回 400，已在名单的用户不重复计数', async () => {
@@ -343,11 +373,12 @@ describe('所有者批量共享多只邮箱', () => {
     expect(await shareRows(f.box.id)).toHaveLength(100);
   });
 
-  it('校验后到写入前被过户、释放、禁用或名单被并发填满时返回 409，所有邮箱都不留部分共享', async () => {
+  it('校验后到写入前被过户、释放、禁用、删除用户或名单被并发填满时返回 409，所有邮箱都不留部分共享', async () => {
     const races: Array<[string, (f: Awaited<ReturnType<typeof fixture>>, boxes: { id: number }[]) => Promise<void>]> = [
       ['过户', async (f, [, last]) => { await db.update(mailboxes).set({ userId: f.stranger.id }).where(eq(mailboxes.id, last!.id)); }],
       ['释放', async (_, [, last]) => { await db.delete(mailboxes).where(eq(mailboxes.id, last!.id)); }],
       ['禁用', async (f) => { await db.update(users).set({ status: 'disabled' }).where(eq(users.id, f.member.id)); }],
+      ['删除用户', async (f) => { await db.delete(users).where(eq(users.id, f.member.id)); }],
       ['名单已满', async (f, [, last]) => {
         await env.db.prepare(`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 100)
           INSERT INTO mailbox_shares (mailbox_id, user_id, granted_by) SELECT ?, 1000000 + n, ? FROM seq`)
