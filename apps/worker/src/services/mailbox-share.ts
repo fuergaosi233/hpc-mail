@@ -23,19 +23,10 @@ const owners = alias(users, 'owners');
 
 /**
  * 自有或全站已认领邮箱，附带所有者与共享名单（含尚未分享的）。
- * 一条 JOIN 查询：邮箱按地址、共享按被分享人用户名排序；mailboxId 只取该邮箱（0 或 1 项），数组只取这些邮箱。
+ * 一条 JOIN 查询：邮箱按地址、共享按被分享人用户名排序；mailboxId 只取该邮箱（0 或 1 项）。
  */
-export async function listMailboxShares(
-  env: Env,
-  actorId: number,
-  all = false,
-  mailboxId?: number | readonly number[],
-): Promise<MailboxShareGrant[]> {
+export async function listMailboxShares(env: Env, actorId: number, all = false, mailboxId?: number): Promise<MailboxShareGrant[]> {
   const db = createDb(env);
-  // 多个 id 以一个 JSON 参数传入，不受 D1 每条 100 个绑定参数的限制
-  const boxFilter = mailboxId === undefined ? undefined
-    : typeof mailboxId === 'number' ? eq(mailboxes.id, mailboxId)
-      : sql`${mailboxes.id} IN (SELECT value FROM json_each(${JSON.stringify(mailboxId)}))`;
   const rows = await db
     .select({
       box: mailboxes,
@@ -49,7 +40,7 @@ export async function listMailboxShares(
     .innerJoin(owners, eq(owners.id, mailboxes.userId))
     .leftJoin(mailboxShares, eq(mailboxShares.mailboxId, mailboxes.id))
     .leftJoin(users, eq(users.id, mailboxShares.userId))
-    .where(and(all ? undefined : eq(mailboxes.userId, actorId), boxFilter))
+    .where(and(all ? undefined : eq(mailboxes.userId, actorId), mailboxId === undefined ? undefined : eq(mailboxes.id, mailboxId)))
     .orderBy(asc(mailboxes.address), asc(users.username))
     .all();
 
@@ -158,10 +149,23 @@ export async function replaceMailboxShares(
   };
 }
 
+interface ShareGrantRow {
+  mailbox_id: number;
+  address: string;
+  domain: string;
+  display_name: string;
+  owner_user_id: number;
+  owner_username: string;
+  grantee_id: number | null;
+  grantee_username: string | null;
+  grantee_status: 'active' | 'disabled' | null;
+  granted_at: number | null;
+}
+
 /**
  * 所有者把自己的多只邮箱一次共享给同一批用户：追加到各自名单，已有成员保留原授权时间，不移除任何人。
- * 校验读取合成一个 batch；写入在同一事务内复核归属、被分享人状态与人数上限，任一失败整单回滚。
- * 返回各邮箱更新后的完整名单，顺序同去重后的 mailboxIds。
+ * 两次往返：校验读取一个 batch；写入与读回同一个 batch（同一事务），写入内复核归属、被分享人状态与人数上限，
+ * 任一失败整单回滚，提交后不再失败。返回各邮箱更新后的完整名单，顺序同去重后的 mailboxIds。
  */
 export async function shareMailboxes(
   env: Env,
@@ -171,6 +175,10 @@ export async function shareMailboxes(
 ): Promise<MailboxShareGrant[]> {
   const boxIds = [...new Set(mailboxIds)];
   const granteeIds = [...new Set(userIds)];
+  // 写入靠逐对复核归属，至少要有一对
+  if (boxIds.length === 0 || granteeIds.length === 0) {
+    throw new AppError('validation_failed', '至少选择一只邮箱和一个用户');
+  }
   // id 数组以 JSON 参数传入：语句数与绑定参数不随邮箱数 × 用户数膨胀
   const boxJson = JSON.stringify(boxIds);
   const granteeJson = JSON.stringify(granteeIds);
@@ -200,8 +208,9 @@ export async function shareMailboxes(
     throw new AppError('validation_failed', `每只邮箱最多共享给 ${MAX_GRANTEES} 个用户`);
   }
 
+  let rows: ShareGrantRow[];
   try {
-    await env.db.batch([
+    const results = await env.db.batch([
       // 归属或被分享人状态已变时写入 NULL，触发 NOT NULL 使整批回滚；
       // 不用 OR IGNORE（会吞掉 NOT NULL 失败），已有共享只按主键冲突跳过。INSERT ... SELECT 需带 WHERE 才能接 ON CONFLICT
       env.db.prepare(`INSERT INTO mailbox_shares (mailbox_id, user_id, granted_by)
@@ -215,7 +224,18 @@ export async function shareMailboxes(
       env.db.prepare(`INSERT INTO mailbox_shares (mailbox_id, user_id, granted_by)
         SELECT mailbox_id, 0, NULL FROM mailbox_shares
         WHERE mailbox_id IN (SELECT value FROM json_each(?)) GROUP BY mailbox_id HAVING COUNT(*) > ?`).bind(boxJson, MAX_GRANTEES),
+      // 同一事务读回：上面的写入已逐只确认归属，这里看到的就是本次提交后的名单。列起别名，避免 JOIN 同名列互相覆盖
+      env.db.prepare(`SELECT m.id AS mailbox_id, m.address, m.domain, m.display_name, m.user_id AS owner_user_id,
+          o.username AS owner_username, s.user_id AS grantee_id, u.username AS grantee_username,
+          u.status AS grantee_status, s.created_at AS granted_at
+        FROM mailboxes m
+        JOIN users o ON o.id = m.user_id
+        LEFT JOIN mailbox_shares s ON s.mailbox_id = m.id
+        LEFT JOIN users u ON u.id = s.user_id
+        WHERE m.id IN (SELECT value FROM json_each(?))
+        ORDER BY u.username`).bind(boxJson),
     ]);
+    rows = (results[2]?.results ?? []) as ShareGrantRow[];
   } catch (error) {
     if (String(error).includes('NOT NULL constraint failed: mailbox_shares.user_id')) {
       throw new AppError('conflict', '邮箱所有者或共享用户状态已改变，请刷新后重试');
@@ -226,13 +246,31 @@ export async function shareMailboxes(
     throw error;
   }
 
-  const grants = new Map((await listMailboxShares(env, ownerId, false, boxIds)).map((grant) => [grant.mailboxId, grant]));
-  return boxIds.map((id) => {
-    const grant = grants.get(id);
-    // 写入后到读回前被过户或释放
-    if (!grant) throw new AppError('conflict', '邮箱所有者已改变，请刷新后重试');
-    return grant;
-  });
+  const grants = new Map<number, MailboxShareGrant>();
+  for (const row of rows) {
+    let grant = grants.get(row.mailbox_id);
+    if (!grant) {
+      grant = {
+        mailboxId: row.mailbox_id,
+        address: row.address,
+        domain: row.domain,
+        displayName: row.display_name,
+        ownerUserId: row.owner_user_id,
+        ownerUsername: row.owner_username,
+        grantees: [],
+      };
+      grants.set(row.mailbox_id, grant);
+    }
+    // 与 listMailboxShares 一致：被分享人用户行缺失的共享不展示
+    if (row.grantee_id === null || row.grantee_username === null || row.grantee_status === null || row.granted_at === null) continue;
+    grant.grantees.push({
+      userId: row.grantee_id,
+      username: row.grantee_username,
+      status: row.grantee_status,
+      grantedAt: new Date(row.granted_at).toISOString(),
+    });
+  }
+  return boxIds.flatMap((id) => grants.get(id) ?? []);
 }
 
 export async function revokeMailboxShare(
