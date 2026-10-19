@@ -1,6 +1,6 @@
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { Check, Share2, Shuffle, X } from 'lucide-react';
-import { type FormEvent, useContext, useEffect, useId, useRef, useState } from 'react';
+import { type FormEvent, useContext, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { type ClaimPlan, type ClaimPlanStrategy, claimMailboxRequestSchema, localPartSchema, MAX_BATCH_CLAIM } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
@@ -17,7 +17,7 @@ import { Spinner } from '@/components/ui/spinner';
 import { toast } from '@/components/ui/toast';
 import { cn } from '@/lib/cn';
 import { CurrentUserContext } from '@/lib/use-session';
-import { BatchSharePanel, useBatchSharePending } from './batch-share-panel';
+import { BatchSharePanel } from './batch-share-panel';
 import {
   type AddressDraft,
   claimList,
@@ -116,8 +116,11 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   /** 结果页切到「共享」步骤，及这批邮箱已共享给的用户名 */
   const [sharing, setSharing] = useState(false);
   const [sharedWith, setSharedWith] = useState<string[]>([]);
-  const sharePending = useBatchSharePending();
-  /** 认领弹窗也可能在已认证外壳外渲染：可空读取，读不到按普通用户处理 */
+  const [sharePending, setSharePending] = useState(false);
+  /** 回到结果页后把焦点还给「共享给…」，否则落在对话框容器上 */
+  const shareButton = useRef<HTMLButtonElement>(null);
+  const refocusShare = useRef(false);
+  /** 可空读取：没有当前用户上下文（如单测直接渲染）时按普通用户处理 */
   const currentUser = useContext(CurrentUserContext);
   const count = parseBatchCount(countText);
   /** 同一轮发起的可用性查询（随机生成一批）合成一次批量请求 */
@@ -200,6 +203,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
     setResult(null);
     setSharing(false);
     setSharedWith([]);
+    setSharePending(false);
   }
 
   function close() {
@@ -347,17 +351,27 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const busy = claiming || planning;
   /** 管理员认领多个后，可把认领成功的这批邮箱一键共享给其他人 */
   const canShare = currentUser?.role === 'admin' && (result?.claimedIds.length ?? 0) > 0;
+  const leaveShare = () => {
+    refocusShare.current = true;
+    setSharing(false);
+  };
+  useLayoutEffect(() => {
+    if (sharing || !refocusShare.current) return;
+    refocusShare.current = false;
+    shareButton.current?.focus();
+  }, [sharing]);
   /** 共享步骤在同一个弹窗内切换，不再叠一层对话框 */
   const sharePanel =
     sharing && canShare && result && currentUser ? (
       <BatchSharePanel
         mailboxIds={result.claimedIds}
         currentUserId={currentUser.id}
-        onBack={() => setSharing(false)}
+        onBack={leaveShare}
         onShared={(names) => {
           setSharedWith((prev) => [...new Set([...prev, ...names])]);
-          setSharing(false);
+          leaveShare();
         }}
+        onPendingChange={setSharePending}
       />
     ) : null;
 
@@ -367,6 +381,11 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       onOpenChange={(next) => {
         // 认领或共享进行中不允许关闭，否则结果无处可看
         if (!next && (claiming || sharePending)) return;
+        // 共享步骤里按 Esc、点 X 或遮罩只回到结果页，不丢掉这批认领结果
+        if (!next && sharing) {
+          leaveShare();
+          return;
+        }
         onOpenChange(next);
         if (!next) reset();
       }}
@@ -393,7 +412,9 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                 ))}
               </ul>
               {sharedWith.length > 0 && (
-                <p className="break-words text-sm text-ink-secondary">已共享给：{sharedWith.join('、')}</p>
+                <p role="status" className="break-words text-sm text-ink-secondary">
+                  已共享给：{sharedWith.join('、')}
+                </p>
               )}
               {result.remaining.length > 0 && (
                 <p role="alert" className="text-sm text-critical">
@@ -413,7 +434,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                 </Button>
               )}
               {canShare && (
-                <Button type="button" variant="secondary" onClick={() => setSharing(true)}>
+                <Button ref={shareButton} type="button" variant="secondary" onClick={() => setSharing(true)}>
                   <Share2 className="size-4" />
                   共享给…
                 </Button>

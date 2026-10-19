@@ -1,4 +1,4 @@
-import { useIsMutating, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { type QueryClient, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import type { AdminUser } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
@@ -8,18 +8,24 @@ import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
 import { DialogBody, DialogFooter, DialogHeader } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
-import { toast } from '@/components/ui/toast';
 
 /** 一次最多选多少人，与后端每只邮箱的共享名单上限一致 */
 const MAX_SHARE_USERS = 100;
-const BATCH_SHARE_MUTATION = ['mailboxes', 'shares', 'batch'] as const;
 
-/** 批量共享请求进行中：所在弹窗据此禁止关闭 */
-export const useBatchSharePending = () => useIsMutating({ mutationKey: BATCH_SHARE_MUTATION }) > 0;
+/** 共享名单变化只影响这两处缓存，不涉及邮件、未读与归属 */
+function invalidateShares(client: QueryClient) {
+  void client.invalidateQueries({ queryKey: queryKeys.mailboxes.shares });
+  void client.invalidateQueries({ queryKey: queryKeys.admin.mailboxShares });
+}
 
-/** toast 标题里名单太长时只列前几位 */
-function nameSummary(names: string[]): string {
-  return names.length <= 3 ? names.join('、') : `${names.slice(0, 3).join('、')} 等 ${names.length} 人`;
+/**
+ * 失败文案：4xx 是请求被拒绝、整单未写入；网络中断、超时或服务端异常时结果未知，
+ * 后端可能已经提交，提示以共享名单为准（与认领的 uncertain 处理一致）。
+ */
+function failureText(error: unknown): { message: string; uncertain: boolean } {
+  const message = error instanceof ApiError ? error.message : '共享失败，请重试';
+  const rejected = error instanceof ApiError && error.httpStatus !== null && error.httpStatus >= 400 && error.httpStatus < 500;
+  return rejected ? { message, uncertain: false } : { message: `${message}。共享可能已生效，请以共享名单为准`, uncertain: true };
 }
 
 export interface BatchSharePanelProps {
@@ -30,13 +36,15 @@ export interface BatchSharePanelProps {
   onBack: () => void;
   /** 共享成功，带回这次共享的用户名 */
   onShared: (usernames: string[]) => void;
+  /** 提交开始与结束时通知所在弹窗，进行中不允许关闭或返回 */
+  onPendingChange: (pending: boolean) => void;
 }
 
 /**
  * 管理员把一批自己的邮箱一次共享给选中的用户：追加到各邮箱名单，不移除已有成员。
  * 渲染为对话框的标题、正文与底栏，由所在弹窗切换步骤，不再叠一层对话框。
  */
-export function BatchSharePanel({ mailboxIds, currentUserId, onBack, onShared }: BatchSharePanelProps) {
+export function BatchSharePanel({ mailboxIds, currentUserId, onBack, onShared, onPendingChange }: BatchSharePanelProps) {
   const queryClient = useQueryClient();
   const [userQuery, setUserQuery] = useState('');
   const [selected, setSelected] = useState<number[]>([]);
@@ -49,17 +57,23 @@ export function BatchSharePanel({ mailboxIds, currentUserId, onBack, onShared }:
   const visible = candidates.filter((user) => selected.includes(user.id) || user.username.toLowerCase().includes(term));
 
   const share = useMutation({
-    mutationKey: BATCH_SHARE_MUTATION,
     mutationFn: (targets: AdminUser[]) => mailboxApi.batchShare({ mailboxIds, userIds: targets.map((user) => user.id) }),
+    // 离线时与认领一样直接发出、快速失败，不进入暂停的「进行中」把弹窗卡住
+    networkMode: 'always',
+    onMutate: () => onPendingChange(true),
+    onSettled: () => onPendingChange(false),
+    // 结果页会显示「已共享给」，不再弹 toast：点 toast 会被当成点击弹窗外部
     onSuccess: (_grants, targets) => {
-      const names = targets.map((user) => user.username);
-      toast({ title: `已将 ${mailboxIds.length} 个邮箱共享给 ${nameSummary(names)}`, variant: 'success' });
-      invalidateMailboxOwnership(queryClient);
-      onShared(names);
+      invalidateShares(queryClient);
+      onShared(targets.map((user) => user.username));
     },
     onError: (error) => {
+      if (failureText(error).uncertain) invalidateShares(queryClient);
+      if (!(error instanceof ApiError)) return;
       // 期间邮箱被过户、释放或用户被禁用，整单未写入：刷新归属与用户名单后可重选
-      if (error instanceof ApiError && error.code === 'conflict') invalidateMailboxOwnership(queryClient);
+      if (error.code === 'conflict') invalidateMailboxOwnership(queryClient);
+      // 选中的人刚被禁用等校验失败：刷新用户名单，失效的人随之移出已选，否则重试总是失败
+      else if (error.code === 'validation_failed') void queryClient.invalidateQueries({ queryKey: queryKeys.admin.users });
     },
   });
   const pending = share.isPending;
@@ -111,7 +125,7 @@ export function BatchSharePanel({ mailboxIds, currentUserId, onBack, onShared }:
         <p className="text-xs text-ink-tertiary">已选 {chosen.length}/{MAX_SHARE_USERS} 人，已有的共享成员会保留。</p>
         {share.isError && (
           <p role="alert" className="text-sm text-critical">
-            {share.error instanceof ApiError ? share.error.message : '共享失败，请重试'}
+            {failureText(share.error).message}
           </p>
         )}
       </DialogBody>

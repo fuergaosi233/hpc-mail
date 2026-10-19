@@ -1,4 +1,4 @@
-import { QueryClient, type QueryClientConfig, QueryClientProvider } from '@tanstack/react-query';
+import { onlineManager, QueryClient, type QueryClientConfig, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ClaimPlan, SessionUser } from '@hpc-mail/shared';
@@ -805,9 +805,15 @@ describe('随机后缀模式', () => {
 describe('管理员把认领结果一键共享给其他人', () => {
   const admin: SessionUser = { id: 1, username: 'root', role: 'admin', createdAt: '', avatarUrl: null, twoFactorEnabled: false };
   const member: SessionUser = { ...admin, id: 6, username: 'member', role: 'user' };
+  const SHARE_KEYS = [{ queryKey: ['mailboxes', 'shares'] }, { queryKey: ['admin', 'mailbox-shares'] }];
   const setCount = (value: string) => fireEvent.change(screen.getByLabelText('随机生成个数'), { target: { value } });
   const claimedAddresses = () => screen.getAllByRole('listitem').map((item) => item.textContent!);
   const userOptions = () => screen.getAllByRole('checkbox').map((box) => box.closest('label')!.textContent);
+  const shareStep = (count: number) => screen.queryByRole('dialog', { name: `把刚认领的 ${count} 个邮箱共享给…` });
+  const shareButton = () => screen.getByRole('button', { name: '共享给…' });
+  const submit = (count: number) => fireEvent.click(screen.getByRole('button', { name: `共享 ${count} 个邮箱` }));
+
+  afterEach(() => onlineManager.setOnline(true));
 
   function renderAs(user: SessionUser | null, onOpenChange = vi.fn()) {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -818,7 +824,12 @@ describe('管理员把认领结果一键共享给其他人', () => {
         </CurrentUserContext.Provider>
       </QueryClientProvider>,
     );
-    return { client, onOpenChange, invalidate: vi.spyOn(client, 'invalidateQueries') };
+    return {
+      client,
+      onOpenChange,
+      invalidate: vi.spyOn(client, 'invalidateQueries'),
+      resetQueries: vi.spyOn(client, 'resetQueries'),
+    };
   }
 
   /** 随机生成 count 个并认领，停在结果页 */
@@ -831,15 +842,18 @@ describe('管理员把认领结果一键共享给其他人', () => {
   }
 
   async function openShare(count: number) {
-    fireEvent.click(screen.getByRole('button', { name: '共享给…' }));
+    fireEvent.click(shareButton());
     expect(await screen.findByRole('dialog', { name: `把刚认领的 ${count} 个邮箱共享给…` })).toBeInTheDocument();
     await screen.findByRole('checkbox', { name: 'alice' });
   }
 
   it('批量认领后可共享给选中的用户：候选只含启用中的其他用户，提交认领成功的邮箱 id', async () => {
-    const { client, invalidate } = renderAs(admin);
+    const { client, invalidate, resetQueries } = renderAs(admin);
     await claimBatch(3);
     const addresses = claimedAddresses();
+    // 认领本身也会刷新缓存：清掉，只核对共享带来的刷新
+    invalidate.mockClear();
+    resetQueries.mockClear();
     await openShare(3);
     // 排除自己（root）与已禁用的 carol
     expect(userOptions()).toEqual(['alice', 'bob', 'ops']);
@@ -853,26 +867,30 @@ describe('管理员把认领结果一键共享给其他人', () => {
     expect(userOptions()).toEqual(['alice', 'bob']);
     fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
     expect(screen.getByText('已选 2/100 人，已有的共享成员会保留。')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '共享 3 个邮箱' }));
+    submit(3);
 
-    expect(await screen.findByText('已共享给：alice、bob')).toBeInTheDocument();
+    const status = await screen.findByText('已共享给：alice、bob');
+    expect(status).toHaveAttribute('role', 'status');
     expect(mocks.batchShare).toHaveBeenCalledTimes(1);
     expect(mocks.batchShare).toHaveBeenCalledWith({ mailboxIds: addresses.map(mocks.idOf), userIds: [2, 3] });
-    expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({ title: '已将 3 个邮箱共享给 alice、bob', variant: 'success' }));
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['mailboxes'] });
+    // 结果页已显示名单，不再弹 toast；只刷新共享名单，不动邮件与归属缓存
+    expect(mocks.toast).not.toHaveBeenCalled();
+    expect(invalidate.mock.calls.map(([filters]) => filters)).toEqual(SHARE_KEYS);
+    expect(resetQueries).not.toHaveBeenCalled();
     expect(screen.getByRole('dialog', { name: '认领邮箱地址' })).toBeInTheDocument();
     expect(claimedAddresses()).toEqual(addresses);
+    expect(shareButton()).toHaveFocus();
 
     // 可以再共享给其他人，结果页的名单随之累加
     await openShare(3);
     fireEvent.click(screen.getByRole('checkbox', { name: 'ops' }));
-    fireEvent.click(screen.getByRole('button', { name: '共享 3 个邮箱' }));
+    submit(3);
     expect(await screen.findByText('已共享给：alice、bob、ops')).toBeInTheDocument();
     expect(mocks.batchShare).toHaveBeenLastCalledWith({ mailboxIds: addresses.map(mocks.idOf), userIds: [5] });
     client.clear();
   });
 
-  it('普通用户、以及读不到当前用户时，结果页没有「共享给…」', async () => {
+  it('普通用户、以及没有当前用户上下文时，结果页没有「共享给…」', async () => {
     for (const user of [member, null]) {
       const { client } = renderAs(user);
       await claimBatch(2);
@@ -897,36 +915,108 @@ describe('管理员把认领结果一键共享给其他人', () => {
     expect(screen.getByRole('button', { name: '返回修改' })).toBeInTheDocument();
     await openShare(2);
     fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
-    fireEvent.click(screen.getByRole('button', { name: '共享 2 个邮箱' }));
+    submit(2);
     await screen.findByText('已共享给：alice');
     expect(mocks.batchShare).toHaveBeenCalledWith({ mailboxIds: addresses.map(mocks.idOf), userIds: [2] });
     mocks.claimOne.mockImplementation(async (body) => mocks.mailbox(body));
     client.clear();
   });
 
-  it('共享失败时留在共享步骤显示原因，可重试；冲突时刷新邮箱归属', async () => {
+  it('冲突（409）时留在共享步骤显示原因、刷新邮箱归属，可重试', async () => {
     mocks.batchShare.mockRejectedValueOnce(new ApiError('邮箱归属已变化，请刷新后重试', { code: 'conflict', httpStatus: 409 }));
-    mocks.batchShare.mockRejectedValueOnce(new TypeError('boom'));
     const { client, invalidate } = renderAs(admin);
     await claimBatch(2);
     invalidate.mockClear();
     await openShare(2);
     fireEvent.click(screen.getByRole('checkbox', { name: 'bob' }));
-    fireEvent.click(screen.getByRole('button', { name: '共享 2 个邮箱' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('邮箱归属已变化，请刷新后重试');
+    submit(2);
+    // 4xx 整单未写入：不提示「可能已生效」
+    expect(await screen.findByRole('alert')).toHaveTextContent(/^邮箱归属已变化，请刷新后重试$/);
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['mailboxes'] });
-    expect(screen.getByRole('dialog', { name: '把刚认领的 2 个邮箱共享给…' })).toBeInTheDocument();
+    expect(shareStep(2)).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'bob' })).toBeChecked();
-
-    fireEvent.click(screen.getByRole('button', { name: '共享 2 个邮箱' }));
-    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('共享失败，请重试'));
-    fireEvent.click(screen.getByRole('button', { name: '共享 2 个邮箱' }));
+    submit(2);
     expect(await screen.findByText('已共享给：bob')).toBeInTheDocument();
-    expect(mocks.batchShare).toHaveBeenCalledTimes(3);
+    expect(mocks.batchShare).toHaveBeenCalledTimes(2);
     client.clear();
   });
 
-  it('共享进行中不能关闭弹窗也不能返回；「返回」回到结果页，关闭后共享状态清空', async () => {
+  it('校验失败（选中的人刚被禁用）时刷新用户名单，失效的人移出已选后重试成功', async () => {
+    mocks.batchShare.mockRejectedValueOnce(new ApiError('部分用户不可共享', { code: 'validation_failed', httpStatus: 400 }));
+    const { client, invalidate } = renderAs(admin);
+    await claimBatch(2);
+    invalidate.mockClear();
+    await openShare(2);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'bob' }));
+    const users = await mocks.listUsers();
+    mocks.listUsers.mockResolvedValueOnce(users.map((user) => (user.id === 3 ? { ...user, status: 'disabled' } : user)));
+    submit(2);
+    expect(await screen.findByRole('alert')).toHaveTextContent(/^部分用户不可共享$/);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['admin', 'users'] });
+    await waitFor(() => expect(screen.queryByRole('checkbox', { name: 'bob' })).toBeNull());
+    expect(screen.getByText('已选 1/100 人，已有的共享成员会保留。')).toBeInTheDocument();
+    submit(2);
+    expect(await screen.findByText('已共享给：alice')).toBeInTheDocument();
+    expect(mocks.batchShare).toHaveBeenLastCalledWith(expect.objectContaining({ userIds: [2] }));
+    client.clear();
+  });
+
+  it.each([
+    ['网络中断', new ApiError('网络连接失败', { code: 'network' }), '网络连接失败'],
+    ['服务端异常 5xx', new ApiError('服务器内部错误', { code: 'internal', httpStatus: 502 }), '服务器内部错误'],
+  ])('结果不明（%s）：提示共享可能已生效，并刷新共享名单', async (_name, error, message) => {
+    mocks.batchShare.mockRejectedValueOnce(error);
+    const { client, invalidate } = renderAs(admin);
+    await claimBatch(2);
+    invalidate.mockClear();
+    await openShare(2);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
+    submit(2);
+    expect(await screen.findByRole('alert')).toHaveTextContent(`${message}。共享可能已生效，请以共享名单为准`);
+    expect(invalidate.mock.calls.map(([filters]) => filters)).toEqual(SHARE_KEYS);
+    expect(shareStep(2)).toBeInTheDocument();
+    client.clear();
+  });
+
+  it('离线时也立即发出请求并快速失败，失败后仍可按 Esc 回到结果页', async () => {
+    const { client, onOpenChange } = renderAs(admin);
+    await claimBatch(2);
+    await openShare(2);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
+    onlineManager.setOnline(false);
+    mocks.batchShare.mockRejectedValueOnce(new ApiError('网络连接失败', { code: 'network' }));
+    submit(2);
+    expect(await screen.findByRole('alert')).toHaveTextContent('网络连接失败');
+    expect(mocks.batchShare).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    expect(screen.getByRole('dialog', { name: '认领邮箱地址' })).toBeInTheDocument();
+    expect(onOpenChange).not.toHaveBeenCalled();
+    client.clear();
+  });
+
+  it.each([
+    ['点「返回」', () => fireEvent.click(screen.getByRole('button', { name: '返回' }))],
+    ['按 Esc', () => fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })],
+    ['点标题栏的关闭', () => fireEvent.click(screen.getByRole('button', { name: '关闭' }))],
+  ])('共享步骤里%s只回到结果页，保留认领结果，焦点回到「共享给…」', async (_name, leave) => {
+    const { client, onOpenChange } = renderAs(admin);
+    await claimBatch(2);
+    const addresses = claimedAddresses();
+    await openShare(2);
+    leave();
+    expect(screen.getByRole('dialog', { name: '认领邮箱地址' })).toBeInTheDocument();
+    expect(claimedAddresses()).toEqual(addresses);
+    expect(shareButton()).toHaveFocus();
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(mocks.batchShare).not.toHaveBeenCalled();
+    // 结果页上才真正关闭
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    client.clear();
+  });
+
+  it('共享进行中 Esc、关闭、返回都不响应；完成后关闭弹窗会清空共享状态', async () => {
     let release!: () => void;
     mocks.batchShare.mockImplementationOnce(
       (body) => new Promise((resolve) => {
@@ -936,15 +1026,14 @@ describe('管理员把认领结果一键共享给其他人', () => {
     const { client, onOpenChange } = renderAs(admin);
     await claimBatch(2);
     await openShare(2);
-    fireEvent.click(screen.getByRole('button', { name: '返回' }));
-    expect(screen.getByRole('dialog', { name: '认领邮箱地址' })).toBeInTheDocument();
-    await openShare(2);
     fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
-    fireEvent.click(screen.getByRole('button', { name: '共享 2 个邮箱' }));
+    submit(2);
     await waitFor(() => expect(screen.getByRole('button', { name: /共享 2 个邮箱/ })).toBeDisabled());
     expect(screen.getByRole('button', { name: '返回' })).toBeDisabled();
     expect(screen.getByRole('checkbox', { name: 'alice' })).toBeDisabled();
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }));
+    expect(shareStep(2)).toBeInTheDocument();
     expect(onOpenChange).not.toHaveBeenCalled();
     release();
     expect(await screen.findByText('已共享给：alice')).toBeInTheDocument();
@@ -960,7 +1049,7 @@ describe('管理员把认领结果一键共享给其他人', () => {
     mocks.listUsers.mockRejectedValueOnce(new ApiError('服务暂时不可用', { code: 'internal', httpStatus: 503 }));
     const { client } = renderAs(admin);
     await claimBatch(2);
-    fireEvent.click(screen.getByRole('button', { name: '共享给…' }));
+    fireEvent.click(shareButton());
     expect(await screen.findByText('服务暂时不可用')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '共享 2 个邮箱' })).toBeDisabled();
     fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
