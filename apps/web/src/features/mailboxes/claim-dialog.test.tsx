@@ -1004,7 +1004,7 @@ describe('管理员把认领结果一键共享给其他人', () => {
     await openShare(2);
     fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
     submit(2);
-    expect(await screen.findByRole('alert')).toHaveTextContent(`${message}。共享可能已生效，请以共享名单为准`);
+    expect(await screen.findByRole('alert')).toHaveTextContent(`${message}。共享可能已生效，可在「我的邮箱」中查看各邮箱的共享名单`);
     expect(invalidate.mock.calls.map(([filters]) => filters)).toEqual(SHARE_KEYS);
     expect(shareStep(2)).toBeInTheDocument();
     client.clear();

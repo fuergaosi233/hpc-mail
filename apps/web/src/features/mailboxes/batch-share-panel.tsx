@@ -29,7 +29,7 @@ function invalidateShares(client: QueryClient) {
  */
 function failureText(error: unknown): { message: string; uncertain: boolean } {
   const message = error instanceof ApiError ? error.message : '共享失败，请重试';
-  return isRejectedRequest(error) ? { message, uncertain: false } : { message: `${message}。共享可能已生效，请以共享名单为准`, uncertain: true };
+  return isRejectedRequest(error) ? { message, uncertain: false } : { message: `${message}。共享可能已生效，可在「我的邮箱」中查看各邮箱的共享名单`, uncertain: true };
 }
 
 export interface BatchSharePanelProps {

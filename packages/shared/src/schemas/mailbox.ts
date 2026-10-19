@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { LOCAL_PART_REGEX, MAX_BATCH_CLAIM, MAX_MAILBOX_GRANTEES } from '../constants.js';
+import { LOCAL_PART_REGEX, MAX_BATCH_CLAIM, MAX_BATCH_SHARE_MAILBOXES, MAX_MAILBOX_GRANTEES } from '../constants.js';
 import type { ErrorCode } from '../envelope.js';
 
 export const localPartSchema = z
@@ -131,7 +131,7 @@ export type ReplaceMailboxSharesRequest = z.infer<typeof replaceMailboxSharesReq
 
 /** 所有者把自己的多只邮箱一次共享给同一批用户：追加到各自名单，不移除已有成员。 */
 export const batchShareMailboxesRequestSchema = z.object({
-  mailboxIds: z.array(z.number().int().positive()).min(1).max(100),
+  mailboxIds: z.array(z.number().int().positive()).min(1).max(MAX_BATCH_SHARE_MAILBOXES),
   userIds: z.array(z.number().int().positive()).min(1).max(MAX_MAILBOX_GRANTEES),
 });
 export type BatchShareMailboxesRequest = z.infer<typeof batchShareMailboxesRequestSchema>;

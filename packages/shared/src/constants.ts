@@ -75,6 +75,8 @@ export const MAX_DRAFT_ATTACHMENTS_PER_USER = 20;
 export const UNREAD_COUNT_CAP = 1000;
 /** 批量认领 / 批量可用性检查单次最多处理的地址数 */
 export const MAX_BATCH_CLAIM = 20;
+/** 批量共享单次最多处理的邮箱数 */
+export const MAX_BATCH_SHARE_MAILBOXES = 100;
 /** 每只邮箱最多共享给多少人（替换与批量追加共用） */
 export const MAX_MAILBOX_GRANTEES = 100;
 export const MAX_DRAFT_ATTACHMENT_BYTES_PER_USER = 100 * 1024 * 1024;
