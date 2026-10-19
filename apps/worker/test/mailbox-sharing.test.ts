@@ -54,18 +54,24 @@ async function data<T>(response: Response): Promise<T> {
   expect(response.status, JSON.stringify(result)).toBe(200);
   return result.data;
 }
-/** 第 at 次 batch 执行前运行一次 hook（默认第一次） */
-function beforeBatch(hook: () => Promise<void>, at = 1): Env {
+/** 第 at 次 batch 执行前（after 时为执行后）运行一次 hook */
+function hookBatch(hook: () => Promise<void>, at: number, after: boolean): Env {
   let calls = 0;
   return { ...env, db: new Proxy(env.db, { get(target, property) {
     if (property === 'batch') return async (statements: D1PreparedStatement[]) => {
-      if (++calls === at) await hook();
-      return target.batch(statements);
+      const current = ++calls;
+      if (current === at && !after) await hook();
+      const result = await target.batch(statements);
+      if (current === at && after) await hook();
+      return result;
     };
     const value = Reflect.get(target, property);
     return typeof value === 'function' ? value.bind(target) : value;
   } }) };
 }
+/** 第 at 次 batch 执行前运行一次 hook（默认第一次） */
+const beforeBatch = (hook: () => Promise<void>, at = 1) => hookBatch(hook, at, false);
+const afterBatch = (hook: () => Promise<void>, at = 1) => hookBatch(hook, at, true);
 
 describe('所有者共享与管理员全站共享', () => {
   it('普通用户共享自己的邮箱给用户和管理员；成员只有来信读取权，撤销立即生效', async () => {
@@ -239,7 +245,7 @@ describe('所有者批量共享多只邮箱', () => {
     return { status: response.status, ...(await response.json() as { error: { code: string; message: string } }).error };
   }
 
-  it('管理员把自己的多只邮箱一次共享给普通用户：返回顺序同请求，成员随即可见，三次 D1 往返', async () => {
+  it('管理员把自己的多只邮箱一次共享给普通用户：返回顺序同去重后的请求，成员随即可见，两次 D1 往返', async () => {
     const f = await fixture();
     const [c, a, b] = await ownedBoxes(f, f.admin.id, 'c', 'a', 'b');
     const grants = await data<MailboxShareGrant[]>(await request('/mailboxes/shares/batch', f.admin.jwt, 'POST', {
@@ -256,7 +262,7 @@ describe('所有者批量共享多只邮箱', () => {
     expect(await shareRows(a!.id).then((rows) => rows[0]!.grantedBy)).toBe(f.admin.id);
     const probe = counting();
     await shareMailboxes(probe.env, f.admin.id, [a!.id, b!.id, c!.id], [f.stranger.id]);
-    expect(probe.trips()).toBe(3);
+    expect(probe.trips()).toBe(2);
   });
 
   it('追加不替换：已有成员保留原授权时间与授权人，重复调用幂等', async () => {
@@ -360,6 +366,22 @@ describe('所有者批量共享多只邮箱', () => {
       const after = await shareRows(...ids);
       expect(after.filter((row) => row.userId === f.member.id || row.userId === f.stranger.id), name).toEqual([]);
       expect(after.length - before.length, name).toBe(name === '名单已满' ? 100 : 0);
+    }
+  });
+
+  it('返回值在写入的同一事务里读回：提交后再过户或释放不会让已生效的请求报冲突', async () => {
+    const f = await fixture();
+    const [a, b, c] = await ownedBoxes(f, f.admin.id, 'a', 'b', 'c');
+    // 第二次 batch 是写入；它提交后立刻过户 b、释放 c
+    const racing = afterBatch(async () => {
+      await db.update(mailboxes).set({ userId: f.stranger.id }).where(eq(mailboxes.id, b!.id));
+      await db.delete(mailboxes).where(eq(mailboxes.id, c!.id));
+    }, 2);
+    const grants = await shareMailboxes(racing, f.admin.id, [c!.id, a!.id, b!.id], [f.member.id]);
+    expect(grants.map((grant) => grant.mailboxId)).toEqual([c!.id, a!.id, b!.id]);
+    for (const grant of grants) {
+      expect(grant).toMatchObject({ ownerUserId: f.admin.id, ownerUsername: f.admin.username });
+      expect(grant.grantees.map((grantee) => grantee.userId)).toEqual([f.member.id]);
     }
   });
 
