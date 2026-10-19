@@ -7,7 +7,6 @@ import { chunk } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
 
-
 function assertManageableMailbox<T extends { userId: number }>(
   box: T | undefined,
   actorId: number,
