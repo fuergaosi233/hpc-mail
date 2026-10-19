@@ -2,6 +2,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
+import type { SessionUser } from '@hpc-mail/shared';
+import { CurrentUserContext } from '@/lib/use-session';
 vi.mock('@/api/resources', () => ({ mailboxApi: { availability: vi.fn(async () => ({ available: true })) } }));
 vi.mock('@/lib/use-config', () => ({ useDomains: () => ({ data: ['example.com'] }) }));
 vi.mock('./use-mailboxes', () => ({
@@ -15,12 +17,16 @@ vi.mock('./use-mailboxes', () => ({
 vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
 import { MailboxesPage } from './mailboxes-page';
 
+const user: SessionUser = { id: 1, username: 'me', role: 'user', createdAt: '', avatarUrl: null, twoFactorEnabled: false };
+
 function renderPage(path: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const router = createMemoryRouter([{ path: '/mailboxes', element: <MailboxesPage /> }], { initialEntries: [path] });
   render(
     <QueryClientProvider client={client}>
-      <RouterProvider router={router} />
+      <CurrentUserContext.Provider value={user}>
+        <RouterProvider router={router} />
+      </CurrentUserContext.Provider>
     </QueryClientProvider>,
   );
   return { client, router };

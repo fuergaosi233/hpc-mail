@@ -41,6 +41,11 @@ export const NETWORK_ERROR_MESSAGE = '网络连接失败，请检查网络后重
  */
 const FETCH_FAILURE = /failed to fetch|load failed|networkerror|network request failed|fetch failed/i;
 
+/** 请求在处理前被服务端明确拒绝（4xx）：确定没有写入；网络中断、超时与 5xx 不算 */
+export function isRejectedRequest(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.httpStatus !== null && error.httpStatus >= 400 && error.httpStatus < 500;
+}
+
 export function isFetchFailure(error: unknown): boolean {
   return error instanceof TypeError && FETCH_FAILURE.test(error.message);
 }

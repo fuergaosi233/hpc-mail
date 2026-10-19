@@ -1,5 +1,5 @@
 import { onlineManager, QueryClient, type QueryClientConfig, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ClaimPlan, SessionUser } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
@@ -94,15 +94,23 @@ beforeAll(() => {
   Element.prototype.releasePointerCapture ??= () => {};
 });
 
+/** 默认以普通用户渲染；管理员相关用例传入 user */
+const member: SessionUser = { id: 6, username: 'member', role: 'user', createdAt: '', avatarUrl: null, twoFactorEnabled: false };
+
 function renderDialog(
   domains = ['example.com'],
   onOpenChange = vi.fn(),
-  queries: QueryClientConfig['defaultOptions'] = { queries: { retry: false } },
+  {
+    defaultOptions = { queries: { retry: false } },
+    user = member,
+  }: { defaultOptions?: QueryClientConfig['defaultOptions']; user?: SessionUser } = {},
 ) {
-  const client = new QueryClient({ defaultOptions: queries });
+  const client = new QueryClient({ defaultOptions });
   const wrap = (list: string[]) => (
     <QueryClientProvider client={client}>
-      <ClaimDialog open onOpenChange={onOpenChange} domains={list} />
+      <CurrentUserContext.Provider value={user}>
+        <ClaimDialog open onOpenChange={onOpenChange} domains={list} />
+      </CurrentUserContext.Provider>
     </QueryClientProvider>
   );
   const view = render(wrap(domains));
@@ -371,7 +379,7 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     mocks.batchAvailability.mockRejectedValueOnce(offline).mockRejectedValueOnce(offline);
     // 与线上一致：非 4xx 错误默认会按行重试（这里把延迟调短，逐行重试若存在会很快暴露）
     const { client } = renderDialog(['one.test'], vi.fn(), {
-      queries: { retry: (count) => count < 2, retryDelay: 10 },
+      defaultOptions: { queries: { retry: (count) => count < 2, retryDelay: 10 } },
     });
     setCount('3');
     fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
@@ -803,8 +811,7 @@ describe('随机后缀模式', () => {
 });
 
 describe('管理员把认领结果一键共享给其他人', () => {
-  const admin: SessionUser = { id: 1, username: 'root', role: 'admin', createdAt: '', avatarUrl: null, twoFactorEnabled: false };
-  const member: SessionUser = { ...admin, id: 6, username: 'member', role: 'user' };
+  const admin: SessionUser = { ...member, id: 1, username: 'root', role: 'admin' };
   const SHARE_KEYS = [{ queryKey: ['mailboxes', 'shares'] }, { queryKey: ['admin', 'mailbox-shares'] }];
   const setCount = (value: string) => fireEvent.change(screen.getByLabelText('随机生成个数'), { target: { value } });
   const claimedAddresses = () => screen.getAllByRole('listitem').map((item) => item.textContent!);
@@ -812,24 +819,21 @@ describe('管理员把认领结果一键共享给其他人', () => {
   const shareStep = (count: number) => screen.queryByRole('dialog', { name: `把刚认领的 ${count} 个邮箱共享给…` });
   const shareButton = () => screen.getByRole('button', { name: '共享给…' });
   const submit = (count: number) => fireEvent.click(screen.getByRole('button', { name: `共享 ${count} 个邮箱` }));
+  /** 「已共享给」播报区：结果页出现时就挂载，此时为空 */
+  /** 点遮罩：Radix 在主键按下后等到 click 才判定点在弹窗外 */
+  const clickOverlay = () => {
+    const overlay = document.querySelector('.bg-scrim')!;
+    fireEvent.pointerDown(overlay);
+    fireEvent.click(overlay);
+  };
+  const sharedRegion = () => screen.getAllByRole('status').find((node) => !node.textContent?.startsWith('已认领'))!;
 
   afterEach(() => onlineManager.setOnline(true));
 
-  function renderAs(user: SessionUser | null, onOpenChange = vi.fn()) {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <QueryClientProvider client={client}>
-        <CurrentUserContext.Provider value={user}>
-          <ClaimDialog open onOpenChange={onOpenChange} domains={['one.test']} />
-        </CurrentUserContext.Provider>
-      </QueryClientProvider>,
-    );
-    return {
-      client,
-      onOpenChange,
-      invalidate: vi.spyOn(client, 'invalidateQueries'),
-      resetQueries: vi.spyOn(client, 'resetQueries'),
-    };
+  /** 以管理员身份打开认领弹窗；spy 在渲染后创建，调用方按需在认领完成后清空 */
+  function renderAdmin(onOpenChange = vi.fn()) {
+    const { client } = renderDialog(['one.test'], onOpenChange, { user: admin });
+    return { client, onOpenChange, invalidate: vi.spyOn(client, 'invalidateQueries'), resetQueries: vi.spyOn(client, 'resetQueries') };
   }
 
   /** 随机生成 count 个并认领，停在结果页 */
@@ -848,13 +852,16 @@ describe('管理员把认领结果一键共享给其他人', () => {
   }
 
   it('批量认领后可共享给选中的用户：候选只含启用中的其他用户，提交认领成功的邮箱 id', async () => {
-    const { client, invalidate, resetQueries } = renderAs(admin);
+    const { client, invalidate, resetQueries } = renderAdmin();
     await claimBatch(3);
     const addresses = claimedAddresses();
+    const region = sharedRegion();
+    expect(region).toHaveTextContent(/^$/);
     // 认领本身也会刷新缓存：清掉，只核对共享带来的刷新
     invalidate.mockClear();
     resetQueries.mockClear();
     await openShare(3);
+    expect(screen.getByText(/全部未删除来信/)).toBeInTheDocument();
     // 排除自己（root）与已禁用的 carol
     expect(userOptions()).toEqual(['alice', 'bob', 'ops']);
     expect(screen.getByRole('button', { name: '共享 3 个邮箱' })).toBeDisabled();
@@ -869,8 +876,9 @@ describe('管理员把认领结果一键共享给其他人', () => {
     expect(screen.getByText('已选 2/100 人，已有的共享成员会保留。')).toBeInTheDocument();
     submit(3);
 
-    const status = await screen.findByText('已共享给：alice、bob');
-    expect(status).toHaveAttribute('role', 'status');
+    await waitFor(() => expect(region).toHaveTextContent('已共享给：alice、bob'));
+    // 播报区一直是同一个节点，名单更新时读屏能播报
+    expect(sharedRegion()).toBe(region);
     expect(mocks.batchShare).toHaveBeenCalledTimes(1);
     expect(mocks.batchShare).toHaveBeenCalledWith({ mailboxIds: addresses.map(mocks.idOf), userIds: [2, 3] });
     // 结果页已显示名单，不再弹 toast；只刷新共享名单，不动邮件与归属缓存
@@ -885,46 +893,50 @@ describe('管理员把认领结果一键共享给其他人', () => {
     await openShare(3);
     fireEvent.click(screen.getByRole('checkbox', { name: 'ops' }));
     submit(3);
-    expect(await screen.findByText('已共享给：alice、bob、ops')).toBeInTheDocument();
+    await waitFor(() => expect(region).toHaveTextContent('已共享给：alice、bob、ops'));
     expect(mocks.batchShare).toHaveBeenLastCalledWith({ mailboxIds: addresses.map(mocks.idOf), userIds: [5] });
     client.clear();
   });
 
-  it('普通用户、以及没有当前用户上下文时，结果页没有「共享给…」', async () => {
-    for (const user of [member, null]) {
-      const { client } = renderAs(user);
-      await claimBatch(2);
-      expect(screen.getByRole('button', { name: '复制全部地址' })).toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: '共享给…' })).toBeNull();
-      cleanup();
-      client.clear();
-    }
+  it('普通用户批量认领后，结果页没有「共享给…」', async () => {
+    const { client } = renderDialog(['one.test']);
+    await claimBatch(2);
+    expect(screen.getByRole('button', { name: '复制全部地址' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '共享给…' })).toBeNull();
     expect(mocks.listUsers).not.toHaveBeenCalled();
+    client.clear();
   });
 
-  it('部分认领（有未认领的）时只共享已认领的邮箱', async () => {
+  it('部分认领（有未认领的）时只共享已认领的邮箱；结果页在共享期间只隐藏不重建', async () => {
     mocks.claimOne.mockImplementation(async (body) => {
       if (body.localPart === 'taken-two') throw new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 });
       return mocks.mailbox(body);
     });
-    const { client } = renderAs(admin);
+    const { client } = renderAdmin();
     await claimBatch(3, () => fireEvent.change(screen.getByLabelText('前缀 2'), { target: { value: 'taken-two' } }));
     expect(screen.getByText('已认领 2 个地址，还有 1 个未认领')).toBeInTheDocument();
     const addresses = claimedAddresses();
     expect(addresses).toHaveLength(2);
+    const alert = screen.getByRole('alert');
     expect(screen.getByRole('button', { name: '返回修改' })).toBeInTheDocument();
     await openShare(2);
+    // 共享步骤里结果页不可见，但节点仍在
+    expect(screen.queryAllByRole('listitem')).toHaveLength(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(alert).toBeInTheDocument();
     fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
     submit(2);
-    await screen.findByText('已共享给：alice');
+    await waitFor(() => expect(sharedRegion()).toHaveTextContent('已共享给：alice'));
     expect(mocks.batchShare).toHaveBeenCalledWith({ mailboxIds: addresses.map(mocks.idOf), userIds: [2] });
+    // 回到结果页还是原来的提示节点，不会被重建后重复播报
+    expect(screen.getByRole('alert')).toBe(alert);
     mocks.claimOne.mockImplementation(async (body) => mocks.mailbox(body));
     client.clear();
   });
 
   it('冲突（409）时留在共享步骤显示原因、刷新邮箱归属，可重试', async () => {
     mocks.batchShare.mockRejectedValueOnce(new ApiError('邮箱归属已变化，请刷新后重试', { code: 'conflict', httpStatus: 409 }));
-    const { client, invalidate } = renderAs(admin);
+    const { client, invalidate } = renderAdmin();
     await claimBatch(2);
     invalidate.mockClear();
     await openShare(2);
@@ -936,14 +948,14 @@ describe('管理员把认领结果一键共享给其他人', () => {
     expect(shareStep(2)).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'bob' })).toBeChecked();
     submit(2);
-    expect(await screen.findByText('已共享给：bob')).toBeInTheDocument();
+    await waitFor(() => expect(sharedRegion()).toHaveTextContent('已共享给：bob'));
     expect(mocks.batchShare).toHaveBeenCalledTimes(2);
     client.clear();
   });
 
   it('校验失败（选中的人刚被禁用）时刷新用户名单，失效的人移出已选后重试成功', async () => {
     mocks.batchShare.mockRejectedValueOnce(new ApiError('部分用户不可共享', { code: 'validation_failed', httpStatus: 400 }));
-    const { client, invalidate } = renderAs(admin);
+    const { client, invalidate } = renderAdmin();
     await claimBatch(2);
     invalidate.mockClear();
     await openShare(2);
@@ -957,8 +969,27 @@ describe('管理员把认领结果一键共享给其他人', () => {
     await waitFor(() => expect(screen.queryByRole('checkbox', { name: 'bob' })).toBeNull());
     expect(screen.getByText('已选 1/100 人，已有的共享成员会保留。')).toBeInTheDocument();
     submit(2);
-    expect(await screen.findByText('已共享给：alice')).toBeInTheDocument();
+    await waitFor(() => expect(sharedRegion()).toHaveTextContent('已共享给：alice'));
     expect(mocks.batchShare).toHaveBeenLastCalledWith(expect.objectContaining({ userIds: [2] }));
+    client.clear();
+  });
+
+  it('被禁用而隐藏的人之后重新启用，不会以已勾选状态回来、也不会被提交', async () => {
+    const { client } = renderAdmin();
+    await claimBatch(2);
+    await openShare(2);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'bob' }));
+    const users = await mocks.listUsers();
+    mocks.listUsers.mockResolvedValueOnce(users.map((user) => (user.id === 3 ? { ...user, status: 'disabled' } : user)));
+    void client.invalidateQueries({ queryKey: ['admin', 'users'] });
+    await waitFor(() => expect(screen.queryByRole('checkbox', { name: 'bob' })).toBeNull());
+    void client.invalidateQueries({ queryKey: ['admin', 'users'] });
+    const bob = await screen.findByRole('checkbox', { name: 'bob' });
+    expect(bob).not.toBeChecked();
+    expect(screen.getByText('已选 1/100 人，已有的共享成员会保留。')).toBeInTheDocument();
+    submit(2);
+    await waitFor(() => expect(mocks.batchShare).toHaveBeenCalledWith(expect.objectContaining({ userIds: [2] })));
     client.clear();
   });
 
@@ -967,7 +998,7 @@ describe('管理员把认领结果一键共享给其他人', () => {
     ['服务端异常 5xx', new ApiError('服务器内部错误', { code: 'internal', httpStatus: 502 }), '服务器内部错误'],
   ])('结果不明（%s）：提示共享可能已生效，并刷新共享名单', async (_name, error, message) => {
     mocks.batchShare.mockRejectedValueOnce(error);
-    const { client, invalidate } = renderAs(admin);
+    const { client, invalidate } = renderAdmin();
     await claimBatch(2);
     invalidate.mockClear();
     await openShare(2);
@@ -980,7 +1011,7 @@ describe('管理员把认领结果一键共享给其他人', () => {
   });
 
   it('离线时也立即发出请求并快速失败，失败后仍可按 Esc 回到结果页', async () => {
-    const { client, onOpenChange } = renderAs(admin);
+    const { client, onOpenChange } = renderAdmin();
     await claimBatch(2);
     await openShare(2);
     fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
@@ -995,19 +1026,37 @@ describe('管理员把认领结果一键共享给其他人', () => {
     client.clear();
   });
 
+  it('离线且没有缓存时显示加载中与离线提示，而不是「没有匹配」；恢复网络后自动加载', async () => {
+    const { client } = renderAdmin();
+    await claimBatch(2);
+    onlineManager.setOnline(false);
+    fireEvent.click(shareButton());
+    expect(await screen.findByText('当前处于离线状态，恢复网络后会自动加载用户列表。')).toBeInTheDocument();
+    expect(screen.getByText('正在加载用户…')).toBeInTheDocument();
+    expect(screen.queryByText('没有匹配的启用用户')).toBeNull();
+    onlineManager.setOnline(true);
+    expect(await screen.findByRole('checkbox', { name: 'alice' })).toBeInTheDocument();
+    expect(screen.queryByText(/当前处于离线状态/)).toBeNull();
+    client.clear();
+  });
+
   it.each([
     ['点「返回」', () => fireEvent.click(screen.getByRole('button', { name: '返回' }))],
     ['按 Esc', () => fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })],
-    ['点标题栏的关闭', () => fireEvent.click(screen.getByRole('button', { name: '关闭' }))],
+    ['点遮罩', () => clickOverlay()],
   ])('共享步骤里%s只回到结果页，保留认领结果，焦点回到「共享给…」', async (_name, leave) => {
-    const { client, onOpenChange } = renderAs(admin);
+    const { client, onOpenChange } = renderAdmin();
     await claimBatch(2);
     const addresses = claimedAddresses();
+    expect(screen.getByRole('button', { name: '关闭' })).toBeInTheDocument();
     await openShare(2);
+    // 共享步骤不显示右上角关闭，避免误以为会关掉整个弹窗
+    expect(screen.queryByRole('button', { name: '关闭' })).toBeNull();
     leave();
     expect(screen.getByRole('dialog', { name: '认领邮箱地址' })).toBeInTheDocument();
     expect(claimedAddresses()).toEqual(addresses);
     expect(shareButton()).toHaveFocus();
+    expect(screen.getByRole('button', { name: '关闭' })).toBeInTheDocument();
     expect(onOpenChange).not.toHaveBeenCalled();
     expect(mocks.batchShare).not.toHaveBeenCalled();
     // 结果页上才真正关闭
@@ -1016,14 +1065,14 @@ describe('管理员把认领结果一键共享给其他人', () => {
     client.clear();
   });
 
-  it('共享进行中 Esc、关闭、返回都不响应；完成后关闭弹窗会清空共享状态', async () => {
+  it('共享进行中 Esc、点遮罩、返回都不响应；完成后关闭弹窗会清空共享状态', async () => {
     let release!: () => void;
     mocks.batchShare.mockImplementationOnce(
       (body) => new Promise((resolve) => {
         release = () => resolve(body.mailboxIds.map((mailboxId) => ({ mailboxId, grantees: [] })));
       }),
     );
-    const { client, onOpenChange } = renderAs(admin);
+    const { client, onOpenChange } = renderAdmin();
     await claimBatch(2);
     await openShare(2);
     fireEvent.click(screen.getByRole('checkbox', { name: 'alice' }));
@@ -1032,11 +1081,11 @@ describe('管理员把认领结果一键共享给其他人', () => {
     expect(screen.getByRole('button', { name: '返回' })).toBeDisabled();
     expect(screen.getByRole('checkbox', { name: 'alice' })).toBeDisabled();
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
-    fireEvent.click(screen.getByRole('button', { name: '关闭' }));
+    clickOverlay();
     expect(shareStep(2)).toBeInTheDocument();
     expect(onOpenChange).not.toHaveBeenCalled();
     release();
-    expect(await screen.findByText('已共享给：alice')).toBeInTheDocument();
+    await waitFor(() => expect(sharedRegion()).toHaveTextContent('已共享给：alice'));
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
     expect(onOpenChange).toHaveBeenCalledWith(false);
     // 弹窗由外部保持打开时，关闭动作已把对话框重置回空白表单
@@ -1047,7 +1096,7 @@ describe('管理员把认领结果一键共享给其他人', () => {
 
   it('用户列表加载失败时可重新加载', async () => {
     mocks.listUsers.mockRejectedValueOnce(new ApiError('服务暂时不可用', { code: 'internal', httpStatus: 503 }));
-    const { client } = renderAs(admin);
+    const { client } = renderAdmin();
     await claimBatch(2);
     fireEvent.click(shareButton());
     expect(await screen.findByText('服务暂时不可用')).toBeInTheDocument();
