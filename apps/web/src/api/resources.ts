@@ -6,6 +6,7 @@ import type {
   AdminUser,
   BatchClaimMailboxResult,
   BatchMailboxRequest,
+  BatchShareMailboxesRequest,
   ApiKeySummary,
   ApiRequestLogEntry,
   ChangePasswordRequest,
@@ -122,6 +123,9 @@ export const mailboxApi = {
   listShares: () => api.get<MailboxShareGrant[]>('/mailboxes/shares'),
   replaceShares: (body: ReplaceMailboxSharesRequest) =>
     api.put<MailboxShareGrant, ReplaceMailboxSharesRequest>('/mailboxes/shares', body),
+  /** 把自己的多只邮箱一次共享给同一批用户：追加到各自名单，返回每只邮箱更新后的完整名单 */
+  batchShare: (body: BatchShareMailboxesRequest) =>
+    api.post<MailboxShareGrant[], BatchShareMailboxesRequest>('/mailboxes/shares/batch', body),
   searchShareUsers: (q: string, excludeUserId?: number, signal?: AbortSignal) =>
     api.get<UserSearchResults>('/mailboxes/share-users', { query: { q, excludeUserId }, signal }),
 };

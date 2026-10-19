@@ -105,7 +105,12 @@ describe('randomAddresses', () => {
 describe('claimList', () => {
   const taken = () => new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 });
   const d = (localPart: string, domain = 'a.test') => ({ localPart, domain });
-  const box = (draft: { localPart: string; domain: string }) => ({ address: `${draft.localPart}@${draft.domain}` });
+  /** 后端返回的邮箱：每个前缀固定一个 id，核对认领结果带回的 id 与地址对应 */
+  const ids: Record<string, number> = { one: 11, two: 12, three: 13, four: 14 };
+  const box = (draft: { localPart: string; domain: string }) => ({
+    id: ids[draft.localPart]!,
+    address: `${draft.localPart}@${draft.domain}`,
+  });
   const batch = (result: Partial<BatchClaimMailboxResult>) =>
     vi.fn(async (_items: Array<{ localPart: string; domain: string }>) => ({
       claimed: [], taken: [], notAttempted: [], stoppedBy: null, ...result,
@@ -116,7 +121,9 @@ describe('claimList', () => {
     const claim = vi.fn();
     const batchClaim = batch({ claimed: drafts.map(box) as never });
     const result = await claimList(drafts, { claim, batchClaim });
-    expect(result).toEqual({ claimed: ['one@a.test', 'two@b.test', 'three@a.test'], remaining: [], stoppedBy: null });
+    expect(result).toEqual({
+      claimed: [box(d('one')), box(d('two', 'b.test')), box(d('three'))], remaining: [], stoppedBy: null,
+    });
     expect(batchClaim).toHaveBeenCalledTimes(1);
     expect(batchClaim).toHaveBeenCalledWith(drafts);
     expect(claim).not.toHaveBeenCalled();
@@ -125,7 +132,9 @@ describe('claimList', () => {
   it('某个地址被抢先占用：只跳过它、不替用户改名，其余照常认领', async () => {
     const batchClaim = batch({ claimed: [box(d('one')), box(d('three'))] as never, taken: [d('two', 'b.test')] });
     const result = await claimList([d('one'), d('two', 'b.test'), d('three')], { claim: vi.fn(), batchClaim });
-    expect(result).toEqual({ claimed: ['one@a.test', 'three@a.test'], remaining: [d('two', 'b.test')], stoppedBy: null });
+    expect(result).toEqual({
+      claimed: [{ id: 11, address: 'one@a.test' }, { id: 13, address: 'three@a.test' }], remaining: [d('two', 'b.test')], stoppedBy: null,
+    });
   });
 
   it('配额用尽等其他错误中途停止：带出后端原因，被占用的与没尝试的按原顺序都留在 remaining（含各自域名）', async () => {
@@ -137,7 +146,7 @@ describe('claimList', () => {
     });
     const result = await claimList([d('one'), d('two', 'b.test'), d('three', 'b.test'), d('four')], { claim: vi.fn(), batchClaim });
     expect(result).toEqual({
-      claimed: ['two@b.test'],
+      claimed: [{ id: 12, address: 'two@b.test' }],
       remaining: [d('one'), d('three', 'b.test'), d('four')],
       stoppedBy: '认领地址数已达上限（2）',
     });
@@ -168,7 +177,7 @@ describe('claimList', () => {
     const batchClaim = batch({});
     const ok = vi.fn(async (body: { localPart: string; domain: string }) => box(body));
     expect(await claimList([d('one', 'b.test')], { claim: ok, batchClaim })).toEqual({
-      claimed: ['one@b.test'], remaining: [], stoppedBy: null,
+      claimed: [{ id: 11, address: 'one@b.test' }], remaining: [], stoppedBy: null,
     });
     expect(ok).toHaveBeenCalledWith(d('one', 'b.test'));
     expect(await claimList([d('one')], { claim: vi.fn().mockRejectedValue(taken()), batchClaim })).toEqual({
@@ -202,11 +211,11 @@ describe('fromBatchResult', () => {
   it('被占用的与没尝试的按用户给出的顺序合并，与后端返回的先后无关', () => {
     const drafts = [d('a'), d('b'), d('c'), d('d'), d('e')];
     expect(fromBatchResult(drafts, {
-      claimed: [{ address: 'a@a.test' }] as never,
+      claimed: [{ id: 5, address: 'a@a.test' }] as never,
       taken: [d('d'), d('b')],
       notAttempted: [d('e'), d('c')],
       stoppedBy: { code: 'forbidden', message: '已达上限' },
-    })).toEqual({ claimed: ['a@a.test'], remaining: [d('b'), d('c'), d('d'), d('e')], stoppedBy: '已达上限' });
+    })).toEqual({ claimed: [{ id: 5, address: 'a@a.test' }], remaining: [d('b'), d('c'), d('d'), d('e')], stoppedBy: '已达上限' });
   });
 
   it('业务错误停止时结果确定；后端中途非业务错误（internal）停止时，出错那项可能已提交，按结果未知处理', () => {
@@ -216,12 +225,12 @@ describe('fromBatchResult', () => {
     });
     expect(business.uncertain).toBeUndefined();
     expect(fromBatchResult(drafts, {
-      claimed: [{ address: 'a@a.test' }] as never,
+      claimed: [{ id: 5, address: 'a@a.test' }] as never,
       taken: [],
       notAttempted: [d('b'), d('c')],
       stoppedBy: { code: 'internal', message: '认领中断，部分地址可能已认领，请以邮箱列表为准' },
     })).toEqual({
-      claimed: ['a@a.test'],
+      claimed: [{ id: 5, address: 'a@a.test' }],
       remaining: [d('b'), d('c')],
       stoppedBy: '认领中断，部分地址可能已认领，请以邮箱列表为准',
       uncertain: true,

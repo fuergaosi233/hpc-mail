@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ApiError, isUncertainSendError, NETWORK_ERROR_MESSAGE, toApiError } from './errors';
+import { ApiError, isRejectedRequest, isUncertainSendError, NETWORK_ERROR_MESSAGE, toApiError } from './errors';
 
 describe('toApiError', () => {
   it.each([
@@ -30,5 +30,16 @@ describe('isUncertainSendError', () => {
     expect(isUncertainSendError(new ApiError('t', { code: 'timeout' }))).toBe(true);
     expect(isUncertainSendError(new ApiError('g', { code: 'internal', httpStatus: 503 }))).toBe(true);
     expect(isUncertainSendError(new ApiError('v', { code: 'validation_failed', httpStatus: 400 }))).toBe(false);
+  });
+});
+
+describe('isRejectedRequest', () => {
+  it('只有服务端明确拒绝的 4xx 算确定未写入，408 与网络失败、5xx 都算结果未知', () => {
+    expect(isRejectedRequest(new ApiError('冲突', { code: 'conflict', httpStatus: 409 }))).toBe(true);
+    expect(isRejectedRequest(new ApiError('校验', { code: 'validation_failed', httpStatus: 400 }))).toBe(true);
+    expect(isRejectedRequest(new ApiError('超时', { code: 'timeout', httpStatus: 408 }))).toBe(false);
+    expect(isRejectedRequest(new ApiError('g', { code: 'internal', httpStatus: 502 }))).toBe(false);
+    expect(isRejectedRequest(toApiError(new TypeError('Failed to fetch')))).toBe(false);
+    expect(isRejectedRequest(new TypeError('boom'))).toBe(false);
   });
 });
