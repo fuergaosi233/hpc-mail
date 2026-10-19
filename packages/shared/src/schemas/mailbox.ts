@@ -129,6 +129,13 @@ export const replaceMailboxSharesRequestSchema = z.object({
 });
 export type ReplaceMailboxSharesRequest = z.infer<typeof replaceMailboxSharesRequestSchema>;
 
+/** 所有者把自己的多只邮箱一次共享给同一批用户：追加到各自名单，不移除已有成员。 */
+export const batchShareMailboxesRequestSchema = z.object({
+  mailboxIds: z.array(z.number().int().positive()).min(1).max(100),
+  userIds: z.array(z.number().int().positive()).min(1).max(100),
+});
+export type BatchShareMailboxesRequest = z.infer<typeof batchShareMailboxesRequestSchema>;
+
 export interface MailboxShareGrantee {
   userId: number;
   username: string;
