@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   claimMailboxRequestSchema,
+  batchMailboxRequestSchema,
+  claimPlanQuerySchema,
   createApiKeyRequestSchema,
   createInviteRequestSchema,
   DEFAULT_SETTINGS,
@@ -20,6 +22,19 @@ import {
   userNotifyPrefsSchema,
   usernameSchema,
 } from '../src/index.js';
+
+describe('批量邮箱数量边界', () => {
+  it('批量请求和随机计划接受 999，拒绝 1000', () => {
+    const items = Array.from({ length: 999 }, (_, index) => ({ localPart: `random${index}`, domain: 'example.com' }));
+    expect(batchMailboxRequestSchema.safeParse({ items }).success).toBe(true);
+    expect(batchMailboxRequestSchema.safeParse({ items: [...items, items[0]] }).success).toBe(false);
+    for (const strategy of ['uniform', 'claude']) {
+      expect(claimPlanQuerySchema.safeParse({ count: '999', strategy }).success).toBe(true);
+      expect(claimPlanQuerySchema.safeParse({ count: '1000', strategy }).success).toBe(false);
+      expect(claimPlanQuerySchema.safeParse({ count: '1.5', strategy }).success).toBe(false);
+    }
+  });
+});
 
 describe('usernameSchema', () => {
   it('接受合法用户名并小写化', () => {

@@ -52,7 +52,9 @@ describe('parseBatchCount', () => {
     expect(parseBatchCount('abc')).toBe(1);
     expect(parseBatchCount('7')).toBe(7);
     expect(parseBatchCount('007')).toBe(7);
-    expect(parseBatchCount('99')).toBe(MAX_BATCH_CLAIM);
+    expect(parseBatchCount('99')).toBe(99);
+    expect(parseBatchCount('999')).toBe(999);
+    expect(parseBatchCount('1000')).toBe(MAX_BATCH_CLAIM);
   });
 });
 

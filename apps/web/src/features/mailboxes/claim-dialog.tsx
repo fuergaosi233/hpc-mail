@@ -1,7 +1,7 @@
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { Check, Share2, Shuffle, X } from 'lucide-react';
 import { type FormEvent, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
-import { type ClaimPlan, type ClaimPlanStrategy, claimMailboxRequestSchema, localPartSchema, MAX_BATCH_CLAIM } from '@hpc-mail/shared';
+import { type ClaimPlan, type ClaimPlanStrategy, claimMailboxRequestSchema, localPartSchema, MAX_BATCH_CLAIM, MAX_BATCH_SHARE_MAILBOXES } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
@@ -349,7 +349,8 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const planShortfall = plan ? shortfallText(plan) : null;
   const busy = claiming || planning;
   /** 管理员认领多个后，可把认领成功的这批邮箱一键共享给其他人（结果页只在认领成功后出现） */
-  const canShare = currentUser.role === 'admin' && result !== null;
+  const shareLimitExceeded = currentUser.role === 'admin' && result !== null && result.claimed.length > MAX_BATCH_SHARE_MAILBOXES;
+  const canShare = currentUser.role === 'admin' && result !== null && !shareLimitExceeded;
   const leaveShare = () => {
     refocusShare.current = true;
     setSharing(false);
@@ -409,6 +410,11 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                   </li>
                 ))}
               </ul>
+              {shareLimitExceeded && (
+                <p className="text-sm text-ink-secondary">
+                  一次最多共享 {MAX_BATCH_SHARE_MAILBOXES} 个邮箱，请前往「我的邮箱」管理共享。
+                </p>
+              )}
               {result.remaining.length > 0 && (
                 <p role="alert" className="text-sm text-critical">
                   {result.stoppedBy
@@ -471,7 +477,10 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                       value={countText}
                       disabled={busy}
                       className="h-8 w-12 px-1 text-center"
-                      onChange={(event) => setCountText(event.target.value.replace(/\D/g, '').slice(0, 2))}
+                      onChange={(event) => {
+                        const digits = event.target.value.replace(/\D/g, '');
+                        setCountText(Number(digits) > MAX_BATCH_CLAIM ? String(MAX_BATCH_CLAIM) : digits);
+                      }}
                       onBlur={() => setCountText(String(count))}
                       onKeyDown={(event) => {
                         // 回车不提交表单（那会直接认领），等同点击旁边的随机生成
