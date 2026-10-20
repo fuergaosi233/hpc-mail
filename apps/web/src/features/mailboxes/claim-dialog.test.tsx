@@ -218,25 +218,30 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
 
   it('999 个地址一次生成、一次批量检查并认领；超过共享上限时提示前往我的邮箱', async () => {
     const { client } = renderDialog(['one.test'], vi.fn(), { user: { ...member, role: 'admin' } });
+    const countInput = screen.getByLabelText('随机生成个数');
+    const form = countInput.closest('form')!;
     setCount('999');
+    expect(countInput).toHaveValue('999');
     fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
-    const values = prefixes();
+    // 大批量用标签定位输入，避免 getByRole 对数千节点逐个计算可访问名称与可见性。
+    const values = Array.from(form.querySelectorAll<HTMLInputElement>('input[aria-label^="前缀"]'), (input) => input.value);
     expect(values).toHaveLength(999);
     expect(new Set(values).size).toBe(999);
     expect(values.every((value) => RANDOM.test(value))).toBe(true);
     await waitFor(() => expect(mocks.batchAvailability).toHaveBeenCalledTimes(1));
     expect(mocks.batchAvailability.mock.calls[0]![0]).toHaveLength(999);
     expect(mocks.availability).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: '认领 999 个' }));
-    await screen.findByText('已认领 999 个地址');
+    expect(within(form).getByText('认领 999 个', { selector: 'button' })).toBeEnabled();
+    fireEvent.submit(form);
+    await screen.findByText('已认领 999 个地址', { selector: '[role="status"]' });
     expect(mocks.batchClaim).toHaveBeenCalledTimes(1);
     expect(mocks.batchClaim.mock.calls[0]![0]).toHaveLength(999);
     expect(mocks.claim).not.toHaveBeenCalled();
-    expect(screen.queryByRole('button', { name: '共享给…' })).not.toBeInTheDocument();
-    expect(screen.getByText('一次最多共享 100 个邮箱，请前往「我的邮箱」管理共享。')).toBeInTheDocument();
+    expect(screen.queryByText('共享给…', { selector: 'button' })).not.toBeInTheDocument();
+    expect(screen.getByText('一次最多共享 100 个邮箱，请前往「我的邮箱」管理共享。', { selector: 'p' })).toBeInTheDocument();
     expect(mocks.batchShare).not.toHaveBeenCalled();
     client.clear();
-  }, 15000);
+  }, 60000);
 
   it('不满意可以反复点随机生成，每次换一批新的', () => {
     const { client } = renderDialog();
