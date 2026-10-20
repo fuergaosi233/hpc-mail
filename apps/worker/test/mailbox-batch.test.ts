@@ -203,6 +203,35 @@ describe('批量认领', () => {
     expect(await ownedBy(f.user.id)).toHaveLength(999);
   });
 
+  it('999 个多域地址的实时配额只聚合一次，并使用索引而非逐项扫描邮箱表', async () => {
+    const f = await fixture(1000);
+    await updateSettings(env, { domains: { list: [
+      { domain: openDomain, public: true, perUserLimit: 500 },
+      { domain: limitedDomain, public: true, perUserLimit: 499 },
+    ] } });
+    const items = Array.from({ length: 999 }, (_, index) => f.item(`quota${index}`, index % 2 === 0 ? openDomain : limitedDomain));
+    let explained = false;
+    const probe = counting(undefined, async (sqls) => {
+      if (!explained && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
+        explained = true;
+        const bindings = [JSON.stringify([{ address: 'explain@batch.test', domain: openDomain, perUserLimit: 1000, perDomainLimit: 500,
+          ownedDomain: 0, wasTaken: 0, code: null, message: null }]), f.user.id, 0, 0, 'user', 0];
+        for (const statement of sqls) {
+          const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${statement}`).bind(...bindings).all<{ detail: string }>();
+          const details = plan.results.map((row) => row.detail);
+          expect(details.filter((detail) => detail === 'MATERIALIZE live_owned')).toHaveLength(1);
+          expect(details.filter((detail) => /SEARCH mailboxes USING (?:COVERING )?INDEX idx_mailboxes_user \(user_id=\?\)/.test(detail))).toHaveLength(1);
+          expect(details.some((detail) => /SCAN mailboxes\b/.test(detail))).toBe(false);
+        }
+      }
+    });
+    const result = await claimMailboxes(probe.env, f.user.id, 'user', items);
+    expect(result.claimed).toHaveLength(999);
+    expect(result).toMatchObject({ taken: [], notAttempted: [], stoppedBy: null });
+    expect(explained).toBe(true);
+    expect(probe.queries()).toBe(24);
+  });
+
   it('重复地址不重复计额度，但达到额度时先判额度再判占用', async () => {
     const f = await fixture(2);
     const first = f.item('first');
@@ -232,6 +261,48 @@ describe('批量认领', () => {
     expect(result.notAttempted).toEqual(items.slice(2));
     expect(result.stoppedBy).toEqual({ code: 'forbidden', message: '认领配额已在并发请求中用尽，请刷新后重试' });
     expect(await ownedBy(f.user.id)).toHaveLength(2);
+  });
+
+  it.each(['quota', 'domains', 'policy'] as const)('新地址并发被占用同时 %s 守卫失效：先停止，不能记为 taken 后继续', async (change) => {
+    const f = await fixture();
+    const first = f.item('raced-first', change === 'quota' ? limitedDomain : openDomain);
+    const items = [first, f.item('must-not-claim')];
+    let raced = false;
+    const racing = counting(undefined, async (sqls) => {
+      if (!raced && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
+        raced = true;
+        await f.own(f.user.id, first);
+        if (change === 'domains') await updateSettings(env, { domains: { list: [{ domain: openDomain, public: true, perUserLimit: 0 }] } });
+        if (change === 'policy') await db.update(users).set({ mailboxPolicyRevision: 1 }).where(eq(users.id, f.user.id));
+      }
+    });
+    const result = await claimMailboxes(racing.env, f.user.id, 'user', items);
+    expect(result).toMatchObject({ claimed: [], taken: [], notAttempted: items, stoppedBy: { code: change === 'quota' ? 'forbidden' : 'conflict' } });
+    expect(await ownedBy(f.user.id)).toEqual([`${first.localPart}@${first.domain}`]);
+  });
+
+  it('并发新增占用地址的重复项仍复核实时额度，阻止后面的其他域写入', async () => {
+    const f = await fixture();
+    await updateSettings(env, { domains: { list: [
+      { domain: openDomain, public: true, perUserLimit: 0 },
+      { domain: limitedDomain, public: true, perUserLimit: 2 },
+    ] } });
+    const first = f.item('repeated-race', limitedDomain);
+    const second = f.item('fills-quota', limitedDomain);
+    const items = [first, second, first, f.item('must-not-claim')];
+    let raced = false;
+    const racing = counting(undefined, async (sqls) => {
+      if (!raced && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
+        raced = true;
+        await f.own(f.user.id, first);
+      }
+    });
+    const result = await claimMailboxes(racing.env, f.user.id, 'user', items);
+    expect(result.claimed.map((box) => box.address)).toEqual([`${second.localPart}@${second.domain}`]);
+    expect(result.taken).toEqual([first]);
+    expect(result.notAttempted).toEqual(items.slice(2));
+    expect(result.stoppedBy).toEqual({ code: 'forbidden', message: '认领配额已在并发请求中用尽，请刷新后重试' });
+    expect(await ownedBy(f.user.id)).toEqual([first, second].map((item) => `${item.localPart}@${item.domain}`).sort());
   });
 
   it.each(['disabled', 'role', 'policy'] as const)('事务前用户 %s 变化，拒绝整个未执行块', async (change) => {

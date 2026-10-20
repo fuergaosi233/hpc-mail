@@ -91,6 +91,33 @@ function announceClaimed(address: string) {
   });
 }
 
+/** 仅展开的那一行挂载域名选项，避免大批量地址把隐藏选项重复渲染数万次。 */
+function DomainSelect({ value, domains, label, disabled, onValueChange }: {
+  value: string;
+  domains: string[];
+  label: string;
+  disabled: boolean;
+  onValueChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const selectDomain = (next: string) => {
+    // 隐藏选项卸载时 Radix 的原生表单桥接可能发出空值，不把它当成域名选择。
+    if (domains.includes(next)) onValueChange(next);
+  };
+  return (
+    <Select value={value} onValueChange={selectDomain} disabled={disabled} open={open} onOpenChange={setOpen}>
+      <SelectTrigger aria-label={label} className="h-9 w-auto min-w-0 max-w-full gap-1.5 px-2.5">
+        <SelectValue placeholder="选择域名">{value}</SelectValue>
+      </SelectTrigger>
+      {open && (
+        <SelectContent>
+          {domains.map((domain) => <SelectItem key={domain} value={domain}>{domain}</SelectItem>)}
+        </SelectContent>
+      )}
+    </Select>
+  );
+}
+
 export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const queryClient = useQueryClient();
   const baseId = useId();
@@ -155,6 +182,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       return {
         queryKey: queryKeys.mailboxes.availability(target.localPart, target.domain),
         queryFn: () => checkAvailability(target),
+        notifyOnChangeProps: ['data', 'isFetching'] as const,
         // 失败由 loader 整批重试；逐行重试各有定时器，会绕过合批变成一串单个请求
         retry: false,
         enabled:
@@ -187,7 +215,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       error: formatError ?? duplicate ?? unavailable,
     };
   });
-  const canSubmit = !claiming && states.every((state) => state.valid && state.error === null);
+  const canSubmit = !claiming && !planning && states.every((state) => state.valid && state.error === null);
 
   function reset() {
     setRows([newRow()]);
@@ -555,21 +583,13 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                               @
                             </span>
                             {domains.length > 1 ? (
-                              <Select value={row.domain} onValueChange={(value) => changeDomain(row.id, value)} disabled={claiming}>
-                                <SelectTrigger
-                                  aria-label={multiple ? `域名 ${index + 1}` : '域名'}
-                                  className="h-9 w-auto min-w-0 max-w-full gap-1.5 px-2.5"
-                                >
-                                  <SelectValue placeholder="选择域名" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  {domains.map((item) => (
-                                    <SelectItem key={item} value={item}>
-                                      {item}
-                                    </SelectItem>
-                                  ))}
-                                </SelectContent>
-                              </Select>
+                              <DomainSelect
+                                value={row.domain}
+                                domains={domains}
+                                label={multiple ? `域名 ${index + 1}` : '域名'}
+                                disabled={claiming}
+                                onValueChange={(value) => changeDomain(row.id, value)}
+                              />
                             ) : (
                               <span className="truncate text-sm text-ink-tertiary" aria-hidden>
                                 {row.domain}
