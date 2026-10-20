@@ -187,7 +187,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       error: formatError ?? duplicate ?? unavailable,
     };
   });
-  const canSubmit = !claiming && states.every((state) => state.valid && state.error === null);
+  const canSubmit = !claiming && !planning && states.every((state) => state.valid && state.error === null);
 
   function reset() {
     setRows([newRow()]);

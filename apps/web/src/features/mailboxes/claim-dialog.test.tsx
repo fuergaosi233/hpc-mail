@@ -578,6 +578,36 @@ describe('随机后缀模式', () => {
     client.clear();
   });
 
+  it('已有有效地址时等待新后缀分配，禁止提交旧列表，完成后才可认领新列表', async () => {
+    let resolve!: (value: ReturnType<typeof planOf>) => void;
+    mocks.randomPlan.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+    const { client } = renderDialog(DOMAINS);
+    fireEvent.change(screen.getByLabelText('前缀'), { target: { value: 'previous-address' } });
+    const submit = screen.getByRole('button', { name: '认领' });
+    expect(submit).toBeEnabled();
+    selectMode('均匀随机');
+    setCount('2');
+    randomize();
+    expect(mocks.randomPlan).toHaveBeenCalledWith(2, 'uniform');
+    expect(submit).toBeDisabled();
+    fireEvent.click(submit);
+    fireEvent.submit(screen.getByLabelText('前缀').closest('form')!);
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.batchClaim).not.toHaveBeenCalled();
+    resolve(planOf('uniform', [['b.test', 0], ['c.test', 0]]));
+    await waitRows(['b.test', 'c.test']);
+    const values = prefixes();
+    const nextSubmit = screen.getByRole('button', { name: '认领 2 个' });
+    expect(nextSubmit).toBeEnabled();
+    fireEvent.click(nextSubmit);
+    await screen.findByText('已认领 2 个地址');
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.batchClaim).toHaveBeenCalledExactlyOnceWith([
+      { localPart: values[0], domain: 'b.test' }, { localPart: values[1], domain: 'c.test' },
+    ]);
+    client.clear();
+  });
+
   it('后端一个都没分到时保留现有的行，并说明原因', async () => {
     mocks.randomPlan.mockResolvedValueOnce(planOf('uniform', [], { pool: [], shortfall: 3, reason: 'no_candidates' }));
     const { client } = renderDialog(DOMAINS);
