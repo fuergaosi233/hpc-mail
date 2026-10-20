@@ -282,6 +282,12 @@ const CLAIM_CHUNK_SIZE = 100;
  * SELECT 计划和 INSERT 使用相同 CTE，放在同一 D1 batch 事务中，其他写入不能插到两者之间。
  */
 const BATCH_CLAIM_PLAN_SQL = `WITH
+  live_owned AS MATERIALIZED (
+    SELECT domain, COUNT(*) AS n FROM mailboxes WHERE user_id = ?2 GROUP BY domain
+  ),
+  live_total AS MATERIALIZED (
+    SELECT COALESCE(SUM(n), 0) AS n FROM live_owned
+  ),
   input AS (
     SELECT CAST(key AS INTEGER) AS position,
       json_extract(value, '$.address') AS address,
@@ -313,8 +319,8 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
       WHEN user_limit > 0 AND ?3 + added >= user_limit THEN 'quota'
       WHEN domain_limit > 0 AND owned_domain + domain_added >= domain_limit THEN 'domain_limit'
       WHEN was_taken = 0 AND (existing OR occurrence = 1) AND (
-        (user_limit > 0 AND (SELECT COUNT(*) FROM mailboxes WHERE user_id = ?2) + added >= user_limit)
-        OR (domain_limit > 0 AND (SELECT COUNT(*) FROM mailboxes WHERE user_id = ?2 AND mailboxes.domain = counted.domain) + domain_added >= domain_limit)
+        (user_limit > 0 AND (SELECT n FROM live_total) + added >= user_limit)
+        OR (domain_limit > 0 AND COALESCE((SELECT n FROM live_owned WHERE domain = counted.domain), 0) + domain_added >= domain_limit)
         OR COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) != ?4
         OR NOT EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active' AND role = ?5 AND mailbox_policy_revision = ?6)
         OR NOT EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured

@@ -20,6 +20,8 @@ const mocks = vi.hoisted(() => {
     async (_localPart = '', _domain = ''): Promise<{ available: boolean; reason?: string }> => ({ available: true }),
   );
   return {
+    selectContentRender: vi.fn(),
+    selectItemRender: vi.fn(),
     idOf,
     mailbox,
     claimOne,
@@ -84,6 +86,20 @@ vi.mock('@/api/resources', () => ({
   },
   adminApi: { listUsers: mocks.listUsers },
 }));
+vi.mock('@/components/ui/select', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/components/ui/select')>();
+  return {
+    ...actual,
+    SelectContent: (props: Parameters<typeof actual.SelectContent>[0]) => {
+      mocks.selectContentRender();
+      return <actual.SelectContent {...props} />;
+    },
+    SelectItem: (props: Parameters<typeof actual.SelectItem>[0]) => {
+      mocks.selectItemRender();
+      return <actual.SelectItem {...props} />;
+    },
+  };
+});
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
 vi.mock('@/components/ui/copy-button', () => ({ writeClipboard: mocks.writeClipboard }));
 import { ClaimDialog } from './claim-dialog';
@@ -551,6 +567,29 @@ describe('随机后缀模式', () => {
     expect(screen.getByText('都用当前选择的域名')).toBeInTheDocument();
     client.clear();
   });
+
+  it('999 行与 64 个域名只挂载展开行的选项，选择后保持正确域名', async () => {
+    const domains = Array.from({ length: 64 }, (_, index) => `domain${index}.test`);
+    const { client } = renderDialog(domains);
+    try {
+      const form = screen.getByLabelText('随机生成个数').closest('form')!;
+      setCount('999');
+      randomize();
+      expect(form.querySelectorAll('input[aria-label^="前缀"]')).toHaveLength(999);
+      expect(mocks.selectContentRender).not.toHaveBeenCalled();
+      expect(mocks.selectItemRender).not.toHaveBeenCalled();
+      const first = form.querySelector<HTMLButtonElement>('button[aria-label="域名 1"]')!;
+      expect(first).toHaveTextContent(domains[0]!);
+      fireEvent.click(first);
+      const listbox = await screen.findByRole('listbox');
+      expect(within(listbox).getAllByRole('option')).toHaveLength(64);
+      fireEvent.click(within(listbox).getByRole('option', { name: domains[63] }));
+      await waitFor(() => expect(first).toHaveTextContent(domains[63]!));
+      expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    } finally {
+      client.clear();
+    }
+  }, 60000);
 
   it('固定后缀：批量生成的地址都用同一个域名（默认第一个），不请求后端分配', () => {
     const { client } = renderDialog(DOMAINS);
