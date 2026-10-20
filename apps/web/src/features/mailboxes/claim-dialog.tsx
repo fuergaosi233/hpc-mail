@@ -1,7 +1,7 @@
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { Check, Share2, Shuffle, X } from 'lucide-react';
 import { type FormEvent, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
-import { type ClaimPlan, type ClaimPlanStrategy, claimMailboxRequestSchema, localPartSchema, MAX_BATCH_CLAIM } from '@hpc-mail/shared';
+import { type ClaimPlan, type ClaimPlanStrategy, claimMailboxRequestSchema, localPartSchema, MAX_BATCH_CLAIM, MAX_BATCH_SHARE_MAILBOXES } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
@@ -91,6 +91,33 @@ function announceClaimed(address: string) {
   });
 }
 
+/** 仅展开的那一行挂载域名选项，避免大批量地址把隐藏选项重复渲染数万次。 */
+function DomainSelect({ value, domains, label, disabled, onValueChange }: {
+  value: string;
+  domains: string[];
+  label: string;
+  disabled: boolean;
+  onValueChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const selectDomain = (next: string) => {
+    // 隐藏选项卸载时 Radix 的原生表单桥接可能发出空值，不把它当成域名选择。
+    if (domains.includes(next)) onValueChange(next);
+  };
+  return (
+    <Select value={value} onValueChange={selectDomain} disabled={disabled} open={open} onOpenChange={setOpen}>
+      <SelectTrigger aria-label={label} className="h-9 w-auto min-w-0 max-w-full gap-1.5 px-2.5">
+        <SelectValue placeholder="选择域名">{value}</SelectValue>
+      </SelectTrigger>
+      {open && (
+        <SelectContent>
+          {domains.map((domain) => <SelectItem key={domain} value={domain}>{domain}</SelectItem>)}
+        </SelectContent>
+      )}
+    </Select>
+  );
+}
+
 export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const queryClient = useQueryClient();
   const baseId = useId();
@@ -155,6 +182,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       return {
         queryKey: queryKeys.mailboxes.availability(target.localPart, target.domain),
         queryFn: () => checkAvailability(target),
+        notifyOnChangeProps: ['data', 'isFetching'] as const,
         // 失败由 loader 整批重试；逐行重试各有定时器，会绕过合批变成一串单个请求
         retry: false,
         enabled:
@@ -187,7 +215,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
       error: formatError ?? duplicate ?? unavailable,
     };
   });
-  const canSubmit = !claiming && states.every((state) => state.valid && state.error === null);
+  const canSubmit = !claiming && !planning && states.every((state) => state.valid && state.error === null);
 
   function reset() {
     setRows([newRow()]);
@@ -349,7 +377,8 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const planShortfall = plan ? shortfallText(plan) : null;
   const busy = claiming || planning;
   /** 管理员认领多个后，可把认领成功的这批邮箱一键共享给其他人（结果页只在认领成功后出现） */
-  const canShare = currentUser.role === 'admin' && result !== null;
+  const shareLimitExceeded = currentUser.role === 'admin' && result !== null && result.claimed.length > MAX_BATCH_SHARE_MAILBOXES;
+  const canShare = currentUser.role === 'admin' && result !== null && !shareLimitExceeded;
   const leaveShare = () => {
     refocusShare.current = true;
     setSharing(false);
@@ -409,6 +438,11 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                   </li>
                 ))}
               </ul>
+              {shareLimitExceeded && (
+                <p className="text-sm text-ink-secondary">
+                  一次最多共享 {MAX_BATCH_SHARE_MAILBOXES} 个邮箱，请前往「我的邮箱」管理共享。
+                </p>
+              )}
               {result.remaining.length > 0 && (
                 <p role="alert" className="text-sm text-critical">
                   {result.stoppedBy
@@ -471,7 +505,10 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                       value={countText}
                       disabled={busy}
                       className="h-8 w-12 px-1 text-center"
-                      onChange={(event) => setCountText(event.target.value.replace(/\D/g, '').slice(0, 2))}
+                      onChange={(event) => {
+                        const digits = event.target.value.replace(/\D/g, '');
+                        setCountText(Number(digits) > MAX_BATCH_CLAIM ? String(MAX_BATCH_CLAIM) : digits);
+                      }}
                       onBlur={() => setCountText(String(count))}
                       onKeyDown={(event) => {
                         // 回车不提交表单（那会直接认领），等同点击旁边的随机生成
@@ -546,21 +583,13 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
                               @
                             </span>
                             {domains.length > 1 ? (
-                              <Select value={row.domain} onValueChange={(value) => changeDomain(row.id, value)} disabled={claiming}>
-                                <SelectTrigger
-                                  aria-label={multiple ? `域名 ${index + 1}` : '域名'}
-                                  className="h-9 w-auto min-w-0 max-w-full gap-1.5 px-2.5"
-                                >
-                                  <SelectValue placeholder="选择域名" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  {domains.map((item) => (
-                                    <SelectItem key={item} value={item}>
-                                      {item}
-                                    </SelectItem>
-                                  ))}
-                                </SelectContent>
-                              </Select>
+                              <DomainSelect
+                                value={row.domain}
+                                domains={domains}
+                                label={multiple ? `域名 ${index + 1}` : '域名'}
+                                disabled={claiming}
+                                onValueChange={(value) => changeDomain(row.id, value)}
+                              />
                             ) : (
                               <span className="truncate text-sm text-ink-tertiary" aria-hidden>
                                 {row.domain}

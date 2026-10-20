@@ -111,6 +111,17 @@ async function plan(token: string, count: number, strategy: string, status = 200
 }
 
 describe('GET /api/mailboxes/random-plan', () => {
+  it('均匀与低风险模式均接受 999，1000 被拒绝', async () => {
+    const f = await fixture([{ public: true, random: true, perUserLimit: 0 }]);
+    for (const strategy of ['uniform', 'claude']) {
+      const response = await request(`/mailboxes/random-plan?count=999&strategy=${strategy}`, f.user.jwt);
+      expect(response.status).toBe(200);
+      const body = await response.json() as { data: ClaimPlan };
+      expect(body.data.items).toHaveLength(999);
+      expect(body.data.shortfall).toBe(0);
+      expect((await request(`/mailboxes/random-plan?count=1000&strategy=${strategy}`, f.user.jwt)).status).toBe(400);
+    }
+  });
   it('Claude 低风险：排除全军覆没与付费被封达阈值，按封号数再按账号数均衡', async () => {
     const f = await fixture(Array.from({ length: 5 }, () => ({ public: false, perUserLimit: 0 })));
     await f.facts(0, 1);                                   // d0：1 个账号，无封号
@@ -218,7 +229,7 @@ describe('GET /api/mailboxes/random-plan', () => {
 
   it('参数校验', async () => {
     const f = await fixture([{ public: true, perUserLimit: 0 }]);
-    for (const query of ['count=0&strategy=claude', 'count=21&strategy=claude', 'count=3&strategy=all', 'strategy=claude']) {
+    for (const query of ['count=0&strategy=claude', 'count=1000&strategy=claude', 'count=3&strategy=all', 'strategy=claude']) {
       expect((await request(`/mailboxes/random-plan?${query}`, f.user.jwt)).status, query).toBe(400);
     }
   });

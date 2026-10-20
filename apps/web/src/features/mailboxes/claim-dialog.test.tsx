@@ -20,6 +20,8 @@ const mocks = vi.hoisted(() => {
     async (_localPart = '', _domain = ''): Promise<{ available: boolean; reason?: string }> => ({ available: true }),
   );
   return {
+    selectContentRender: vi.fn(),
+    selectItemRender: vi.fn(),
     idOf,
     mailbox,
     claimOne,
@@ -84,6 +86,20 @@ vi.mock('@/api/resources', () => ({
   },
   adminApi: { listUsers: mocks.listUsers },
 }));
+vi.mock('@/components/ui/select', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/components/ui/select')>();
+  return {
+    ...actual,
+    SelectContent: (props: Parameters<typeof actual.SelectContent>[0]) => {
+      mocks.selectContentRender();
+      return <actual.SelectContent {...props} />;
+    },
+    SelectItem: (props: Parameters<typeof actual.SelectItem>[0]) => {
+      mocks.selectItemRender();
+      return <actual.SelectItem {...props} />;
+    },
+  };
+});
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
 vi.mock('@/components/ui/copy-button', () => ({ writeClipboard: mocks.writeClipboard }));
 import { ClaimDialog } from './claim-dialog';
@@ -215,6 +231,33 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     expect(mocks.batchClaim).not.toHaveBeenCalled();
     client.clear();
   });
+
+  it('999 个地址一次生成、一次批量检查并认领；超过共享上限时提示前往我的邮箱', async () => {
+    const { client } = renderDialog(['one.test'], vi.fn(), { user: { ...member, role: 'admin' } });
+    const countInput = screen.getByLabelText('随机生成个数');
+    const form = countInput.closest('form')!;
+    setCount('999');
+    expect(countInput).toHaveValue('999');
+    fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
+    // 大批量用标签定位输入，避免 getByRole 对数千节点逐个计算可访问名称与可见性。
+    const values = Array.from(form.querySelectorAll<HTMLInputElement>('input[aria-label^="前缀"]'), (input) => input.value);
+    expect(values).toHaveLength(999);
+    expect(new Set(values).size).toBe(999);
+    expect(values.every((value) => RANDOM.test(value))).toBe(true);
+    await waitFor(() => expect(mocks.batchAvailability).toHaveBeenCalledTimes(1));
+    expect(mocks.batchAvailability.mock.calls[0]![0]).toHaveLength(999);
+    expect(mocks.availability).not.toHaveBeenCalled();
+    expect(within(form).getByText('认领 999 个', { selector: 'button' })).toBeEnabled();
+    fireEvent.submit(form);
+    await screen.findByText('已认领 999 个地址', { selector: '[role="status"]' });
+    expect(mocks.batchClaim).toHaveBeenCalledTimes(1);
+    expect(mocks.batchClaim.mock.calls[0]![0]).toHaveLength(999);
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(screen.queryByText('共享给…', { selector: 'button' })).not.toBeInTheDocument();
+    expect(screen.getByText('一次最多共享 100 个邮箱，请前往「我的邮箱」管理共享。', { selector: 'p' })).toBeInTheDocument();
+    expect(mocks.batchShare).not.toHaveBeenCalled();
+    client.clear();
+  }, 60000);
 
   it('不满意可以反复点随机生成，每次换一批新的', () => {
     const { client } = renderDialog();
@@ -424,14 +467,18 @@ describe('随机生成：先预览、可编辑，确认后才认领', () => {
     client.clear();
   });
 
-  it('个数框只收数字，失焦后归一到 1~20', () => {
+  it('个数框只收数字，999 可输入，1000 夹到 999，失焦后归一到 1~999', () => {
     const { client } = renderDialog();
     const input = screen.getByLabelText('随机生成个数');
     setCount('a1b2');
     expect(input).toHaveValue('12');
-    setCount('99');
+    setCount('999');
     fireEvent.blur(input);
-    expect(input).toHaveValue('20');
+    expect(input).toHaveValue('999');
+    setCount('1000');
+    expect(input).toHaveValue('999');
+    fireEvent.blur(input);
+    expect(input).toHaveValue('999');
     setCount('');
     fireEvent.blur(input);
     expect(input).toHaveValue('1');
@@ -521,6 +568,29 @@ describe('随机后缀模式', () => {
     client.clear();
   });
 
+  it('999 行与 64 个域名只挂载展开行的选项，选择后保持正确域名', async () => {
+    const domains = Array.from({ length: 64 }, (_, index) => `domain${index}.test`);
+    const { client } = renderDialog(domains);
+    try {
+      const form = screen.getByLabelText('随机生成个数').closest('form')!;
+      setCount('999');
+      randomize();
+      expect(form.querySelectorAll('input[aria-label^="前缀"]')).toHaveLength(999);
+      expect(mocks.selectContentRender).not.toHaveBeenCalled();
+      expect(mocks.selectItemRender).not.toHaveBeenCalled();
+      const first = form.querySelector<HTMLButtonElement>('button[aria-label="域名 1"]')!;
+      expect(first).toHaveTextContent(domains[0]!);
+      fireEvent.click(first);
+      const listbox = await screen.findByRole('listbox');
+      expect(within(listbox).getAllByRole('option')).toHaveLength(64);
+      fireEvent.click(within(listbox).getByRole('option', { name: domains[63] }));
+      await waitFor(() => expect(first).toHaveTextContent(domains[63]!));
+      expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    } finally {
+      client.clear();
+    }
+  }, 60000);
+
   it('固定后缀：批量生成的地址都用同一个域名（默认第一个），不请求后端分配', () => {
     const { client } = renderDialog(DOMAINS);
     setCount('10');
@@ -544,6 +614,36 @@ describe('随机后缀模式', () => {
     await waitFor(() => expect(mocks.availableOf).toHaveBeenCalledWith(values[1], 'c.test'));
     expect(mocks.claim).not.toHaveBeenCalled();
     expect(mocks.batchClaim).not.toHaveBeenCalled();
+    client.clear();
+  });
+
+  it('已有有效地址时等待新后缀分配，禁止提交旧列表，完成后才可认领新列表', async () => {
+    let resolve!: (value: ReturnType<typeof planOf>) => void;
+    mocks.randomPlan.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+    const { client } = renderDialog(DOMAINS);
+    fireEvent.change(screen.getByLabelText('前缀'), { target: { value: 'previous-address' } });
+    const submit = screen.getByRole('button', { name: '认领' });
+    expect(submit).toBeEnabled();
+    selectMode('均匀随机');
+    setCount('2');
+    randomize();
+    expect(mocks.randomPlan).toHaveBeenCalledWith(2, 'uniform');
+    expect(submit).toBeDisabled();
+    fireEvent.click(submit);
+    fireEvent.submit(screen.getByLabelText('前缀').closest('form')!);
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.batchClaim).not.toHaveBeenCalled();
+    resolve(planOf('uniform', [['b.test', 0], ['c.test', 0]]));
+    await waitRows(['b.test', 'c.test']);
+    const values = prefixes();
+    const nextSubmit = screen.getByRole('button', { name: '认领 2 个' });
+    expect(nextSubmit).toBeEnabled();
+    fireEvent.click(nextSubmit);
+    await screen.findByText('已认领 2 个地址');
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.batchClaim).toHaveBeenCalledExactlyOnceWith([
+      { localPart: values[0], domain: 'b.test' }, { localPart: values[1], domain: 'c.test' },
+    ]);
     client.clear();
   });
 

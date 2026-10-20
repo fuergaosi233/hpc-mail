@@ -158,7 +158,7 @@ async function loadClaimContext(env: Env, actor: { userId: number; role: Role },
     claimSettingsStatement(env.db),
     mailboxPolicyUserStatement(env.db, actor.userId),
     ownedCountsStatement(env.db, actor.userId),
-    env.db.prepare(`SELECT address FROM mailboxes WHERE address IN (${unique.map(() => '?').join(', ')})`).bind(...unique),
+    env.db.prepare('SELECT address FROM mailboxes WHERE address IN (SELECT value FROM json_each(?))').bind(JSON.stringify(unique)),
   ]);
   return {
     userId: actor.userId,
@@ -274,11 +274,105 @@ export async function claimMailbox(
   return await claimWithContext(env, context, req);
 }
 
+/** 每块两条 SQL、一次事务；999 个地址也不超过 D1 Free 的每调用查询数限制。 */
+const CLAIM_CHUNK_SIZE = 100;
+
 /**
- * 批量认领：按请求顺序逐个认领，规则与单个认领一致；设置与用户权限每批只读一次，
- * 每个 INSERT 仍带完整守卫（同一事务能看到前面已插入的行，配额判断保持原子）。
- * 被占用的跳过并继续；其他业务错误立即停止，已认领的保留。
+ * 先标记已有/重复地址，再按输入顺序累计新地址，找出第一条不满足规则的记录。
+ * SELECT 计划和 INSERT 使用相同 CTE，放在同一 D1 batch 事务中，其他写入不能插到两者之间。
  */
+const BATCH_CLAIM_PLAN_SQL = `WITH
+  live_owned AS MATERIALIZED (
+    SELECT domain, COUNT(*) AS n FROM mailboxes WHERE user_id = ?2 GROUP BY domain
+  ),
+  live_total AS MATERIALIZED (
+    SELECT COALESCE(SUM(n), 0) AS n FROM live_owned
+  ),
+  input AS (
+    SELECT CAST(key AS INTEGER) AS position,
+      json_extract(value, '$.address') AS address,
+      json_extract(value, '$.domain') AS domain,
+      json_extract(value, '$.perUserLimit') AS user_limit,
+      json_extract(value, '$.perDomainLimit') AS domain_limit,
+      json_extract(value, '$.ownedDomain') AS owned_domain,
+      json_extract(value, '$.wasTaken') AS was_taken,
+      json_extract(value, '$.code') AS policy_code,
+      json_extract(value, '$.message') AS policy_message
+    FROM json_each(?1)
+  ),
+  numbered AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY address ORDER BY position) AS occurrence,
+      EXISTS (SELECT 1 FROM mailboxes WHERE mailboxes.address = input.address) AS existing
+    FROM input
+  ),
+  counted AS (
+    SELECT *, (was_taken = 0 AND existing = 0 AND occurrence = 1) AS is_new,
+      COALESCE(SUM(was_taken = 0 AND existing = 0 AND occurrence = 1) OVER (
+        ORDER BY position ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS added,
+      COALESCE(SUM(was_taken = 0 AND existing = 0 AND occurrence = 1) OVER (
+        PARTITION BY domain ORDER BY position ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS domain_added
+    FROM numbered
+  ),
+  checked AS (
+    SELECT *, CASE
+      WHEN policy_code IS NOT NULL THEN policy_code
+      WHEN user_limit > 0 AND ?3 + added >= user_limit THEN 'quota'
+      WHEN domain_limit > 0 AND owned_domain + domain_added >= domain_limit THEN 'domain_limit'
+      WHEN was_taken = 0 AND (existing OR occurrence = 1) AND (
+        (user_limit > 0 AND (SELECT n FROM live_total) + added >= user_limit)
+        OR (domain_limit > 0 AND COALESCE((SELECT n FROM live_owned WHERE domain = counted.domain), 0) + domain_added >= domain_limit)
+        OR COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) != ?4
+        OR NOT EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active' AND role = ?5 AND mailbox_policy_revision = ?6)
+        OR NOT EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured
+          WHERE settings.key = 'domains' AND lower(trim(CASE WHEN configured.type = 'text' THEN configured.value
+            ELSE json_extract(configured.value, '$.domain') END)) = counted.domain)
+      ) THEN 'guard'
+      ELSE NULL END AS blocked
+    FROM counted
+  ),
+  planned AS (
+    SELECT * FROM checked WHERE position <= COALESCE((SELECT MIN(position) FROM checked WHERE blocked IS NOT NULL), 2147483647)
+  )`;
+
+interface PlannedClaimRow {
+  position: number;
+  address: string;
+  is_new: number;
+  blocked: string | null;
+  policy_message: string | null;
+  user_limit: number;
+  domain_limit: number;
+}
+
+async function claimChunk(env: Env, context: ClaimContext, items: ClaimMailboxRequest[]) {
+  const inputs = items.map((item) => {
+    // 配额在事务内按实际成功的前缀累计；这里仅冻结域名、权限和保留前缀规则。
+    const policy = evaluateClaimPolicy(context.settings, context.user, { total: 0, byDomain: new Map() }, item.localPart, item.domain);
+    return {
+      address: addressOf(item), domain: item.domain,
+      perUserLimit: policy.perUserLimit, perDomainLimit: policy.perDomainLimit,
+      ownedDomain: context.owned.byDomain.get(item.domain) ?? 0,
+      wasTaken: context.taken.has(addressOf(item)) ? 1 : 0,
+      code: policy.blocked?.error.code ?? null, message: policy.blocked?.error.message ?? null,
+    };
+  });
+  const bindings = [JSON.stringify(inputs), context.userId, context.owned.total, context.settings.domains.revision ?? 0,
+    context.user.role, context.user.mailboxPolicyRevision];
+  const [plan, inserted] = await env.db.batch([
+    env.db.prepare(`${BATCH_CLAIM_PLAN_SQL} SELECT position, address, is_new, blocked, policy_message, user_limit, domain_limit FROM planned ORDER BY position`).bind(...bindings),
+    env.db.prepare(`${BATCH_CLAIM_PLAN_SQL}
+      INSERT INTO mailboxes (address, domain, user_id, display_name)
+      SELECT address, domain, ?2, '' FROM planned WHERE blocked IS NULL AND is_new ORDER BY position
+      RETURNING id, address, domain, user_id, display_name, created_at,
+        (SELECT COUNT(*) FROM messages WHERE messages.address = mailboxes.address) AS message_count`).bind(...bindings),
+  ]);
+  return {
+    plan: plan!.results as unknown as PlannedClaimRow[],
+    inserted: new Map((inserted!.results as unknown as InsertedMailboxRow[]).map((row) => [row.address, row])),
+  };
+}
+
+/** 按顺序分块认领：占用跳过；首个业务错误停止，之前完成的块和本块前缀保留。 */
 export async function claimMailboxes(
   env: Env,
   userId: number,
@@ -291,13 +385,32 @@ export async function claimMailboxes(
   try {
     const context = await loadClaimContext(env, { userId, role }, items.map(addressOf));
     started = true;
-    for (; index < items.length; index++) {
-      const item = items[index]!;
-      try {
-        result.claimed.push(await claimWithContext(env, context, item));
-      } catch (error) {
-        if (!(error instanceof AppError) || error.code !== 'address_taken') throw error;
-        result.taken.push(item);
+    while (index < items.length) {
+      const chunk = items.slice(index, index + CLAIM_CHUNK_SIZE);
+      const { plan, inserted } = await claimChunk(env, context, chunk);
+      for (const row of plan) {
+        const item = items[index]!;
+        if (row.blocked) {
+          if (row.blocked === 'guard') throw await claimGuardError(env, context);
+          if (row.blocked === 'quota') throw new AppError('forbidden', `认领地址数已达上限（${row.user_limit}）`);
+          if (row.blocked === 'domain_limit') throw new AppError('forbidden', `在该域名下最多认领 ${row.domain_limit} 个地址`);
+          throw new AppError(row.blocked as AppError['code'], row.policy_message!);
+        }
+        if (!row.is_new) {
+          result.taken.push(item);
+        } else {
+          const mailbox = inserted.get(row.address);
+          if (!mailbox) throw new Error('批量认领写入结果缺失');
+          result.claimed.push(serialize({
+            id: Number(mailbox.id), address: mailbox.address, domain: mailbox.domain,
+            userId: Number(mailbox.user_id), displayName: mailbox.display_name,
+            createdAt: new Date(Number(mailbox.created_at)),
+          }, Number(mailbox.message_count)));
+          context.taken.add(row.address);
+          context.owned.total++;
+          context.owned.byDomain.set(item.domain, (context.owned.byDomain.get(item.domain) ?? 0) + 1);
+        }
+        index++;
       }
     }
   } catch (error) {

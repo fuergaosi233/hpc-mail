@@ -65,17 +65,21 @@ async function data<T>(response: Response, status = 200): Promise<T> {
 const ownedBy = async (userId: number) => (await db.select().from(mailboxes).where(eq(mailboxes.userId, userId))).map((row) => row.address).sort();
 
 /** 统计 D1 往返：每次 batch 与每条单独执行的语句各算一次 */
-function counting(hook?: (sql: string) => Promise<void>, onBatch?: (sqls: string[]) => Promise<void>): { env: Env; trips: () => number } {
+function counting(hook?: (sql: string) => Promise<void>, onBatch?: (sqls: string[]) => Promise<void>): { env: Env; trips: () => number; queries: () => number } {
   let trips = 0;
+  let queries = 0;
   const sqlOf = new WeakMap<object, string>();
   const wrap = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => {
     const proxy = new Proxy(statement, {
       get(target, property) {
-        if (property === 'bind') return (...args: unknown[]) => wrap(target.bind(...args), sql);
+        if (property === 'bind') return (...args: unknown[]) => {
+          expect(args.length).toBeLessThanOrEqual(100);
+          return wrap(target.bind(...args), sql);
+        };
         const method = Reflect.get(target, property);
         if (typeof method !== 'function') return method;
         return async (...args: unknown[]) => {
-          if (['first', 'all', 'run', 'raw'].includes(String(property))) { trips++; await hook?.(sql); }
+          if (['first', 'all', 'run', 'raw'].includes(String(property))) { trips++; queries++; await hook?.(sql); }
           return method.apply(target, args);
         };
       },
@@ -87,13 +91,14 @@ function counting(hook?: (sql: string) => Promise<void>, onBatch?: (sqls: string
     if (property === 'prepare') return (sql: string) => wrap(target.prepare(sql), sql);
     if (property === 'batch') return async (statements: D1PreparedStatement[]) => {
       trips++;
+      queries += statements.length;
       await onBatch?.(statements.map((statement) => sqlOf.get(statement) ?? ''));
       return target.batch(statements);
     };
     const method = Reflect.get(target, property);
     return typeof method === 'function' ? method.bind(target) : method;
   } }) } as Env;
-  return { env: wrapped, trips: () => trips };
+  return { env: wrapped, trips: () => trips, queries: () => queries };
 }
 
 const INTERRUPTED = { code: 'internal', message: '认领中断，部分地址可能已认领，请以邮箱列表为准' };
@@ -166,16 +171,16 @@ describe('批量认领', () => {
   it('写入前域名配置改变：停止为 conflict，之前认领的保留', async () => {
     const f = await fixture();
     let inserts = 0;
-    const racing = counting(async (sql) => {
-      if (/INSERT INTO mailboxes/i.test(sql) && ++inserts === 2) {
+    const racing = counting(undefined, async (sqls) => {
+      if (sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql)) && ++inserts === 2) {
         await updateSettings(env, { domains: { list: [{ domain: openDomain, public: true, perUserLimit: 0 }] } });
       }
     });
-    const items = [f.item('a'), f.item('b'), f.item('c')];
+    const items = Array.from({ length: 102 }, (_, index) => f.item(`race${index}`));
     const result = await claimMailboxes(racing.env, f.user.id, 'user', items);
-    expect(result.claimed.map((box) => box.address)).toEqual([`${f.prefix}-a@${openDomain}`]);
-    expect(result).toMatchObject({ taken: [], notAttempted: items.slice(1), stoppedBy: { code: 'conflict', message: '域名配置已改变，请刷新后重试' } });
-    expect(await ownedBy(f.user.id)).toEqual([`${f.prefix}-a@${openDomain}`]);
+    expect(result.claimed.map((box) => box.address)).toEqual(items.slice(0, 100).map((item) => `${item.localPart}@${item.domain}`));
+    expect(result).toMatchObject({ taken: [], notAttempted: items.slice(100), stoppedBy: { code: 'conflict', message: '域名配置已改变，请刷新后重试' } });
+    expect(await ownedBy(f.user.id)).toHaveLength(100);
   });
 
   it('并发批量认领不能突破全局额度', async () => {
@@ -184,6 +189,135 @@ describe('批量认领', () => {
     expect(attempts.reduce((sum, result) => sum + result.claimed.length, 0)).toBe(2);
     expect(await ownedBy(f.user.id)).toHaveLength(2);
     for (const result of attempts.filter((entry) => entry.stoppedBy)) expect(result.stoppedBy!.code).toBe('forbidden');
+  });
+
+  it('999 个地址经真实接口检查与认领，读回完整有序结果', async () => {
+    const f = await fixture();
+    const items = Array.from({ length: 999 }, (_, index) => f.item(`api${index}`));
+    const checks = await data<MailboxAvailability[]>(await request('/mailboxes/availability/batch', f.user.jwt, 'POST', { items }));
+    expect(checks).toHaveLength(999);
+    expect(checks.every((entry) => entry.available)).toBe(true);
+    const result = await data<BatchClaimMailboxResult>(await request('/mailboxes/batch', f.user.jwt, 'POST', { items }));
+    expect(result.claimed.map((box) => box.address)).toEqual(items.map((item) => `${item.localPart}@${item.domain}`));
+    expect(result).toMatchObject({ taken: [], notAttempted: [], stoppedBy: null });
+    expect(await ownedBy(f.user.id)).toHaveLength(999);
+  });
+
+  it('999 个多域地址的实时配额只聚合一次，并使用索引而非逐项扫描邮箱表', async () => {
+    const f = await fixture(1000);
+    await updateSettings(env, { domains: { list: [
+      { domain: openDomain, public: true, perUserLimit: 500 },
+      { domain: limitedDomain, public: true, perUserLimit: 499 },
+    ] } });
+    const items = Array.from({ length: 999 }, (_, index) => f.item(`quota${index}`, index % 2 === 0 ? openDomain : limitedDomain));
+    let explained = false;
+    const probe = counting(undefined, async (sqls) => {
+      if (!explained && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
+        explained = true;
+        const bindings = [JSON.stringify([{ address: 'explain@batch.test', domain: openDomain, perUserLimit: 1000, perDomainLimit: 500,
+          ownedDomain: 0, wasTaken: 0, code: null, message: null }]), f.user.id, 0, 0, 'user', 0];
+        for (const statement of sqls) {
+          const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${statement}`).bind(...bindings).all<{ detail: string }>();
+          const details = plan.results.map((row) => row.detail);
+          expect(details.filter((detail) => detail === 'MATERIALIZE live_owned')).toHaveLength(1);
+          expect(details.filter((detail) => /SEARCH mailboxes USING (?:COVERING )?INDEX idx_mailboxes_user \(user_id=\?\)/.test(detail))).toHaveLength(1);
+          expect(details.some((detail) => /SCAN mailboxes\b/.test(detail))).toBe(false);
+        }
+      }
+    });
+    const result = await claimMailboxes(probe.env, f.user.id, 'user', items);
+    expect(result.claimed).toHaveLength(999);
+    expect(result).toMatchObject({ taken: [], notAttempted: [], stoppedBy: null });
+    expect(explained).toBe(true);
+    expect(probe.queries()).toBe(24);
+  });
+
+  it('重复地址不重复计额度，但达到额度时先判额度再判占用', async () => {
+    const f = await fixture(2);
+    const first = f.item('first');
+    const items = [first, first, f.item('second'), first, f.item('last')];
+    const result = await claimMailboxes(env, f.user.id, 'user', items);
+    expect(result.claimed).toHaveLength(2);
+    expect(result.taken).toEqual([first]);
+    expect(result.notAttempted).toEqual(items.slice(3));
+    expect(result.stoppedBy).toEqual({ code: 'forbidden', message: '认领地址数已达上限（2）' });
+  });
+
+  it('并发耗尽某域额度后停止，不认领后面的其他域；已占用的地址仍跳过', async () => {
+    const f = await fixture();
+    const occupied = f.item('occupied');
+    await f.own(f.other.id, occupied);
+    let raced = false;
+    const racing = counting(undefined, async (sqls) => {
+      if (!raced && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
+        raced = true;
+        await f.own(f.user.id, f.item('other-claim', limitedDomain));
+      }
+    });
+    const items = [occupied, f.item('free'), f.item('over', limitedDomain), f.item('after')];
+    const result = await claimMailboxes(racing.env, f.user.id, 'user', items);
+    expect(result.taken).toEqual([occupied]);
+    expect(result.claimed.map((box) => box.address)).toEqual([`${f.prefix}-free@${openDomain}`]);
+    expect(result.notAttempted).toEqual(items.slice(2));
+    expect(result.stoppedBy).toEqual({ code: 'forbidden', message: '认领配额已在并发请求中用尽，请刷新后重试' });
+    expect(await ownedBy(f.user.id)).toHaveLength(2);
+  });
+
+  it.each(['quota', 'domains', 'policy'] as const)('新地址并发被占用同时 %s 守卫失效：先停止，不能记为 taken 后继续', async (change) => {
+    const f = await fixture();
+    const first = f.item('raced-first', change === 'quota' ? limitedDomain : openDomain);
+    const items = [first, f.item('must-not-claim')];
+    let raced = false;
+    const racing = counting(undefined, async (sqls) => {
+      if (!raced && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
+        raced = true;
+        await f.own(f.user.id, first);
+        if (change === 'domains') await updateSettings(env, { domains: { list: [{ domain: openDomain, public: true, perUserLimit: 0 }] } });
+        if (change === 'policy') await db.update(users).set({ mailboxPolicyRevision: 1 }).where(eq(users.id, f.user.id));
+      }
+    });
+    const result = await claimMailboxes(racing.env, f.user.id, 'user', items);
+    expect(result).toMatchObject({ claimed: [], taken: [], notAttempted: items, stoppedBy: { code: change === 'quota' ? 'forbidden' : 'conflict' } });
+    expect(await ownedBy(f.user.id)).toEqual([`${first.localPart}@${first.domain}`]);
+  });
+
+  it('并发新增占用地址的重复项仍复核实时额度，阻止后面的其他域写入', async () => {
+    const f = await fixture();
+    await updateSettings(env, { domains: { list: [
+      { domain: openDomain, public: true, perUserLimit: 0 },
+      { domain: limitedDomain, public: true, perUserLimit: 2 },
+    ] } });
+    const first = f.item('repeated-race', limitedDomain);
+    const second = f.item('fills-quota', limitedDomain);
+    const items = [first, second, first, f.item('must-not-claim')];
+    let raced = false;
+    const racing = counting(undefined, async (sqls) => {
+      if (!raced && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
+        raced = true;
+        await f.own(f.user.id, first);
+      }
+    });
+    const result = await claimMailboxes(racing.env, f.user.id, 'user', items);
+    expect(result.claimed.map((box) => box.address)).toEqual([`${second.localPart}@${second.domain}`]);
+    expect(result.taken).toEqual([first]);
+    expect(result.notAttempted).toEqual(items.slice(2));
+    expect(result.stoppedBy).toEqual({ code: 'forbidden', message: '认领配额已在并发请求中用尽，请刷新后重试' });
+    expect(await ownedBy(f.user.id)).toEqual([first, second].map((item) => `${item.localPart}@${item.domain}`).sort());
+  });
+
+  it.each(['disabled', 'role', 'policy'] as const)('事务前用户 %s 变化，拒绝整个未执行块', async (change) => {
+    const f = await fixture();
+    let raced = false;
+    const racing = counting(undefined, async (sqls) => {
+      if (!raced && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
+        raced = true;
+        await db.update(users).set(change === 'disabled' ? { status: 'disabled' } : change === 'role' ? { role: 'admin' } : { mailboxPolicyRevision: 1 }).where(eq(users.id, f.user.id));
+      }
+    });
+    const items = [f.item('first'), f.item('second')];
+    const result = await claimMailboxes(racing.env, f.user.id, 'user', items);
+    expect(result).toMatchObject({ claimed: [], taken: [], notAttempted: items, stoppedBy: { code: change === 'disabled' ? 'user_disabled' : 'conflict' } });
+    expect(await ownedBy(f.user.id)).toEqual([]);
   });
 
   it('非法请求体返回 400', async () => {
@@ -227,7 +361,7 @@ describe('批量可用性', () => {
 });
 
 describe('认领与可用性的 D1 往返', () => {
-  it('单个认领成功 2 次、守卫失败 3 次，单个与批量可用性各 1 次，20 个批量认领 21 次', async () => {
+  it('999 个批量认领仅 11 次往返、24 条 SQL；单个认领与可用性往返保持不变', async () => {
     const f = await fixture();
     let probe = counting();
     await claimMailbox(probe.env, f.user.id, 'user', f.item('one'));
@@ -245,7 +379,8 @@ describe('认领与可用性的 D1 往返', () => {
     probe = counting();
     const result = await claimMailboxes(probe.env, f.user.id, 'user', items);
     expect(result.claimed).toHaveLength(MAX_BATCH_CLAIM);
-    expect(probe.trips()).toBe(1 + MAX_BATCH_CLAIM);
+    expect(probe.trips()).toBe(11);
+    expect(probe.queries()).toBe(24);
 
     // 并发认领在写入前占满按域额度：守卫拒绝，再读一次判定为并发用尽
     probe = counting(async (sql) => {
@@ -262,10 +397,10 @@ describe('批量认领中断', () => {
     const f = await fixture();
     const failure = new Error('D1_ERROR: transient');
     let inserts = 0;
-    const racing = counting(async (sql) => {
-      if (/INSERT INTO mailboxes/i.test(sql) && ++inserts === 3) throw failure;
+    const racing = counting(undefined, async (sqls) => {
+      if (sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql)) && ++inserts === 2) throw failure;
     });
-    const items = [f.item('a'), f.item('b'), f.item('c'), f.item('d')];
+    const items = Array.from({ length: 102 }, (_, index) => f.item(`failure${index}`));
     const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const ctx = createExecutionContext();
@@ -273,25 +408,25 @@ describe('批量认领中断', () => {
         headers: { Authorization: `Bearer ${f.user.jwt}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ items }) }, racing.env, ctx);
       await waitOnExecutionContext(ctx);
       const result = await data<BatchClaimMailboxResult>(response);
-      expect(result.claimed.map((box) => box.address)).toEqual([`${f.prefix}-a@${openDomain}`, `${f.prefix}-b@${openDomain}`]);
-      expect(result).toMatchObject({ taken: [], notAttempted: items.slice(2), stoppedBy: INTERRUPTED });
+      expect(result.claimed.map((box) => box.address)).toEqual(items.slice(0, 100).map((item) => `${item.localPart}@${item.domain}`));
+      expect(result).toMatchObject({ taken: [], notAttempted: items.slice(100), stoppedBy: INTERRUPTED });
       expect(logged.mock.calls.some((args) => args.includes(failure))).toBe(true);
     } finally {
       logged.mockRestore();
     }
-    expect(await ownedBy(f.user.id)).toEqual([`${f.prefix}-a@${openDomain}`, `${f.prefix}-b@${openDomain}`]);
+    expect(await ownedBy(f.user.id)).toHaveLength(100);
   });
 
   it('守卫未通过后诊断读取失败，同样收进 stoppedBy', async () => {
     const f = await fixture();
     let raced = false;
     // 写入前并发占满按域额度 → 守卫拒绝 → 诊断读取的 batch 失败
-    const racing = counting(async (sql) => {
-      if (/INSERT INTO mailboxes/i.test(sql) && !raced) {
+    const racing = counting(undefined, async (sqls) => {
+      if (sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql)) && !raced) {
         raced = true;
         await f.own(f.user.id, f.item('race', limitedDomain));
-      }
-    }, async () => { if (raced) throw new Error('D1_ERROR: diagnose failed'); });
+      } else if (raced) throw new Error('D1_ERROR: diagnose failed');
+    });
     const items = [f.item('x', limitedDomain), f.item('y')];
     const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
