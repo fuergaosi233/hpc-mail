@@ -234,6 +234,48 @@ describe('批量认领', () => {
     expect(await ownedBy(f.user.id)).toHaveLength(2);
   });
 
+  it.each(['quota', 'domains', 'policy'] as const)('新地址并发被占用同时 %s 守卫失效：先停止，不能记为 taken 后继续', async (change) => {
+    const f = await fixture();
+    const first = f.item('raced-first', change === 'quota' ? limitedDomain : openDomain);
+    const items = [first, f.item('must-not-claim')];
+    let raced = false;
+    const racing = counting(undefined, async (sqls) => {
+      if (!raced && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
+        raced = true;
+        await f.own(f.user.id, first);
+        if (change === 'domains') await updateSettings(env, { domains: { list: [{ domain: openDomain, public: true, perUserLimit: 0 }] } });
+        if (change === 'policy') await db.update(users).set({ mailboxPolicyRevision: 1 }).where(eq(users.id, f.user.id));
+      }
+    });
+    const result = await claimMailboxes(racing.env, f.user.id, 'user', items);
+    expect(result).toMatchObject({ claimed: [], taken: [], notAttempted: items, stoppedBy: { code: change === 'quota' ? 'forbidden' : 'conflict' } });
+    expect(await ownedBy(f.user.id)).toEqual([`${first.localPart}@${first.domain}`]);
+  });
+
+  it('并发新增占用地址的重复项仍复核实时额度，阻止后面的其他域写入', async () => {
+    const f = await fixture();
+    await updateSettings(env, { domains: { list: [
+      { domain: openDomain, public: true, perUserLimit: 0 },
+      { domain: limitedDomain, public: true, perUserLimit: 2 },
+    ] } });
+    const first = f.item('repeated-race', limitedDomain);
+    const second = f.item('fills-quota', limitedDomain);
+    const items = [first, second, first, f.item('must-not-claim')];
+    let raced = false;
+    const racing = counting(undefined, async (sqls) => {
+      if (!raced && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
+        raced = true;
+        await f.own(f.user.id, first);
+      }
+    });
+    const result = await claimMailboxes(racing.env, f.user.id, 'user', items);
+    expect(result.claimed.map((box) => box.address)).toEqual([`${second.localPart}@${second.domain}`]);
+    expect(result.taken).toEqual([first]);
+    expect(result.notAttempted).toEqual(items.slice(2));
+    expect(result.stoppedBy).toEqual({ code: 'forbidden', message: '认领配额已在并发请求中用尽，请刷新后重试' });
+    expect(await ownedBy(f.user.id)).toEqual([first, second].map((item) => `${item.localPart}@${item.domain}`).sort());
+  });
+
   it.each(['disabled', 'role', 'policy'] as const)('事务前用户 %s 变化，拒绝整个未执行块', async (change) => {
     const f = await fixture();
     let raced = false;

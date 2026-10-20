@@ -312,7 +312,7 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
       WHEN policy_code IS NOT NULL THEN policy_code
       WHEN user_limit > 0 AND ?3 + added >= user_limit THEN 'quota'
       WHEN domain_limit > 0 AND owned_domain + domain_added >= domain_limit THEN 'domain_limit'
-      WHEN is_new AND (
+      WHEN was_taken = 0 AND (existing OR occurrence = 1) AND (
         (user_limit > 0 AND (SELECT COUNT(*) FROM mailboxes WHERE user_id = ?2) + added >= user_limit)
         OR (domain_limit > 0 AND (SELECT COUNT(*) FROM mailboxes WHERE user_id = ?2 AND mailboxes.domain = counted.domain) + domain_added >= domain_limit)
         OR COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) != ?4
