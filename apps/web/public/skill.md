@@ -16,7 +16,7 @@ description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和�
 | 已读（含按地址/域名/搜索词全部已读）、星标、回收站恢复/永久删除 | `/v1/messages…`：`mail.write`；或 JWT | [邮件、验证码与发送](references/mail.md) |
 | 发信、回复、转发、部分失败补发 | `POST /v1/messages`：`mail.send`；或 `POST /api/messages/send`：JWT | [邮件、验证码与发送](references/mail.md) |
 | 下载附件、流式/分片上传、附件 Token | 下载 `mail.read`；上传 `mail.send`；或 JWT | [附件](references/attachments.md) |
-| 为批量认领分配随机后缀（均匀随机或按 Claude 封号统计的低风险策略） | `/api/mailboxes/random-plan`；用户 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 为一次最多 999 个地址分配随机后缀（均匀随机或按 Claude 封号统计的低风险策略） | `/api/mailboxes/random-plan`；用户 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 列出自己的/共享的邮箱、检查地址可用性及不可用原因 | `/v1/mailboxes…`：`mailbox.read`；或 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 认领、改显示名、释放邮箱与清除历史 | `/v1/mailboxes…`：`mailbox.write`；或 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 登录/注册/登出、密码、头像、两步验证 | `/api/auth…`；JWT，登录/注册除外 | [鉴权、请求与 Key 管理](references/auth-and-http.md) |

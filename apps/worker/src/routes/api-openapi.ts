@@ -1,3 +1,4 @@
+import { MAX_BATCH_CLAIM } from '@hpc-mail/shared';
 import {
   array, bool, changed, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, okResult, operation,
   page, pageQuery, query, ref, scopeQuery, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
@@ -54,7 +55,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/mailboxes/availability/batch': { post: operation('Check availability of several addresses', array(ref('MailboxAvailability')), { request: 'BatchMailboxRequest',
       description: 'Advisory only, same rules as GET /mailboxes/availability. Results follow request order.' }) },
     '/mailboxes/random-plan': { get: operation('Allocate random suffixes for a batch claim', ref('ClaimPlan'), {
-      parameters: [query('count', { type: 'integer', minimum: 1, maximum: 20 }, 'Number of addresses to allocate.', true),
+      parameters: [query('count', { type: 'integer', minimum: 1, maximum: MAX_BATCH_CLAIM }, 'Number of addresses to allocate.', true),
         query('strategy', { type: 'string', enum: ['uniform', 'claude'] }, 'uniform: equal chance among eligible domains; claude: fewest Claude suspensions first, then fewest Claude accounts plus pending claims, spread evenly.', true)],
       description: 'JWT only. Read-only: allocates domains, does not claim or reserve. Candidates are the domains the caller may claim with domains.list[].random true, trimmed by per-domain and per-user remaining quota. The claude strategy also excludes domains with claim_random risk (wiped, paid_suspended or suspended_rate), skips domains whose additions in the last 24 hours reached claim_random.dailyLimit (stopping rather than moving to domains with more suspensions), and reports how many Claude suspensions each allocated domain has. Generate prefixes, then check availability and claim with the batch endpoints.' }) },
     '/mailboxes/availability': { get: operation('Check mailbox availability', ref('MailboxAvailability'), { parameters: [query('localPart', str, undefined, true), query('domain', str, undefined, true)],

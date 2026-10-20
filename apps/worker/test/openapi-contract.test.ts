@@ -22,6 +22,15 @@ function visit(value: unknown, callback: (value: Schema) => void) {
 }
 
 describe('OpenAPI routes and public contracts', () => {
+  it('publishes 999 as the batch claim, availability and random-plan upper bound', () => {
+    const batch = specs.api.components.schemas.BatchMailboxRequest!;
+    expect((batch.properties as Record<string, Schema>).items).toMatchObject({ minItems: 1, maxItems: 999 });
+    const params = specs.api.paths['/mailboxes/random-plan']!.get!.parameters as Array<{ name: string; schema: Schema }>;
+    expect(params.find((param) => param.name === 'count')?.schema).toMatchObject({ minimum: 1, maximum: 999 });
+    for (const path of ['/mailboxes/batch', '/mailboxes/availability/batch']) {
+      expect(specs.api.paths[path]!.post!.requestBody).toMatchObject({ content: { 'application/json': { schema: { $ref: '#/components/schemas/BatchMailboxRequest' } } } });
+    }
+  });
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
     const mounted = [...new Set(app.routes.filter(route => methods.has(route.method.toLowerCase()) && !route.path.includes('*'))
       .map(route => `${route.method} ${route.path.replace(/\/$/, '').replace(/:([^/]+)/g, '{$1}')}`))].sort();

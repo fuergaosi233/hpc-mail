@@ -74,7 +74,7 @@ export const MAX_DRAFT_ATTACHMENTS_PER_USER = 20;
 /** /api 未读数封顶：侧栏只显示到 99+、标题到 999+，数到上限即停；/v1 精确计数 */
 export const UNREAD_COUNT_CAP = 1000;
 /** 批量认领 / 批量可用性检查单次最多处理的地址数 */
-export const MAX_BATCH_CLAIM = 20;
+export const MAX_BATCH_CLAIM = 999;
 /** 批量共享单次最多处理的邮箱数 */
 export const MAX_BATCH_SHARE_MAILBOXES = 100;
 /** 每只邮箱最多共享给多少人（替换与批量追加共用） */
