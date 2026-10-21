@@ -250,6 +250,8 @@ export function MailboxesPage() {
   const shared = useSharedMailboxesQuery();
   const [searchParams, setSearchParams] = useSearchParams();
   const [claimOpen, setClaimOpen] = useState(false);
+  /** 认领弹窗预选的域名：/mailboxes?claim=1&domain=… 带入 */
+  const [claimDomain, setClaimDomain] = useState<string | undefined>();
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
   const [editing, setEditing] = useState<Mailbox | null>(null);
   const [sharing, setSharing] = useState<Mailbox | null>(null);
@@ -257,23 +259,32 @@ export function MailboxesPage() {
   const invalidateMailboxes = () =>
     invalidateMailboxOwnership(queryClient);
 
-  // /mailboxes?claim=1：从空收件箱等入口直达认领。域名就绪后打开一次并清掉参数，刷新不会重复弹出
+  // /mailboxes?claim=1[&domain=…]：从空收件箱、托管域名详情等入口直达认领。域名就绪后打开一次并清掉参数，刷新不会重复弹出
   const wantsClaim = searchParams.get('claim') === '1';
+  const wantedDomain = searchParams.get('domain') ?? undefined;
   useEffect(() => {
     if (!wantsClaim || visibleDomains === undefined) return;
-    if (visibleDomains.length > 0) setClaimOpen(true);
-    else toast({ title: '暂无可认领的域名', description: '请联系管理员配置可认领的域名。' });
+    if (visibleDomains.length > 0) {
+      setClaimDomain(wantedDomain);
+      setClaimOpen(true);
+    } else toast({ title: '暂无可认领的域名', description: '请联系管理员配置可认领的域名。' });
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
         next.delete('claim');
+        next.delete('domain');
         return next;
       },
       { replace: true },
     );
-  }, [wantsClaim, visibleDomains, setSearchParams]);
+  }, [wantsClaim, wantedDomain, visibleDomains, setSearchParams]);
 
   const items = mailboxes ?? [];
+  /** 页面上的认领按钮不预选域名 */
+  const openClaim = () => {
+    setClaimDomain(undefined);
+    setClaimOpen(true);
+  };
 
   return (
     <div className="mx-auto max-w-4xl">
@@ -281,7 +292,7 @@ export function MailboxesPage() {
         title="我的邮箱"
         description="认领邮箱地址收发邮件，也可把来信只读共享给其他用户。"
         actions={
-          <Button disabled={!visibleDomains?.length} onClick={() => setClaimOpen(true)}>
+          <Button disabled={!visibleDomains?.length} onClick={openClaim}>
             <Plus className="size-4" />
             认领地址
           </Button>
@@ -298,7 +309,7 @@ export function MailboxesPage() {
           icon={AtSign}
           title="还没有认领任何地址"
           description="认领一个地址后即可收发邮件。"
-          action={<Button disabled={!visibleDomains?.length} onClick={() => setClaimOpen(true)}>认领地址</Button>}
+          action={<Button disabled={!visibleDomains?.length} onClick={openClaim}>认领地址</Button>}
           className="rounded-lg border border-line bg-surface"
         />
       ) : isMobile ? (
@@ -358,7 +369,7 @@ export function MailboxesPage() {
           </CardList>}
       </section>
 
-      <ClaimDialog open={claimOpen} onOpenChange={setClaimOpen} domains={visibleDomains ?? []} />
+      <ClaimDialog open={claimOpen} onOpenChange={setClaimOpen} domains={visibleDomains ?? []} initialDomain={claimDomain} />
       <EditMailboxDialog mailbox={editing} onClose={() => setEditing(null)} />
       {sharing && <OwnMailboxShareDialog key={sharing.id} mailbox={sharing} onClose={() => setSharing(null)} />}
       <ReleaseDialog

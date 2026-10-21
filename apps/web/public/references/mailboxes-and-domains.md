@@ -6,7 +6,7 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD 在 JWT
 
 | 路径 | JWT `/api` | Key `/v1` |
 |---|---|---|
-| `GET /domains` | `data` 为域名字符串数组；系统域名之后附上自己拥有或被共享、已生效的托管域名 | `data:{domains:[...]}`，任一有效 Key，范围同左 |
+| `GET /domains` | `data` 为域名字符串数组；系统域名之后附上已生效的托管域名：普通用户为自己拥有或被共享的，管理员为全部 | `data:{domains:[...]}`，任一有效 Key，范围同左 |
 | `GET /mailboxes` | 自己认领的数组 | 同左，`mailbox.read` |
 | `GET /mailboxes?all=1` | 管理员全站数组；普通用户不能请求全站范围 | 同左，`mailbox.read` 加管理员角色 |
 | `GET /mailboxes/shared` | 分享给自己的只读管理员邮箱数组 | 同左，`mailbox.read` |
@@ -116,7 +116,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 
 状态：`pending` 等待改 NS → NS 生效后系统自动开通收件与发信（`provisioning`）→ `active`。`error` 为开通或巡检未通过（自动重试），`moved` 为 NS 已不再指向本站，`suspended` 为管理员暂停（拒收、禁止发信与新认领），`deleting` 为删除中。定时任务约每 5 分钟推进一次。
 
-- 权限：所有者与管理员可查看进度、管理成员、过户、删除；成员只能在该域认领地址（受 `memberLimit` 与系统保留前缀约束），看不到域名设置，也看不到他人地址的邮件；其他用户看到 404。管理员额外可用 `POST /admin/hosted-domains/:id/suspend|resume`。
+- 权限：所有者与管理员可查看进度、管理成员、过户、删除；管理员还能在任何人的托管域名下认领地址，并像其他邮箱一样用 `/admin/mailboxes/:id/transfer`、`/admin/mailbox-shares` 过户或共享其中的地址（含自动认领给所有者的地址）；成员只能在该域认领地址（受 `memberLimit` 与系统保留前缀约束），看不到域名设置，也看不到他人地址的邮件；其他用户看到 404。管理员额外可用 `POST /admin/hosted-domains/:id/suspend|resume`。
 - 收件：已生效域名上**未认领地址的来信自动认领给域名所有者**，直接出现在所有者收件箱并按其个人偏好通知；域内地址达到 `hosted_domains.autoClaimLimit`（默认 1000）后，未认领新地址的来信拒收；暂停或删除中的域名拒收。释放托管域名下的地址且保留历史时，下一封来信会把该地址连同历史邮件自动认领给域名所有者；不想留给所有者就用 `deleteHistory=1` 释放。
 - 认领与发信：托管域名的地址不占全站每人认领上限；所有者不受保留前缀限制。从托管域名发信要求 `steps.sending` 为 ready，否则返回 400。
 - 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400；Cloudflare 限流 429。

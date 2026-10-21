@@ -584,6 +584,41 @@ describe('托管域名的过户与删除', () => {
 });
 
 describe('管理员', () => {
+  it('管理员可在任何人的托管域名下认领地址，并过户或共享其中的地址（含自动认领给所有者的）', async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const other = await f.actor('other');
+    const admin = await f.actor('admin', 'admin');
+    const domain = f.domain();
+    await activeDomain(cf, owner, domain);
+    // 认领弹窗的域名来源：管理员看得到他人的托管域名，其他普通用户看不到
+    expect(await data<string[]>(await call('GET', '/domains', admin.jwt))).toContain(domain);
+    expect(await data<string[]>(await call('GET', '/domains', other.jwt))).not.toContain(domain);
+    expect(await data<{ address: string; available: boolean }>(await call('GET', `/mailboxes/availability?localPart=postmaster&domain=${domain}`, admin.jwt)))
+      .toMatchObject({ available: true });
+    const claimed = await data<Mailbox>(await call('POST', '/mailboxes', admin.jwt, { localPart: 'postmaster', domain }), 201);
+    expect(claimed.userId).toBe(admin.id);
+    const batch = await data<{ claimed: Mailbox[]; stoppedBy: unknown }>(await call('POST', '/mailboxes/batch', admin.jwt, {
+      items: [{ localPart: 'ops1', domain }, { localPart: 'ops2', domain }],
+    }));
+    expect(batch).toMatchObject({ stoppedBy: null });
+    expect(batch.claimed.map((box) => box.userId)).toEqual([admin.id, admin.id]);
+
+    // 自动认领给所有者的地址：管理员过户给其他用户（保留历史），再共享给所有者只读
+    await receive(`auto@${domain}`, `${f.prefix}-adm1`);
+    const auto = (await db.select().from(mailboxes).where(eq(mailboxes.address, `auto@${domain}`)).get())!;
+    expect(auto.userId).toBe(owner.id);
+    const moved = await data<{ transferred: boolean; mailbox: Mailbox }>(await call('POST', `/admin/mailboxes/${auto.id}/transfer`, admin.jwt,
+      { userId: other.id, expectedOwnerId: owner.id }));
+    expect(moved).toMatchObject({ transferred: true, mailbox: { userId: other.id, messageCount: 1 } });
+    const shared = await data<{ grantees: { userId: number }[] }>(await call('PUT', '/admin/mailbox-shares', admin.jwt,
+      { mailboxId: auto.id, userIds: [owner.id], expectedOwnerId: other.id }));
+    expect(shared.grantees.map((grantee) => grantee.userId)).toEqual([owner.id]);
+    // 过户后新来信归新主人
+    expect((await receive(`auto@${domain}`, `${f.prefix}-adm2`)).stored?.notifyOwnerIds).toEqual([other.id]);
+  });
+
   it('删除拥有托管域名的用户前须先过户或删除；成员被删除时移出成员名单', async () => {
     const cf = fakeCloudflare();
     const f = await fixture();

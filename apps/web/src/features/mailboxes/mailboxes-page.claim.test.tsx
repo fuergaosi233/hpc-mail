@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import type { SessionUser } from '@hpc-mail/shared';
 import { CurrentUserContext } from '@/lib/use-session';
 vi.mock('@/api/resources', () => ({ mailboxApi: { availability: vi.fn(async () => ({ available: true })) } }));
-vi.mock('@/lib/use-config', () => ({ useDomains: () => ({ data: ['example.com'] }) }));
+const domains = vi.hoisted(() => ({ data: ['example.com'] }));
+vi.mock('@/lib/use-config', () => ({ useDomains: () => domains }));
 vi.mock('./use-mailboxes', () => ({
   useSharedMailboxesQuery: () => ({ data: [{ mailboxId: 10, address: 'shared@example.com', domain: 'example.com', ownerUsername: 'other-owner', displayName: '' }], isLoading: false, isError: false }),
   useMailboxesQuery: () => ({
@@ -38,6 +39,19 @@ describe('我的邮箱', () => {
     expect(await screen.findByRole('dialog', { name: '认领邮箱地址' })).toBeInTheDocument();
     await waitFor(() => expect(router.state.location.search).toBe(''));
     client.clear();
+  });
+
+  it('?claim=1&domain= 打开认领对话框并预选该域名（托管域名详情页的入口）', async () => {
+    domains.data = ['example.com', 'hosted.example'];
+    try {
+      const { client, router } = renderPage('/mailboxes?claim=1&domain=hosted.example');
+      const dialog = await screen.findByRole('dialog', { name: '认领邮箱地址' });
+      await waitFor(() => expect(within(dialog).getByRole('combobox', { name: '域名' })).toHaveTextContent('hosted.example'));
+      await waitFor(() => expect(router.state.location.search).toBe(''));
+      client.clear();
+    } finally {
+      domains.data = ['example.com'];
+    }
   });
 
   it('地址链接到只看该地址的收件箱，旁边可复制', () => {
