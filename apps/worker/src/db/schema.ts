@@ -274,6 +274,58 @@ export const claudeAddressFacts = sqliteTable(
   (t) => [index('idx_claude_facts_domain').on(t.domain)],
 );
 
+/**
+ * 用户托管域名：zone 建在站长 Cloudflare 账户，用户把 NS 改过来后自动开通收发。
+ * 只操作本表记录过的 zone_id，从不接管账户里已有的 zone。未认领地址的来信自动认领给 user_id。
+ */
+export const hostedDomains = sqliteTable(
+  'hosted_domains',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    domain: text('domain').notNull().unique(),
+    userId: integer('user_id').notNull(),
+    status: text('status', {
+      enum: ['pending', 'provisioning', 'active', 'error', 'moved', 'suspended', 'deleting'],
+    }).notNull().default('pending'),
+    /** 创建请求先占位，zone 建好后回填；null 表示占位后 zone 尚未创建成功 */
+    zoneId: text('zone_id'),
+    nameServers: text('name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    originalNameServers: text('original_name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    originalRegistrar: text('original_registrar').notNull().default(''),
+    /** 以下四列是最近一次核对 Cloudflare 的结果，供状态展示与发信判断 */
+    zoneStatus: text('zone_status').notNull().default(''),
+    routingStatus: text('routing_status').notNull().default(''),
+    catchAllReady: integer('catch_all_ready', { mode: 'boolean' }).notNull().default(false),
+    sendingStatus: text('sending_status').notNull().default(''),
+    sendingTag: text('sending_tag'),
+    /** 公共 DNS 仍能查到 DS 记录：切换 NS 前必须先在注册商关闭 DNSSEC */
+    dnssec: integer('dnssec', { mode: 'boolean' }).notNull().default(false),
+    lastError: text('last_error').notNull().default(''),
+    /** 每位成员在该域名下最多认领的地址数（0=不限） */
+    memberLimit: integer('member_limit').notNull().default(0),
+    checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
+    activatedAt: integer('activated_at', { mode: 'timestamp_ms' }),
+    updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [index('idx_hosted_domains_user').on(t.userId), index('idx_hosted_domains_status').on(t.status, t.checkedAt)],
+);
+
+/** 托管域名成员：可在该域名下认领地址，不改变域名归属，也看不到他人地址的邮件 */
+export const hostedDomainMembers = sqliteTable(
+  'hosted_domain_members',
+  {
+    domainId: integer('domain_id').notNull(),
+    userId: integer('user_id').notNull(),
+    grantedBy: integer('granted_by').notNull(),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.domainId, t.userId] }),
+    index('idx_hosted_domain_members_user').on(t.userId),
+  ],
+);
+
 export const settings = sqliteTable('settings', {
   key: text('key').primaryKey(),
   value: text('value').notNull(),

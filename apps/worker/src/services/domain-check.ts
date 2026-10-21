@@ -15,7 +15,7 @@ interface DohResponse {
 }
 
 /** DNS-over-HTTPS JSON 查询（Cloudflare 公共 resolver，纯边缘子请求，不需任何凭据） */
-async function dohQuery(name: string, type: 'MX' | 'TXT'): Promise<DohAnswer[]> {
+async function dohQuery(name: string, type: 'MX' | 'TXT' | 'DS'): Promise<DohAnswer[]> {
   const url = `${DOH_ENDPOINT}?name=${encodeURIComponent(name)}&type=${type}`;
   const res = await fetch(url, {
     headers: { accept: 'application/dns-json' },
@@ -73,4 +73,9 @@ export async function checkDomainOnboarding(
   }
   const mxReady = mxRecords.some((host) => host.endsWith(CF_MX_SUFFIX));
   return { domain, inList, mxReady, spfReady, mxRecords, resolved };
+}
+
+/** 父域仍发布 DS 记录即 DNSSEC 已开启：此时切换 NS 会让解析校验失败，需先在注册商关闭 */
+export async function hasDnssec(domain: string): Promise<boolean> {
+  return (await dohQuery(domain, 'DS')).some((answer) => answer.type === 43);
 }

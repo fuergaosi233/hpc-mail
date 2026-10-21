@@ -1,4 +1,4 @@
-import { MAX_BATCH_CLAIM } from '@hpc-mail/shared';
+import { HOSTED_DOMAIN_STATUSES, MAX_BATCH_CLAIM } from '@hpc-mail/shared';
 import {
   array, bool, changed, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, okResult, operation,
   page, pageQuery, query, ref, scopeQuery, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
@@ -29,7 +29,30 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/auth/2fa/disable': { post: operation('Disable two-factor authentication', success, { request: 'DisableTwoFactorRequest',
       description: 'An enrolled account must supply its current password or a valid TOTP code.' }) },
     '/auth/logout': { post: operation('Revoke the current session', success) },
-    '/domains': { get: operation('List configured domains visible to this user', array(str), { description: 'Returns data as an array, unlike /v1/domains data.domains. Ordinary users see public domains or the domains allowed by their dedicated mailboxPolicy. Dedicated policies replace public visibility and quotas; explicitly granted private domains are allowed. Adding/managing domains requires administrator settings; claiming an address is a separate operation.' }) },
+    '/domains': { get: operation('List configured domains visible to this user', array(str), { description: 'Returns data as an array, unlike /v1/domains data.domains. Ordinary users see public domains or the domains allowed by their dedicated mailboxPolicy. Dedicated policies replace public visibility and quotas; explicitly granted private domains are allowed. Active hosted domains the caller owns or was granted follow the system domains. Adding/managing system domains requires administrator settings; users host their own domains with /hosted-domains; claiming an address is a separate operation.' }) },
+    '/hosted-domains': {
+      get: operation('List hosted domains the caller owns or was granted', array(ref('HostedDomain')), {
+        description: 'Users can host their own domains on this site. Each item has role owner or member; administrators also see only their own here and use /admin/hosted-domains for all.' }),
+      post: operation('Host a domain', ref('HostedDomain'), { request: 'CreateHostedDomainRequest', status: 201,
+        description: 'Requires /config hostedDomainsEnabled. Enter a registered root domain (not a subdomain). The site creates a Cloudflare zone and returns status pending with the two nameServers to set at the registrar; the domain is then used only for mail and its existing website DNS records are not migrated. Disable DNSSEC at the registrar first. After the nameservers take effect, receiving (Email Routing catch-all) and sending (Email Sending) are configured automatically; poll GET /hosted-domains/{id}. Mail to any unclaimed address on an active hosted domain is claimed for the owner on arrival. Ordinary users obey hosted_domains.maxPerUser and pending limits; domains already used on this site, system domains and zones already in the site account are rejected with 409.' }),
+    },
+    '/hosted-domains/{id}': {
+      get: operation('Read a hosted domain and its setup progress', ref('HostedDomain'), { description: 'Owner, member or administrator; otherwise 404.' }),
+      put: operation('Set the per-member claim limit', ref('HostedDomain'), { request: 'UpdateHostedDomainRequest', description: 'Owner or administrator.' }),
+      delete: operation('Stop hosting and delete the domain', success, {
+        description: 'Owner or administrator. Irreversible: the domain enters deleting, rejects mail immediately, then every message on the domain is permanently deleted, all its addresses are released and the Cloudflare zone is removed. Restore the original nameservers at the registrar first or the domain stops resolving.' }),
+    },
+    '/hosted-domains/{id}/check': { post: operation('Check the nameservers and continue setup now', ref('HostedDomain'), {
+      description: 'Owner or administrator. Asks Cloudflare to re-check nameservers while pending, then advances setup. Calls within 15 seconds of the last check return the current state.' }) },
+    '/hosted-domains/{id}/members': {
+      get: operation('List members of a hosted domain', array(ref('HostedDomainMember')), { description: 'Owner or administrator.' }),
+      put: operation('Replace the members of a hosted domain', array(ref('HostedDomainMember')), { request: 'ReplaceHostedDomainMembersRequest',
+        description: 'Owner or administrator. Members may claim addresses on the domain (subject to memberLimit and reserved prefixes) and only see mail of addresses they claimed. userIds replaces the whole list; removed members keep addresses they already claimed. expectedOwnerId must be the current owner, otherwise 409. Find users with GET /mailboxes/share-users.' }),
+    },
+    '/hosted-domains/{id}/members/{userId}': { delete: operation('Remove a member or leave a shared domain', success, {
+      description: 'Owner or administrator removes any member; a member may remove themselves. Their claimed addresses are kept.' }) },
+    '/hosted-domains/{id}/transfer': { post: operation('Transfer a hosted domain to another user', ref('HostedDomainTransferResult'), { request: 'TransferHostedDomainRequest',
+      description: 'Owner or administrator. The target must be an active user; ordinary owners are limited by the target’s hosted_domains.maxPerUser. includeMailboxes moves the previous owner’s addresses on the domain with all history and revokes their mailbox shares. Members are kept. A stale expectedOwnerId returns 409; retrying a completed transfer returns transferred=false.' }) },
     '/mailboxes': {
       get: operation('List caller-owned mailboxes', array(ref('Mailbox')), { parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator all=1 or true includes all owners; ordinary users cannot request this range.')] }),
       post: operation('Claim an address on a configured domain', ref('Mailbox'), { request: 'ClaimMailboxRequest', status: 201,
@@ -149,6 +172,15 @@ export function buildSessionOpenApiSpec(origin: string) {
       description: 'One item per configured domain, in list order. Judged from official Claude/Anthropic mail by MIME From and subject; senders are not DKIM-verified. Facts are kept after mail is deleted and are refreshed every 5 minutes.' }) },
     '/admin/settings/domain-status': { get: operation('Check public domain DNS onboarding', ref('DomainStatus'), { ...admin, parameters: [query('domain', str, undefined, true)],
       description: 'Checks MX/SPF via public DNS. Cannot prove the private Cloudflare catch-all target or end-to-end email delivery.' }) },
+    '/admin/hosted-domains': { get: operation('List all hosted domains', array(ref('HostedDomain')), { ...admin,
+      parameters: [query('status', { type: 'string', enum: HOSTED_DOMAIN_STATUSES }), query('q', { type: 'string', maxLength: 253 }, 'Domain or owner username substring.')],
+      description: 'Administrators manage details, members, transfer and deletion through /hosted-domains/{id} with full rights.' }) },
+    '/admin/hosted-domains/health': { get: operation('Check hosted domain prerequisites', ref('HostedDomainsHealth'), { ...admin,
+      description: 'Whether the Worker has Cloudflare credentials, whether the token verifies, and the account zone counts. Cloudflare blocks new zones when an account has more than 50 zones and more pending than active ones.' }) },
+    '/admin/hosted-domains/{id}/suspend': { post: operation('Suspend a hosted domain', ref('HostedDomain'), { ...admin,
+      description: 'Rejects incoming mail, blocks sending and new claims. Addresses and history are kept.' }) },
+    '/admin/hosted-domains/{id}/resume': { post: operation('Resume a suspended hosted domain', ref('HostedDomain'), { ...admin,
+      description: 'Re-checks Cloudflare immediately and returns to the matching state.' }) },
     '/admin/mailbox-shares': {
       get: operation('List grants on all claimed mailboxes', array(ref('MailboxShareGrant')), { ...admin,
         parameters: [query('mailboxId', { type: 'integer', minimum: 1 }, 'Only this mailbox (at most one item).')] }),

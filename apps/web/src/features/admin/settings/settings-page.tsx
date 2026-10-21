@@ -244,6 +244,8 @@ export function SettingsPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.config });
       // 排除阈值与未注册天数会改变各域名的 Claude 统计与排除原因
       void queryClient.invalidateQueries({ queryKey: queryKeys.admin.domainClaudeStats });
+      // 托管总开关会改变运行状态卡片
+      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.hostedDomainsHealth });
       toast({ title: '设置已保存', variant: 'success' });
     },
     onError: (err) => toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' }),
@@ -471,6 +473,64 @@ export function SettingsPage() {
               onChange={(v) => patch((s) => void (s.claim_random.pendingDays = v))}
               max={90}
               suffix="天"
+            />
+          </Section>
+        )}
+
+        {draft.hosted_domains && (
+          <Section
+            title="域名托管"
+            description="用户把自己的域名托管到本站用作邮箱后缀。需要 Worker 已配置 Cloudflare 凭据，运行状态见「托管域名」页。"
+          >
+            <ToggleRow
+              label="启用域名托管"
+              description="关闭后不再显示「我的域名」入口，用户不能添加新域名或手动检测；已托管的域名照常收发。"
+              checked={draft.hosted_domains.enabled}
+              onChange={(value) => patch((s) => void (s.hosted_domains.enabled = value))}
+            />
+            <NumberRow
+              label="每人最多托管域名数"
+              description="普通用户最多拥有的托管域名数，管理员不受限。0 表示不限。"
+              value={draft.hosted_domains.maxPerUser}
+              onChange={(v) => patch((s) => void (s.hosted_domains.maxPerUser = v))}
+              max={1000}
+              suffix="个"
+            />
+            <NumberRow
+              label="每人同时等待生效数"
+              description="普通用户同时处于「等待修改 NS」状态的域名数。"
+              value={draft.hosted_domains.maxPendingPerUser}
+              onChange={(v) => patch((s) => void (s.hosted_domains.maxPendingPerUser = v))}
+              min={1}
+              max={100}
+              suffix="个"
+            />
+            <NumberRow
+              label="全站同时等待生效数"
+              description="含管理员。Cloudflare 在账户超过 50 个 zone 且等待生效的多于已生效时禁止新增，此项用于保护站长账户。"
+              value={draft.hosted_domains.maxPendingTotal}
+              onChange={(v) => patch((s) => void (s.hosted_domains.maxPendingTotal = v))}
+              min={1}
+              max={1000}
+              suffix="个"
+            />
+            <NumberRow
+              label="等待生效天数"
+              description="超过这个天数仍未改好 NS 的域名自动删除（Cloudflare 免费计划 28 天后也会删除）。"
+              value={draft.hosted_domains.pendingDays}
+              onChange={(v) => patch((s) => void (s.hosted_domains.pendingDays = v))}
+              min={1}
+              max={28}
+              suffix="天"
+            />
+            <NumberRow
+              label="每域自动认领上限"
+              description="未认领地址的来信会自动认领给域名所有者；域内地址达到该数后不再自动认领，新地址的来信拒收，防止随机地址的垃圾邮件无限建地址。手动认领不受此限。"
+              value={draft.hosted_domains.autoClaimLimit}
+              onChange={(v) => patch((s) => void (s.hosted_domains.autoClaimLimit = v))}
+              min={1}
+              max={100000}
+              suffix="个"
             />
           </Section>
         )}

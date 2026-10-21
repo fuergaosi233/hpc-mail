@@ -1,0 +1,757 @@
+import type {
+  AdminHostedDomainsQuery, HostedDomain, HostedDomainMember, HostedDomainRole, HostedDomainSteps, HostedDomainStepState,
+  HostedDomainTransferResult, HostedDomainsHealth, Settings, TransferHostedDomainRequest,
+} from '@hpc-mail/shared';
+import { and, desc, eq, inArray, notInArray, or, sql, type SQL } from 'drizzle-orm';
+import { createDb } from '../db/client.js';
+import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
+import { AppError } from '../lib/errors.js';
+import type { AuthUser, Env, ExecCtx } from '../types.js';
+import { logAdminAction } from './audit.js';
+import {
+  CloudflareApiError, catchAllTargetsWorker, cloudflareCredentials, countZones, createSendingSubdomain, createZone, deleteSendingSubdomain,
+  deleteZone, enableRouting, findZone, getCatchAll, getRouting, getSendingDnsStatus, getZone, isCloudflareNotFound,
+  isTransientCloudflareError, listSendingSubdomains, putCatchAll, repairSendingDns, requestActivationCheck, verifyToken,
+  type CloudflareCredentials,
+} from './cloudflare.js';
+import { hasDnssec } from './domain-check.js';
+import { purgeMatchingMessages } from './message-lifecycle.js';
+import { getSettings, getSettingsFresh } from './setting.js';
+
+type HostedRow = typeof hostedDomains.$inferSelect;
+type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
+type Access = HostedDomainRole | null;
+
+const MINUTE = 60_000;
+const DAY = 24 * 60 * MINUTE;
+/** NS 生效后这段时间内未全部就绪仍算 provisioning，之后转为 error 并降低重试频率 */
+const PROVISION_GRACE_MS = 30 * MINUTE;
+/** 「立即检测」的最短间隔，避免连点刷 Cloudflare API */
+const CHECK_THROTTLE_MS = 15_000;
+/** 占位后迟迟没有 zone_id：超过该时长视为创建请求中断，由定时任务收尾 */
+const RESERVATION_STALE_MS = 10 * MINUTE;
+/** 删除时单次定时任务清理邮件的时长上限，剩余的下次继续 */
+const TEARDOWN_PURGE_MS = 8_000;
+
+const SYSTEM_ACTOR = { id: 0, username: 'system' };
+
+/** 功能可用：设置总开关打开且 Worker 配置了 Cloudflare 凭据 */
+export function hostedDomainsAvailable(env: Env, settings: Pick<Settings, 'hosted_domains'>): boolean {
+  return settings.hosted_domains.enabled && cloudflareCredentials(env) !== null;
+}
+
+function requireCredentials(env: Env, settings: Pick<Settings, 'hosted_domains'>): CloudflareCredentials {
+  const creds = cloudflareCredentials(env);
+  if (!settings.hosted_domains.enabled || !creds) throw new AppError('forbidden', '本站未开启域名托管');
+  return creds;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** 后台任务：有 ctx 放进 waitUntil，没有时（定时任务、单测）同步等待 */
+async function runDetached(ctx: ExecCtx | null | undefined, label: string, task: () => Promise<unknown>): Promise<void> {
+  const guarded = task().catch((error) => console.error(`${label}失败:`, error));
+  if (ctx) ctx.waitUntil(guarded);
+  else await guarded;
+}
+
+// ---------------------------------------------------------------------------
+// 视图
+
+function viewColumns(viewerId: number) {
+  return {
+    row: hostedDomains,
+    ownerUsername: users.username,
+    memberCount: sql<number>`(SELECT COUNT(*) FROM hosted_domain_members m WHERE m.domain_id = ${hostedDomains.id})`,
+    mailboxCount: sql<number>`(SELECT COUNT(*) FROM mailboxes b WHERE b.domain = ${hostedDomains.domain})`,
+    isMember: sql<number>`EXISTS (SELECT 1 FROM hosted_domain_members m
+      WHERE m.domain_id = ${hostedDomains.id} AND m.user_id = ${viewerId})`,
+  };
+}
+
+interface ViewRow {
+  row: HostedRow;
+  ownerUsername: string | null;
+  memberCount: number;
+  mailboxCount: number;
+  isMember: number;
+}
+
+function stepsOf(row: HostedRow): HostedDomainSteps {
+  const failed = row.status === 'error';
+  const state = (ready: boolean): HostedDomainStepState => (ready ? 'ready' : failed ? 'error' : 'waiting');
+  return {
+    nameServers: row.zoneStatus === 'active' ? 'ready' : row.status === 'moved' ? 'error' : 'waiting',
+    routing: state(row.routingStatus === 'ready'),
+    catchAll: state(row.catchAllReady),
+    sending: state(row.sendingStatus === 'ready'),
+  };
+}
+
+function warningsOf(row: HostedRow): string[] {
+  const warnings: string[] = [];
+  if (row.status === 'pending' && row.dnssec) {
+    warnings.push('该域名仍开启着 DNSSEC（父域存在 DS 记录）。请先在注册商处关闭 DNSSEC，再修改名称服务器，否则切换后域名将无法解析。');
+  }
+  if (row.status === 'pending' && /cloudflare/i.test(row.originalRegistrar)) {
+    warnings.push('该域名注册在 Cloudflare Registrar，它通常不允许改用其他账户的名称服务器，可能需要先把域名转出到其他注册商。');
+  }
+  if (row.status === 'moved') {
+    warnings.push('域名的名称服务器已不再指向本站，收发已停止。如需继续使用，请把 NS 改回上面两条。');
+  }
+  return warnings;
+}
+
+function roleOf(row: HostedRow, viewer: Viewer, isMember: boolean): Access {
+  if (row.userId === viewer.id) return 'owner';
+  if (viewer.role === 'admin') return 'admin';
+  return isMember ? 'member' : null;
+}
+
+/** 查看者没有任何权限时返回 null */
+function toView(view: ViewRow, viewer: Viewer, pendingDays: number): HostedDomain | null {
+  const { row } = view;
+  const role = roleOf(row, viewer, Number(view.isMember) === 1);
+  if (!role) return null;
+  const iso = (value: Date | null) => (value ? value.toISOString() : null);
+  return {
+    id: row.id,
+    domain: row.domain,
+    status: row.status,
+    role,
+    ownerUserId: row.userId,
+    ownerUsername: view.ownerUsername ?? `user#${row.userId}`,
+    nameServers: row.nameServers,
+    originalNameServers: row.originalNameServers,
+    originalRegistrar: row.originalRegistrar,
+    steps: stepsOf(row),
+    warnings: warningsOf(row),
+    lastError: row.lastError,
+    memberLimit: row.memberLimit,
+    memberCount: Number(view.memberCount),
+    mailboxCount: Number(view.mailboxCount),
+    createdAt: row.createdAt.toISOString(),
+    activatedAt: iso(row.activatedAt),
+    checkedAt: iso(row.checkedAt),
+    expiresAt: row.status === 'pending' ? new Date(row.createdAt.getTime() + pendingDays * DAY).toISOString() : null,
+  };
+}
+
+async function loadViews(env: Env, viewer: Viewer, where: SQL | undefined, limit = 500): Promise<HostedDomain[]> {
+  const [rows, settings] = await Promise.all([
+    createDb(env).select(viewColumns(viewer.id)).from(hostedDomains)
+      .leftJoin(users, eq(users.id, hostedDomains.userId))
+      .where(where).orderBy(desc(hostedDomains.id)).limit(limit).all(),
+    getSettings(env),
+  ]);
+  return rows.map((row) => toView(row as ViewRow, viewer, settings.hosted_domains.pendingDays))
+    .filter((view): view is HostedDomain => view !== null);
+}
+
+/** 读取域名并判定查看者身份；没有任何权限时按不存在处理，不暴露他人域名 */
+async function loadAccess(env: Env, viewer: Viewer, id: number): Promise<{ row: HostedRow; access: Exclude<Access, null> }> {
+  const db = createDb(env);
+  const found = await db.select({
+    row: hostedDomains,
+    isMember: sql<number>`EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = ${hostedDomains.id} AND m.user_id = ${viewer.id})`,
+  }).from(hostedDomains).where(eq(hostedDomains.id, id)).get();
+  const access = found ? roleOf(found.row, viewer, Number(found.isMember) === 1) : null;
+  if (!found || !access) throw new AppError('not_found', '域名不存在');
+  return { row: found.row, access };
+}
+
+function requireManage(access: Exclude<Access, null>): void {
+  if (access === 'member') throw new AppError('forbidden', '只有域名所有者或管理员可以执行此操作');
+}
+
+export async function getHostedDomain(env: Env, viewer: Viewer, id: number): Promise<HostedDomain> {
+  await loadAccess(env, viewer, id);
+  const [view] = await loadViews(env, viewer, eq(hostedDomains.id, id), 1);
+  if (!view) throw new AppError('not_found', '域名不存在');
+  return view;
+}
+
+/** 我拥有的与共享给我的（管理员也只看自己的，全站列表走管理员接口） */
+export async function listMyHostedDomains(env: Env, viewer: Viewer): Promise<HostedDomain[]> {
+  return loadViews(env, viewer, or(
+    eq(hostedDomains.userId, viewer.id),
+    sql`EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = ${hostedDomains.id} AND m.user_id = ${viewer.id})`,
+  ));
+}
+
+export async function listAllHostedDomains(env: Env, viewer: Viewer, query: AdminHostedDomainsQuery): Promise<HostedDomain[]> {
+  const conditions: (SQL | undefined)[] = [];
+  if (query.status) conditions.push(eq(hostedDomains.status, query.status));
+  if (query.q) {
+    // instr 按字面匹配，% 和 _ 不当通配符
+    conditions.push(or(sql`instr(${hostedDomains.domain}, ${query.q}) > 0`,
+      sql`${hostedDomains.userId} IN (SELECT id FROM users WHERE instr(lower(username), ${query.q}) > 0)`));
+  }
+  return loadViews(env, viewer, and(...conditions), 1000);
+}
+
+// ---------------------------------------------------------------------------
+// 创建
+
+function createZoneError(error: unknown): AppError {
+  if (error instanceof AppError) return error;
+  if (!(error instanceof CloudflareApiError)) return new AppError('internal', `Cloudflare 创建域名失败：${errorText(error)}`);
+  if (error.has(1061)) return new AppError('conflict', '该域名已存在于 Cloudflare 账户中，不能托管');
+  if (error.has(1049)) return new AppError('validation_failed', '该域名尚未注册，请先在注册商完成注册');
+  if (error.has(1099, 1093, 1116)) return new AppError('validation_failed', '请填写已注册的根域名（例如 example.com，而不是 mail.example.com）');
+  if (error.has(1110)) return new AppError('validation_failed', '暂时查不到该域名的注册信息，请稍后重试');
+  if (error.has(1097)) return new AppError('validation_failed', 'Cloudflare 不允许添加该域名');
+  if (error.has(1105)) return new AppError('rate_limited', 'Cloudflare 提示该域名尝试次数过多，请 3 小时后再试');
+  if (error.has(1118)) return new AppError('rate_limited', '站长的 Cloudflare 账户暂时不能添加更多域名，请稍后再试或联系管理员');
+  return new AppError('internal', `Cloudflare 创建域名失败：${error.message}`);
+}
+
+/** 占位守卫未通过：读回各项条件，给出具体原因 */
+async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: Settings['hosted_domains']): Promise<AppError> {
+  const [hosted, used, owned, pending, totalPending, user] = await env.db.batch([
+    env.db.prepare('SELECT user_id FROM hosted_domains WHERE domain = ?').bind(domain),
+    env.db.prepare(`SELECT (EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
+      OR EXISTS (SELECT 1 FROM messages WHERE domain = ?1)) AS used`).bind(domain),
+    env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status <> 'deleting'").bind(viewer.id),
+    env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status = 'pending'").bind(viewer.id),
+    env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE status = 'pending'"),
+    env.db.prepare("SELECT 1 FROM users WHERE id = ? AND status = 'active'").bind(viewer.id),
+  ]);
+  const first = <T>(result: D1Result | undefined) => result?.results?.[0] as T | undefined;
+  const holder = first<{ user_id: number }>(hosted);
+  if (holder) {
+    return new AppError('conflict', Number(holder.user_id) === viewer.id ? '你已经添加过该域名' : '该域名已被其他用户托管');
+  }
+  if (Number(first<{ used: number }>(used)?.used)) {
+    return new AppError('conflict', '本站已有该域名的历史地址或邮件，不能作为托管域名添加');
+  }
+  if (!first(user)) return new AppError('user_disabled', '用户已被禁用');
+  const isAdmin = viewer.role === 'admin';
+  if (!isAdmin && cfg.maxPerUser > 0 && Number(first<{ n: number }>(owned)?.n) >= cfg.maxPerUser) {
+    return new AppError('forbidden', `每人最多托管 ${cfg.maxPerUser} 个域名`);
+  }
+  if (!isAdmin && Number(first<{ n: number }>(pending)?.n) >= cfg.maxPendingPerUser) {
+    return new AppError('forbidden', '你还有域名在等待 NS 生效，请先完成或删除后再添加');
+  }
+  if (Number(first<{ n: number }>(totalPending)?.n) >= cfg.maxPendingTotal) {
+    return new AppError('rate_limited', '当前等待生效的域名较多，请稍后再试');
+  }
+  return new AppError('conflict', '域名状态已改变，请刷新后重试');
+}
+
+/**
+ * 添加托管域名：先在 D1 原子占位（唯一性、历史隔离、额度），再在站长账户建 zone。
+ * 从不接管账户里已有的同名 zone；建 zone 失败释放占位。能在 NS 生效前做的配置随后在后台尝试。
+ */
+export async function createHostedDomain(env: Env, viewer: Viewer, domain: string, ctx?: ExecCtx | null, ip = ''): Promise<HostedDomain> {
+  const settings = await getSettingsFresh(env);
+  const creds = requireCredentials(env, settings);
+  if (settings.domains.list.some((entry) => entry.domain === domain)) {
+    throw new AppError('conflict', '该域名已是本站的系统域名');
+  }
+  const cfg = settings.hosted_domains;
+  const reserved = await env.db.prepare(`INSERT INTO hosted_domains (domain, user_id, status)
+    SELECT ?1, ?2, 'pending'
+    WHERE NOT EXISTS (SELECT 1 FROM hosted_domains WHERE domain = ?1)
+      AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
+      AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?1)
+      AND (?3 = 1 OR ?4 = 0 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status <> 'deleting') < ?4)
+      AND (?3 = 1 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status = 'pending') < ?5)
+      AND (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') < ?6
+      AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active')
+    RETURNING id`)
+    .bind(domain, viewer.id, viewer.role === 'admin' ? 1 : 0, cfg.maxPerUser, cfg.maxPendingPerUser, cfg.maxPendingTotal)
+    .first<{ id: number }>();
+  if (!reserved) throw await reservationError(env, viewer, domain, cfg);
+  const id = Number(reserved.id);
+
+  let zone;
+  try {
+    if (await findZone(creds, domain)) {
+      throw new AppError('conflict', '该域名已存在于站长的 Cloudflare 账户中，不能作为托管域名添加');
+    }
+    zone = await createZone(creds, domain);
+  } catch (error) {
+    // 超时或 5xx 时 zone 可能已经建好：保留占位，由定时任务按名称找回或释放
+    if (isTransientCloudflareError(error) && !(error instanceof AppError)) {
+      throw new AppError('internal', 'Cloudflare 暂时没有响应，系统会在约 10 分钟内确认结果，请稍后刷新「我的域名」查看');
+    }
+    await env.db.prepare('DELETE FROM hosted_domains WHERE id = ? AND zone_id IS NULL').bind(id).run();
+    throw createZoneError(error);
+  }
+  const dnssec = await hasDnssec(domain).catch(() => false);
+  const now = new Date();
+  const filled = await createDb(env).update(hostedDomains).set({
+    zoneId: zone.id,
+    nameServers: zone.name_servers ?? [],
+    originalNameServers: zone.original_name_servers ?? [],
+    originalRegistrar: zone.original_registrar ?? '',
+    zoneStatus: zone.status,
+    dnssec,
+    checkedAt: now,
+    updatedAt: now,
+  }).where(and(eq(hostedDomains.id, id), sql`${hostedDomains.zoneId} IS NULL`)).returning({ id: hostedDomains.id });
+  if (!filled.length) {
+    // 建 zone 期间占位已被删除：不留下没有记录的 zone
+    await deleteZone(creds, zone.id, domain).catch((error) => console.error('回收孤儿 zone 失败:', error));
+    throw new AppError('conflict', '该域名已被删除，请重新添加');
+  }
+  await logAdminAction(env, viewer, 'hosted_domain.create', domain, `zone ${zone.id}，NS ${(zone.name_servers ?? []).join(' / ')}`, ip);
+  // catch-all 与发信接入不一定要求 zone 已激活，先尝试；Email Routing 要等 NS 生效后由定时任务补齐
+  await runDetached(ctx, '托管域名预配置', () => preconfigure(env, creds, id));
+  return getHostedDomain(env, viewer, id);
+}
+
+// ---------------------------------------------------------------------------
+// 开通与巡检
+
+interface MailConfig {
+  routingStatus: string;
+  catchAllReady: boolean;
+  sendingStatus: string;
+  sendingTag: string | null;
+  /** 第一个失败环节的说明；全部成功为空串 */
+  error: string;
+}
+
+/**
+ * 补齐收发配置，每一步先读后写、可重复执行。zoneActive=false 时跳过只能在激活后开启的 Email Routing，
+ * 其余步骤的失败由调用方忽略。
+ */
+async function ensureMailConfig(creds: CloudflareCredentials, row: HostedRow, zoneActive: boolean): Promise<MailConfig> {
+  const zoneId = row.zoneId!;
+  const out: MailConfig = {
+    routingStatus: row.routingStatus, catchAllReady: row.catchAllReady,
+    sendingStatus: row.sendingStatus, sendingTag: row.sendingTag, error: '',
+  };
+  const fail = (step: string, error: unknown) => {
+    if (!out.error) out.error = `${step}：${errorText(error)}`;
+  };
+  // 超时、5xx、限流：结果不确定，保留上次核对的状态，避免一次抖动就挡住收发
+  const settled = (error: unknown) => !isTransientCloudflareError(error);
+
+  if (zoneActive) {
+    try {
+      let routing = await getRouting(creds, zoneId).catch(() => null);
+      if (!routing?.enabled || routing.status !== 'ready') routing = await enableRouting(creds, zoneId, row.domain);
+      out.routingStatus = routing.status ?? '';
+      if (out.routingStatus !== 'ready') fail('收件路由', `Cloudflare 状态为 ${out.routingStatus || '未知'}`);
+    } catch (error) {
+      if (settled(error)) out.routingStatus = '';
+      fail('收件路由', error);
+    }
+  }
+
+  try {
+    const rule = await getCatchAll(creds, zoneId).catch(() => undefined);
+    out.catchAllReady = catchAllTargetsWorker(rule, creds.workerName)
+      || catchAllTargetsWorker(await putCatchAll(creds, zoneId), creds.workerName);
+    if (!out.catchAllReady) fail('全部地址投递', '规则未指向本站 Worker');
+  } catch (error) {
+    if (settled(error)) out.catchAllReady = false;
+    fail('全部地址投递', error);
+  }
+
+  try {
+    let tag = out.sendingTag;
+    if (!tag) {
+      const existing = (await listSendingSubdomains(creds, zoneId)).find((item) => item.name === row.domain);
+      tag = existing?.tag ?? (await createSendingSubdomain(creds, zoneId, row.domain)).tag;
+    }
+    out.sendingTag = tag;
+    let status = await getSendingDnsStatus(creds, zoneId, tag);
+    if (zoneActive && (status.status === 'unconfigured' || status.status === 'unlocked')) {
+      status = await repairSendingDns(creds, zoneId, tag);
+    }
+    out.sendingStatus = status.status;
+    if (status.status !== 'ready') {
+      const codes = (status.errors ?? []).map((item) => item.code).join(', ');
+      fail('发信', `Cloudflare 状态为 ${status.status}${codes ? `（${codes}）` : ''}`);
+    }
+  } catch (error) {
+    // 发信接入被删除后标签失效：清掉标签，下次重新接入
+    if (isCloudflareNotFound(error)) out.sendingTag = null;
+    if (settled(error)) out.sendingStatus = '';
+    fail('发信', error);
+  }
+  return out;
+}
+
+/** 写回核对结果；暂停与删除中的域名不被并发的巡检改回 */
+async function saveChecked(env: Env, id: number, fields: Partial<typeof hostedDomains.$inferInsert>): Promise<void> {
+  await createDb(env).update(hostedDomains).set({ ...fields, updatedAt: new Date() })
+    .where(and(eq(hostedDomains.id, id), notInArray(hostedDomains.status, ['suspended', 'deleting'])));
+}
+
+async function preconfigure(env: Env, creds: CloudflareCredentials, id: number): Promise<void> {
+  const row = await createDb(env).select().from(hostedDomains).where(eq(hostedDomains.id, id)).get();
+  if (!row?.zoneId) return;
+  const config = await ensureMailConfig(creds, row, false);
+  await saveChecked(env, id, {
+    catchAllReady: config.catchAllReady, sendingTag: config.sendingTag, sendingStatus: config.sendingStatus,
+  });
+}
+
+/** 删除 zone 与记录（只用于从未生效的 pending 域名，没有地址和邮件） */
+async function dropPending(env: Env, creds: CloudflareCredentials, row: HostedRow, reason: string): Promise<void> {
+  if (row.zoneId) await deleteZone(creds, row.zoneId, row.domain);
+  const [removed] = await env.db.batch([
+    env.db.prepare("DELETE FROM hosted_domains WHERE id = ? AND status = 'pending' AND activated_at IS NULL").bind(row.id),
+    env.db.prepare('DELETE FROM hosted_domain_members WHERE domain_id = ?1 AND NOT EXISTS (SELECT 1 FROM hosted_domains WHERE id = ?1)').bind(row.id),
+  ]);
+  if (removed?.meta.changes) await logAdminAction(env, SYSTEM_ACTOR, 'hosted_domain.expire', row.domain, reason);
+}
+
+/** 创建请求在 zone 建好前中断：找回本次创建的 zone，找不到则释放占位 */
+async function recoverReservation(env: Env, creds: CloudflareCredentials, row: HostedRow): Promise<void> {
+  if (Date.now() - row.createdAt.getTime() < RESERVATION_STALE_MS) return;
+  const zone = await findZone(creds, row.domain);
+  if (zone && zone.created_on && new Date(zone.created_on).getTime() >= row.createdAt.getTime() - MINUTE) {
+    await createDb(env).update(hostedDomains).set({
+      zoneId: zone.id, nameServers: zone.name_servers ?? [], originalNameServers: zone.original_name_servers ?? [],
+      originalRegistrar: zone.original_registrar ?? '', zoneStatus: zone.status, checkedAt: new Date(), updatedAt: new Date(),
+    }).where(and(eq(hostedDomains.id, row.id), sql`${hostedDomains.zoneId} IS NULL`));
+    return;
+  }
+  await env.db.prepare("DELETE FROM hosted_domains WHERE id = ? AND zone_id IS NULL AND status = 'pending'").bind(row.id).run();
+}
+
+/**
+ * 删除：先永久删除该域名的全部邮件（分批，可跨多次定时任务），再释放地址、撤销共享、
+ * 删除 Cloudflare 上的发信接入与 zone，最后删除记录。任一步失败保留 deleting 状态等待重试。
+ */
+async function teardown(env: Env, creds: CloudflareCredentials, row: HostedRow): Promise<void> {
+  // 创建请求可能仍在建 zone：等它回填 zone_id 或超时后再收尾，避免留下没有记录的 zone
+  if (!row.zoneId && Date.now() - row.createdAt.getTime() < RESERVATION_STALE_MS) return;
+  const deadline = Date.now() + TEARDOWN_PURGE_MS;
+  for (;;) {
+    const deleted = await purgeMatchingMessages(env, eq(messages.domain, row.domain), 500);
+    if (deleted === 0) break;
+    if (Date.now() > deadline) return;
+  }
+  await env.db.batch([
+    env.db.prepare('DELETE FROM mailbox_shares WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE domain = ?)').bind(row.domain),
+    env.db.prepare('DELETE FROM mailboxes WHERE domain = ?').bind(row.domain),
+    env.db.prepare('DELETE FROM hosted_domain_members WHERE domain_id = ?').bind(row.id),
+  ]);
+  try {
+    // 中断的创建请求可能已在 Cloudflare 建好 zone：按名称找回本次创建的 zone 一并删除
+    const orphan = row.zoneId ? null : await findZone(creds, row.domain);
+    const zoneId = row.zoneId ?? (orphan?.created_on && new Date(orphan.created_on).getTime() >= row.createdAt.getTime() - MINUTE
+      ? orphan.id : null);
+    if (zoneId) {
+      // 发信接入随 zone 删除，单独删除失败不阻塞
+      if (row.sendingTag) await deleteSendingSubdomain(creds, zoneId, row.sendingTag).catch(() => undefined);
+      await deleteZone(creds, zoneId, row.domain);
+    }
+  } catch (error) {
+    await createDb(env).update(hostedDomains).set({ lastError: `删除 Cloudflare 配置失败：${errorText(error)}`, checkedAt: new Date() })
+      .where(eq(hostedDomains.id, row.id));
+    return;
+  }
+  // 删除中的域名拒收、不可认领；进行中的收件仍可能晚到，留到该域没有邮件和地址时再删记录，下一轮继续清理
+  await env.db.prepare(`DELETE FROM hosted_domains WHERE id = ?1 AND status = 'deleting'
+    AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?2) AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?2)`)
+    .bind(row.id, row.domain).run();
+}
+
+/**
+ * 与 Cloudflare 核对一次并推进状态。zone 未激活：刷新 NS 与 DNSSEC，到期删除；
+ * 已激活：补齐收发配置，全部就绪为 active，否则 provisioning（宽限期内）或 error。
+ */
+export async function syncHostedDomain(env: Env, id: number, opts: { activationCheck?: boolean } = {}): Promise<void> {
+  const creds = cloudflareCredentials(env);
+  if (!creds) return;
+  const db = createDb(env);
+  const row = await db.select().from(hostedDomains).where(eq(hostedDomains.id, id)).get();
+  if (!row || row.status === 'suspended') return;
+  if (row.status === 'deleting') return teardown(env, creds, row);
+  if (!row.zoneId) return recoverReservation(env, creds, row);
+
+  const now = new Date();
+  let zone;
+  try {
+    zone = await getZone(creds, row.zoneId, row.domain);
+  } catch (error) {
+    await saveChecked(env, id, { lastError: `查询 Cloudflare 失败：${errorText(error)}`, checkedAt: now });
+    return;
+  }
+  if (!zone) {
+    if (row.status === 'pending') return dropPending(env, creds, row, 'Cloudflare 已删除未激活的 zone');
+    await saveChecked(env, id, { status: 'moved', zoneStatus: 'missing', lastError: 'Cloudflare 中的 zone 已不存在', checkedAt: now });
+    return;
+  }
+  if (zone.status === 'pending' || zone.status === 'initializing') {
+    const { hosted_domains: cfg } = await getSettings(env);
+    if (row.status === 'pending' && !row.activatedAt && now.getTime() > row.createdAt.getTime() + cfg.pendingDays * DAY) {
+      return dropPending(env, creds, row, `${cfg.pendingDays} 天内未完成 NS 修改，已自动删除`);
+    }
+    if (opts.activationCheck) await requestActivationCheck(creds, zone.id);
+    const dnssec = await hasDnssec(row.domain).catch(() => row.dnssec);
+    await saveChecked(env, id, {
+      status: 'pending', zoneStatus: zone.status, nameServers: zone.name_servers ?? row.nameServers,
+      dnssec, lastError: '', checkedAt: now,
+    });
+    return;
+  }
+  if (zone.status === 'moved') {
+    await saveChecked(env, id, { status: 'moved', zoneStatus: 'moved', lastError: '域名的名称服务器已不再指向本站', checkedAt: now });
+    return;
+  }
+  const activatedAt = row.activatedAt ?? (zone.activated_on ? new Date(zone.activated_on) : now);
+  const config = await ensureMailConfig(creds, row, true);
+  const ready = config.routingStatus === 'ready' && config.catchAllReady && config.sendingStatus === 'ready';
+  await saveChecked(env, id, {
+    status: ready ? 'active' : now.getTime() - activatedAt.getTime() > PROVISION_GRACE_MS ? 'error' : 'provisioning',
+    zoneStatus: 'active',
+    activatedAt,
+    routingStatus: config.routingStatus,
+    catchAllReady: config.catchAllReady,
+    sendingStatus: config.sendingStatus,
+    sendingTag: config.sendingTag,
+    dnssec: false,
+    lastError: ready ? '' : config.error,
+    checkedAt: now,
+  });
+}
+
+/**
+ * 定时任务：开通中与删除中的每轮处理；等待 NS 每 4 分钟查一次（只读 zone 状态，不触发 activation_check）；
+ * 异常每 30 分钟重试；已生效与已迁走每天巡检一次。
+ */
+export async function syncDueHostedDomains(env: Env, limit = 10): Promise<number> {
+  if (!cloudflareCredentials(env)) return 0;
+  const now = Date.now();
+  const due = await env.db.prepare(`SELECT id FROM hosted_domains WHERE status IN ('provisioning', 'deleting')
+      OR (status = 'pending' AND COALESCE(checked_at, 0) < ?1)
+      OR (status = 'error' AND COALESCE(checked_at, 0) < ?2)
+      OR (status IN ('active', 'moved') AND COALESCE(checked_at, 0) < ?3)
+    ORDER BY COALESCE(checked_at, 0) LIMIT ?4`)
+    .bind(now - 4 * MINUTE, now - 30 * MINUTE, now - DAY, limit).all<{ id: number }>();
+  for (const row of due.results) {
+    try {
+      await syncHostedDomain(env, Number(row.id));
+    } catch (error) {
+      console.error(`托管域名 #${row.id} 核对失败:`, error);
+    }
+  }
+  return due.results.length;
+}
+
+/** 用户点「立即检测」：等待 NS 时请 Cloudflare 立即复查，再核对并推进开通 */
+export async function checkHostedDomain(env: Env, viewer: Viewer, id: number): Promise<HostedDomain> {
+  const { row, access } = await loadAccess(env, viewer, id);
+  requireManage(access);
+  requireCredentials(env, await getSettings(env));
+  const recent = row.checkedAt && Date.now() - row.checkedAt.getTime() < CHECK_THROTTLE_MS;
+  if (!recent && row.status !== 'suspended' && row.status !== 'deleting') {
+    await syncHostedDomain(env, id, { activationCheck: row.status === 'pending' });
+  }
+  return getHostedDomain(env, viewer, id);
+}
+
+// ---------------------------------------------------------------------------
+// 设置、删除、成员、过户
+
+export async function updateHostedDomain(env: Env, viewer: Viewer, id: number, memberLimit: number, ip = ''): Promise<HostedDomain> {
+  const { row, access } = await loadAccess(env, viewer, id);
+  requireManage(access);
+  if (row.status === 'deleting') throw new AppError('conflict', '域名正在删除');
+  await createDb(env).update(hostedDomains).set({ memberLimit, updatedAt: new Date() }).where(eq(hostedDomains.id, id));
+  if (row.memberLimit !== memberLimit) {
+    await logAdminAction(env, viewer, 'hosted_domain.update', row.domain, `成员认领上限 ${row.memberLimit}→${memberLimit}`, ip);
+  }
+  return getHostedDomain(env, viewer, id);
+}
+
+/** 进入删除中：立即拒收、停止认领与发信，后台清理邮件、地址与 Cloudflare 配置 */
+export async function deleteHostedDomain(env: Env, viewer: Viewer, id: number, ctx?: ExecCtx | null, ip = ''): Promise<void> {
+  const { row, access } = await loadAccess(env, viewer, id);
+  requireManage(access);
+  if (row.status !== 'deleting') {
+    // 普通用户按读到的归属复核，避免与并发过户交错时删掉已过户给别人的域名
+    const updated = await createDb(env).update(hostedDomains).set({ status: 'deleting', lastError: '', updatedAt: new Date() })
+      .where(and(eq(hostedDomains.id, id), notInArray(hostedDomains.status, ['deleting']),
+        access === 'admin' ? undefined : eq(hostedDomains.userId, row.userId)))
+      .returning({ id: hostedDomains.id });
+    if (updated.length) {
+      await logAdminAction(env, viewer, 'hosted_domain.delete', row.domain, `所有者 #${row.userId}，地址与邮件将永久删除`, ip);
+    } else if (access !== 'admin') {
+      throw new AppError('conflict', '域名归属已改变，请刷新后重试');
+    }
+  }
+  await runDetached(ctx, '托管域名删除', () => syncHostedDomain(env, id));
+}
+
+export async function listHostedDomainMembers(env: Env, viewer: Viewer, id: number): Promise<HostedDomainMember[]> {
+  const { row, access } = await loadAccess(env, viewer, id);
+  requireManage(access);
+  const rows = await createDb(env).select({
+    userId: hostedDomainMembers.userId,
+    username: users.username,
+    status: users.status,
+    grantedAt: hostedDomainMembers.createdAt,
+    mailboxCount: sql<number>`(SELECT COUNT(*) FROM mailboxes b WHERE b.user_id = ${hostedDomainMembers.userId} AND b.domain = ${row.domain})`,
+  }).from(hostedDomainMembers)
+    .innerJoin(users, eq(users.id, hostedDomainMembers.userId))
+    .where(eq(hostedDomainMembers.domainId, id))
+    .orderBy(hostedDomainMembers.createdAt).all();
+  return rows.map((member) => ({
+    userId: member.userId, username: member.username, status: member.status,
+    grantedAt: member.grantedAt.toISOString(), mailboxCount: Number(member.mailboxCount),
+  }));
+}
+
+/** 替换成员名单；被移除的成员保留已认领的地址，只失去新增认领的权限 */
+export async function replaceHostedDomainMembers(
+  env: Env, viewer: Viewer, id: number, userIds: number[], expectedOwnerId: number, ip = '',
+): Promise<HostedDomainMember[]> {
+  const { row, access } = await loadAccess(env, viewer, id);
+  requireManage(access);
+  if (row.status === 'deleting') throw new AppError('conflict', '域名正在删除');
+  if (row.userId !== expectedOwnerId) throw new AppError('conflict', '域名归属已改变，请刷新后重试');
+  const unique = [...new Set(userIds)];
+  if (unique.includes(row.userId)) throw new AppError('validation_failed', '不能把所有者加为成员');
+  const before = await listHostedDomainMembers(env, viewer, id);
+  // 只校验新增的人：已被禁用的现有成员可以留在名单里，不妨碍添加其他人
+  const added = unique.filter((userId) => !before.some((member) => member.userId === userId));
+  if (added.length) {
+    const active = await createDb(env).select({ id: users.id }).from(users)
+      .where(and(inArray(users.id, added), eq(users.status, 'active'))).all();
+    if (active.length !== added.length) throw new AppError('validation_failed', '只能共享给启用中的用户');
+  }
+  const ids = JSON.stringify(unique);
+  const ownerGuard = `EXISTS (SELECT 1 FROM hosted_domains WHERE id = ?1 AND user_id = ?2 AND status <> 'deleting')`;
+  await env.db.batch([
+    env.db.prepare(`DELETE FROM hosted_domain_members WHERE domain_id = ?1
+      AND user_id NOT IN (SELECT value FROM json_each(?3)) AND ${ownerGuard}`).bind(id, expectedOwnerId, ids),
+    env.db.prepare(`INSERT OR IGNORE INTO hosted_domain_members (domain_id, user_id, granted_by)
+      SELECT ?1, value, ?4 FROM json_each(?3) WHERE ${ownerGuard}`).bind(id, expectedOwnerId, ids, viewer.id),
+  ]);
+  const current = await createDb(env).select({ userId: hostedDomains.userId }).from(hostedDomains).where(eq(hostedDomains.id, id)).get();
+  if (current?.userId !== expectedOwnerId) throw new AppError('conflict', '域名归属已改变，请刷新后重试');
+  const after = await listHostedDomainMembers(env, viewer, id);
+  const beforeNames = new Set(before.map((member) => member.username));
+  const afterNames = new Set(after.map((member) => member.username));
+  const joined = [...afterNames].filter((name) => !beforeNames.has(name));
+  const left = [...beforeNames].filter((name) => !afterNames.has(name));
+  if (joined.length || left.length) {
+    await logAdminAction(env, viewer, 'hosted_domain.members', row.domain,
+      [joined.length ? `+${joined.join('、')}` : '', left.length ? `−${left.join('、')}` : ''].filter(Boolean).join(' '), ip);
+  }
+  return after;
+}
+
+/** 移除成员；成员本人可以退出共享 */
+export async function removeHostedDomainMember(env: Env, viewer: Viewer, id: number, userId: number, ip = ''): Promise<void> {
+  const { row, access } = await loadAccess(env, viewer, id);
+  if (!(access === 'member' && userId === viewer.id)) requireManage(access);
+  const result = await env.db.prepare('DELETE FROM hosted_domain_members WHERE domain_id = ? AND user_id = ?').bind(id, userId).run();
+  if (result.meta.changes) {
+    await logAdminAction(env, viewer, 'hosted_domain.members', row.domain, userId === viewer.id ? '成员退出共享' : `移除成员 #${userId}`, ip);
+  }
+}
+
+/**
+ * 过户：所有权、移除新所有者的成员身份、（可选）原所有者地址连同历史一起过户并撤销其邮箱共享、审计，
+ * 同一 D1 事务。用户发起时受对方托管数量上限约束，管理员不受限。
+ */
+export async function transferHostedDomain(
+  env: Env, viewer: Viewer, id: number, req: TransferHostedDomainRequest, ip = '',
+): Promise<HostedDomainTransferResult> {
+  const { row, access } = await loadAccess(env, viewer, id);
+  requireManage(access);
+  if (row.status === 'deleting') throw new AppError('conflict', '域名正在删除');
+  const db = createDb(env);
+  const target = await db.select().from(users).where(eq(users.id, req.userId)).get();
+  if (!target) throw new AppError('not_found', '目标用户不存在');
+  if (target.status !== 'active') throw new AppError('validation_failed', '只能过户给启用中的用户');
+  const resultFor = async (transferred: boolean, movedMailboxes: number): Promise<HostedDomainTransferResult> => ({
+    domain: (await loadViews(env, viewer, eq(hostedDomains.id, id), 1))[0] ?? null,
+    previousUserId: transferred ? req.expectedOwnerId : row.userId,
+    transferred,
+    movedMailboxes,
+  });
+  // 重试已完成的过户直接返回，不重复移动地址或记审计
+  if (row.userId === target.id) return resultFor(false, 0);
+  if (row.userId !== req.expectedOwnerId) throw new AppError('conflict', '域名归属已改变，请刷新后重新确认');
+  const { hosted_domains: cfg } = await getSettingsFresh(env);
+  const limit = viewer.role === 'admin' ? 0 : cfg.maxPerUser;
+  const previous = await db.select({ username: users.username }).from(users).where(eq(users.id, row.userId)).get();
+  // 本次过户写入的 updated_at 作为标记：后续语句只在过户真正发生时执行
+  const marker = Date.now();
+  const moved = `EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND user_id = ? AND updated_at = ?)`;
+  const statements = [
+    env.db.prepare(`UPDATE hosted_domains SET user_id = ?, updated_at = ?
+      WHERE id = ? AND user_id = ? AND status <> 'deleting'
+        AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active')
+        AND (? = 0 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ? AND status <> 'deleting') < ?)`)
+      .bind(target.id, marker, id, req.expectedOwnerId, target.id, limit, target.id, limit),
+    env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
+      SELECT ?, ?, 'hosted_domain.transfer', ?, ?, ? WHERE changes() = 1`)
+      .bind(viewer.id, viewer.username, row.domain,
+        `${previous?.username ?? `user#${row.userId}`} (#${row.userId}) → ${target.username} (#${target.id})`
+        + (req.includeMailboxes ? '；地址连同历史一起过户' : '；原所有者保留已认领地址'), ip),
+    env.db.prepare(`DELETE FROM hosted_domain_members WHERE domain_id = ? AND user_id = ? AND ${moved}`)
+      .bind(id, target.id, id, target.id, marker),
+  ];
+  if (req.includeMailboxes) {
+    statements.push(
+      env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE domain = ? AND user_id = ?)
+        AND ${moved}`).bind(row.domain, req.expectedOwnerId, id, target.id, marker),
+      env.db.prepare(`UPDATE mailboxes SET user_id = ? WHERE domain = ? AND user_id = ? AND ${moved}`)
+        .bind(target.id, row.domain, req.expectedOwnerId, id, target.id, marker),
+    );
+  }
+  const results = await env.db.batch(statements);
+  if (!results[0]?.meta.changes) {
+    const current = await db.select({ userId: hostedDomains.userId }).from(hostedDomains).where(eq(hostedDomains.id, id)).get();
+    if (current?.userId === target.id) return resultFor(false, 0);
+    if (limit > 0 && current?.userId === req.expectedOwnerId) throw new AppError('forbidden', `对方托管的域名数已达上限（${limit}）`);
+    throw new AppError('conflict', '域名归属或目标用户状态已改变，请刷新后重新确认');
+  }
+  return resultFor(true, req.includeMailboxes ? (results[4]?.meta.changes ?? 0) : 0);
+}
+
+// ---------------------------------------------------------------------------
+// 管理员
+
+export async function suspendHostedDomain(env: Env, viewer: Viewer, id: number, ip = ''): Promise<HostedDomain> {
+  const { row } = await loadAccess(env, viewer, id);
+  if (row.status === 'deleting') throw new AppError('conflict', '域名正在删除');
+  const updated = await createDb(env).update(hostedDomains).set({ status: 'suspended', updatedAt: new Date() })
+    .where(and(eq(hostedDomains.id, id), notInArray(hostedDomains.status, ['suspended', 'deleting']))).returning({ id: hostedDomains.id });
+  if (updated.length) await logAdminAction(env, viewer, 'hosted_domain.suspend', row.domain, '', ip);
+  return getHostedDomain(env, viewer, id);
+}
+
+/** 恢复后立即核对一次，按 Cloudflare 实际状态回到 pending / provisioning / active 等 */
+export async function resumeHostedDomain(env: Env, viewer: Viewer, id: number, ip = ''): Promise<HostedDomain> {
+  const { row } = await loadAccess(env, viewer, id);
+  const updated = await createDb(env).update(hostedDomains).set({ status: 'provisioning', updatedAt: new Date() })
+    .where(and(eq(hostedDomains.id, id), eq(hostedDomains.status, 'suspended'))).returning({ id: hostedDomains.id });
+  if (updated.length) {
+    await logAdminAction(env, viewer, 'hosted_domain.resume', row.domain, '', ip);
+    await syncHostedDomain(env, id);
+  }
+  return getHostedDomain(env, viewer, id);
+}
+
+export async function hostedDomainsHealth(env: Env): Promise<HostedDomainsHealth> {
+  const settings = await getSettings(env);
+  const creds = cloudflareCredentials(env);
+  const base: HostedDomainsHealth = {
+    enabled: settings.hosted_domains.enabled, configured: creds !== null,
+    tokenValid: null, error: '', accountZones: null, accountPendingZones: null,
+  };
+  if (!creds) return base;
+  try {
+    await verifyToken(creds);
+    const zones = await countZones(creds);
+    return { ...base, tokenValid: true, accountZones: zones.total, accountPendingZones: zones.pending };
+  } catch (error) {
+    return { ...base, tokenValid: false, error: errorText(error) };
+  }
+}

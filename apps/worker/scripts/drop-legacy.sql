@@ -16,6 +16,8 @@ DROP TABLE IF EXISTS role;
 DROP TABLE IF EXISTS setting;
 DROP TABLE IF EXISTS schema_meta;
 -- 新系统表（幂等重跑保护）
+DROP TABLE IF EXISTS hosted_domain_members;
+DROP TABLE IF EXISTS hosted_domains;
 DROP TABLE IF EXISTS claude_address_facts;
 DROP TABLE IF EXISTS delivery_object_leases;
 DROP TABLE IF EXISTS notification_jobs;

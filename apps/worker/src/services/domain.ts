@@ -1,11 +1,12 @@
-import type { Settings } from '@hpc-mail/shared';
-import { inArray } from 'drizzle-orm';
+import { HOSTED_DOMAIN_USABLE_STATUSES, type Settings } from '@hpc-mail/shared';
+import { eq, inArray } from 'drizzle-orm';
 import { chunk } from '../lib/d1.js';
 import { createDb } from '../db/client.js';
-import { mailboxes } from '../db/schema.js';
+import { hostedDomains, mailboxes } from '../db/schema.js';
+import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
 import { getSettings, getSettingsFresh } from './setting.js';
-import { loadMailboxPolicyUser, resolveMailboxPolicy } from './mailbox-policy.js';
+import { mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy } from './mailbox-policy.js';
 
 /**
  * 全部系统域名名（管理员可用范围）：完全由 settings.domains.list 决定（管理端维护，无写死 fallback）。
@@ -38,11 +39,37 @@ export async function getVisibleDomains(
   userId: number,
   settings?: Settings,
 ): Promise<string[]> {
-  const [user, resolved] = await Promise.all([
-    loadMailboxPolicyUser(createDb(env), userId),
+  // 用户策略与托管域名合成一个 batch，与设置直读并行，仍是一层往返
+  const [[userResult, hosted], resolved] = await Promise.all([
+    env.db.batch([
+      mailboxPolicyUserStatement(env.db, userId),
+      env.db.prepare(`SELECT domain FROM hosted_domains h WHERE status IN (${USABLE_HOSTED_SQL})
+        AND (user_id = ?1 OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?1))
+        ORDER BY domain`).bind(userId),
+    ]),
     settings ?? getSettingsFresh(env),
   ]);
-  return resolveMailboxPolicy(resolved, user).domains.map(({ domain }) => domain);
+  // 自己拥有或被共享的托管域名排在系统域名之后；管理员在托管域名页处理他人的域名
+  return [
+    ...resolveMailboxPolicy(resolved, mailboxPolicyUserFromResult(userResult)).domains.map(({ domain }) => domain),
+    ...((hosted?.results ?? []) as { domain: string }[]).map((row) => row.domain),
+  ];
+}
+
+const USABLE_HOSTED_SQL = HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ');
+
+/** 托管域名站内投递：已生效或被暂停（由收件方拒收）走站内，等待 NS、已迁走或删除中按真实 DNS 外发 */
+const INTERNAL_HOSTED_STATUSES: readonly string[] = [...HOSTED_DOMAIN_USABLE_STATUSES, 'suspended'];
+
+/** 从托管域名发信需该域发信已就绪；系统域名不受此限 */
+export async function assertHostedSendable(env: Env, settings: Settings, domain: string): Promise<void> {
+  if (settings.domains.list.some((entry) => entry.domain === domain)) return;
+  const row = await createDb(env).select({ status: hostedDomains.status, sendingStatus: hostedDomains.sendingStatus })
+    .from(hostedDomains).where(eq(hostedDomains.domain, domain)).get();
+  if (!row) return;
+  if (!(HOSTED_DOMAIN_USABLE_STATUSES as readonly string[]).includes(row.status) || row.sendingStatus !== 'ready') {
+    throw new AppError('validation_failed', '该域名的发信尚未生效或已停用');
+  }
 }
 
 /** 域名是否对普通用户公开。 */
@@ -65,16 +92,31 @@ export async function getRoutableDomains(env: Env, settings?: Settings, candidat
   const listed = await getDomains(env, settings);
   const set = new Set(listed);
   const db = createDb(env);
+  // 托管域名按状态决定：未生效、已迁走或删除中的域名即使有存量地址也按真实 DNS 外发
+  const applyHosted = (rows: { domain: string; status: string }[]) => {
+    for (const row of rows) {
+      if (INTERNAL_HOSTED_STATUSES.includes(row.status)) set.add(row.domain);
+      else set.delete(row.domain);
+    }
+  };
   if (candidates) {
     const unknown = [...new Set(candidates.filter((domain) => domain && !set.has(domain)))];
     for (const batch of chunk(unknown)) {
-      const rows = await db.selectDistinct({ domain: mailboxes.domain }).from(mailboxes)
-        .where(inArray(mailboxes.domain, batch)).all();
+      const [rows, hosted] = await db.batch([
+        db.selectDistinct({ domain: mailboxes.domain }).from(mailboxes).where(inArray(mailboxes.domain, batch)),
+        db.select({ domain: hostedDomains.domain, status: hostedDomains.status }).from(hostedDomains)
+          .where(inArray(hostedDomains.domain, batch)),
+      ]);
       for (const row of rows) set.add(row.domain);
+      applyHosted(hosted);
     }
     return [...set];
   }
-  const rows = await db.selectDistinct({ domain: mailboxes.domain }).from(mailboxes).all();
+  const [rows, hosted] = await db.batch([
+    db.selectDistinct({ domain: mailboxes.domain }).from(mailboxes),
+    db.select({ domain: hostedDomains.domain, status: hostedDomains.status }).from(hostedDomains),
+  ]);
   for (const row of rows) set.add(row.domain);
+  applyHosted(hosted);
   return [...set];
 }

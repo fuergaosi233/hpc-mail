@@ -20,8 +20,8 @@ import { makePreview } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByRegex } from './code-extract.js';
 import { extractVerificationLink } from './link-extract.js';
-import { getRoutableDomains } from './domain.js';
-import { resolveNotifyOwnerIds } from './mailbox.js';
+import { assertHostedSendable, getRoutableDomains } from './domain.js';
+import { resolveDeliveryOwners } from './mailbox.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { bumpCounter, dayWindow } from './rate-counter.js';
 import { getSettings } from './setting.js';
@@ -485,6 +485,7 @@ export async function sendMail(
   ];
   const domains = await getRoutableDomains(env, settings, candidateDomains);
   const from = await resolveFrom(env, sender, req, domains);
+  await assertHostedSendable(env, settings, from.domain);
   if (req.forwardAttachmentsFrom) {
     const forwarded = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
       attachments.length, attachments.reduce((sum, att) => sum + att.bytes.byteLength, 0));
@@ -601,8 +602,11 @@ export async function sendMail(
       let ownerIds: number[] = [];
       try {
         // 每封站内副本独立持有正文对象，删除一封副本不会擦除其他收件人的正文。
+        // 托管域名停用时拒收；未认领地址先归域名所有者，再落库
+        const recipient = await resolveDeliveryOwners(env, target);
+        if (recipient.rejected) throw new Error(recipient.rejected);
+        ownerIds = recipient.ownerIds;
         body = await storeMailBody(env, text, html);
-        ownerIds = await resolveNotifyOwnerIds(env, target);
         const insertMessage = db.insert(messages).values({
           direction: 'inbound', address: target, domain: getEmailDomain(target),
           fromAddress: from.address, fromName: from.displayName,

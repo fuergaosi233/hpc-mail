@@ -2,6 +2,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import {
   AtSign,
   ChevronDown,
+  Earth,
   Keyboard,
   Globe,
   Inbox,
@@ -10,6 +11,7 @@ import {
   LogOut,
   Mails,
   Menu,
+  Network,
   PenLine,
   Send,
   ScrollText,
@@ -65,6 +67,7 @@ const PRIMARY_NAV: NavEntry[] = [
   { to: '/starred', label: '星标', icon: Star },
   { to: '/sent', label: '已发送', icon: Send },
   { to: '/mailboxes', label: '我的邮箱', icon: AtSign },
+  { to: '/domains', label: '我的域名', icon: Earth },
   { to: '/trash', label: '回收站', icon: Trash2 },
   { to: '/api-keys', label: 'API Keys', icon: KeyRound },
   { to: '/profile', label: '个人设置', icon: User },
@@ -73,6 +76,7 @@ const PRIMARY_NAV: NavEntry[] = [
 const ADMIN_NAV: NavEntry[] = [
   { to: '/admin/users', label: '用户', icon: Users },
   { to: '/admin/domains', label: '域名', icon: Globe },
+  { to: '/admin/hosted-domains', label: '托管域名', icon: Network },
   { to: '/admin/addresses', label: '全站地址', icon: AtSign },
   { to: '/admin/mail', label: '全站邮件', icon: Mails },
   { to: '/admin/invites', label: '邀请码', icon: Ticket },
@@ -200,19 +204,23 @@ function SideLink({
 
 function NavSections({
   isAdmin,
+  hostedDomains,
   full,
   unreadCount,
   onNavigate,
 }: {
   isAdmin: boolean;
+  /** 站点开放了域名托管才显示「我的域名」 */
+  hostedDomains: boolean;
   full: boolean;
   unreadCount: number;
   onNavigate?: () => void;
 }) {
+  const primary = hostedDomains ? PRIMARY_NAV : PRIMARY_NAV.filter((entry) => entry.to !== '/domains');
   return (
     <nav className="flex flex-col gap-1 p-2">
       <ComposeButton full={full} onNavigate={onNavigate} />
-      {PRIMARY_NAV.map((entry) => (
+      {primary.map((entry) => (
         <SideLink
           key={entry.to}
           entry={entry}
@@ -313,6 +321,7 @@ export function AppShell() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const isAdmin = user.role === 'admin';
+  const hostedDomains = config?.hostedDomainsEnabled === true;
   const siteTitle = config?.siteTitle ?? 'HPC Mail';
   const unreadCount = unread?.unread ?? 0;
   const bottomNavHidden = hidesBottomNav(pathname);
@@ -328,7 +337,7 @@ export function AppShell() {
           <span className="ml-2 hidden truncate text-sm font-semibold text-ink lg:inline">{siteTitle}</span>
         </div>
         <div className="flex-1 overflow-y-auto">
-          <NavSections isAdmin={isAdmin} full={false} unreadCount={unreadCount} />
+          <NavSections isAdmin={isAdmin} hostedDomains={hostedDomains} full={false} unreadCount={unreadCount} />
         </div>
         <div className="border-t border-line p-2">
           <NavLink
@@ -356,7 +365,13 @@ export function AppShell() {
               </IconButton>
             </SheetTrigger>
             <SheetContent side="left" title={siteTitle}>
-              <NavSections isAdmin={isAdmin} full unreadCount={unreadCount} onNavigate={() => setMenuOpen(false)} />
+              <NavSections
+                isAdmin={isAdmin}
+                hostedDomains={hostedDomains}
+                full
+                unreadCount={unreadCount}
+                onNavigate={() => setMenuOpen(false)}
+              />
             </SheetContent>
           </Sheet>
           <img src={logoUrl} alt="" className="size-7 shrink-0 rounded-md md:hidden" />

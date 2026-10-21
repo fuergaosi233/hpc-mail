@@ -1,0 +1,57 @@
+import { type QueryClient, queryOptions, useQuery } from '@tanstack/react-query';
+import type { HostedDomain, HostedDomainStatus } from '@hpc-mail/shared';
+import { queryKeys } from '@/api/query-keys';
+import { hostedDomainApi } from './hosted-domains-api';
+
+/** 等待生效期间详情页自动刷新的间隔 */
+export const HOSTED_DOMAIN_POLL_MS = 30_000;
+const POLLING_STATUSES: readonly HostedDomainStatus[] = ['pending', 'provisioning'];
+
+export const hostedDomainsQueryOptions = () =>
+  queryOptions({
+    queryKey: queryKeys.hostedDomains.list,
+    queryFn: () => hostedDomainApi.list(),
+  });
+
+export function useHostedDomainsQuery() {
+  return useQuery(hostedDomainsQueryOptions());
+}
+
+/** 单个域名；等待 NS 或开通中时每 30 秒刷新一次，进入其他状态后停止 */
+export function useHostedDomainQuery(id: number, enabled: boolean, placeholder?: () => HostedDomain | undefined) {
+  return useQuery({
+    queryKey: queryKeys.hostedDomains.detail(id),
+    queryFn: () => hostedDomainApi.get(id),
+    enabled,
+    placeholderData: placeholder,
+    refetchInterval: (query) =>
+      query.state.data && POLLING_STATUSES.includes(query.state.data.status) ? HOSTED_DOMAIN_POLL_MS : false,
+  });
+}
+
+const replaceIn = (list: HostedDomain[] | undefined, domain: HostedDomain) =>
+  list?.map((item) => (item.id === domain.id ? domain : item));
+
+/** 写操作返回的最新域名：就地更新详情与各列表缓存，不整体重拉 */
+export function storeHostedDomain(client: QueryClient, domain: HostedDomain): void {
+  client.setQueryData(queryKeys.hostedDomains.detail(domain.id), domain);
+  client.setQueryData<HostedDomain[]>(queryKeys.hostedDomains.list, (list) => replaceIn(list, domain));
+  client.setQueriesData<HostedDomain[]>({ queryKey: queryKeys.admin.hostedDomains }, (list) => replaceIn(list, domain));
+}
+
+/** 只改详情缓存里的几个计数（成员数等），列表随后台失效重拉 */
+export function patchHostedDomain(client: QueryClient, id: number, patch: Partial<HostedDomain>): void {
+  client.setQueryData<HostedDomain>(queryKeys.hostedDomains.detail(id), (domain) => domain && { ...domain, ...patch });
+  void client.invalidateQueries({ queryKey: queryKeys.hostedDomains.list });
+  void client.invalidateQueries({ queryKey: queryKeys.admin.hostedDomains });
+}
+
+/** 域名不再对当前用户可见（删除、退出共享、过户后失去权限）：移出缓存，可认领域名随之变化 */
+export function forgetHostedDomain(client: QueryClient, id: number): void {
+  client.removeQueries({ queryKey: queryKeys.hostedDomains.detail(id) });
+  client.removeQueries({ queryKey: queryKeys.hostedDomains.members(id) });
+  client.setQueryData<HostedDomain[]>(queryKeys.hostedDomains.list, (list) => list?.filter((item) => item.id !== id));
+  void client.invalidateQueries({ queryKey: queryKeys.hostedDomains.list });
+  void client.invalidateQueries({ queryKey: queryKeys.admin.hostedDomains });
+  void client.invalidateQueries({ queryKey: queryKeys.domains });
+}

@@ -1,6 +1,6 @@
 ---
 name: hpc-mail
-description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和搜索邮件、获取邮箱验证码与验证链接、发送回复转发及附件、管理邮箱和共享、多域名、通知、API Keys、账户与管理员设置。当用户明确要求操作 HPC Mail，或已确认目标邮箱属于此实例并提供了相应授权时使用；普通邮箱请求不能据此推断属于 HPC Mail。
+description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和搜索邮件、获取邮箱验证码与验证链接、发送回复转发及附件、管理邮箱和共享、多域名与用户托管域名、通知、API Keys、账户与管理员设置。当用户明确要求操作 HPC Mail，或已确认目标邮箱属于此实例并提供了相应授权时使用；普通邮箱请求不能据此推断属于 HPC Mail。
 ---
 
 # HPC Mail
@@ -23,6 +23,7 @@ description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和�
 | 创建/更新/禁用/吊销 Key、自己的调用审计 | `/api/api-keys…`；JWT | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
 | 个人飞书/PushDeer/Webhook/邮箱转发、健康与重试 | `/api/me/notify-prefs…`；JWT | [通知与转发](references/notifications.md) |
 | 管理自己邮箱的共享名单、多只邮箱一次共享给同一批人、搜索共享成员 | `/api/mailboxes/shares…`、`/api/mailboxes/share-users`；用户 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 把自己的域名托管到本站（建 zone、给出 NS、查看生效进度）、域名成员共享与过户、删除托管 | `/api/hosted-domains…`；用户 JWT（管理员全站：`/api/admin/hosted-domains…`） | [邮箱、共享与多域名](references/mailboxes-and-domains.md#用户托管域名) |
 | 用户专属邮箱权限、强制过户邮箱、全站任意邮箱共享名单、域名增删/公开性/配额/参与随机、每域 Claude 统计、接入检查 | `/api/admin…`；管理员 JWT | [管理员参考](references/administration.md)、[邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 用户、邀请码、系统设置、全站 Key 与管理审计、审阅其他用户邮件 | `/api/admin…` 及邮件的管理员 `scope`；管理员 JWT | [管理员功能](references/administration.md) |
 

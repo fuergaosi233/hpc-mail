@@ -10,6 +10,8 @@ import { RouteErrorPage } from './route-error-page';
 import {
   loadApiKeysPage,
   loadComposePage,
+  loadHostedDomainDetailPage,
+  loadHostedDomainsPage,
   loadInboxPage,
   loadMailboxesPage,
   loadMessagePage,
@@ -37,6 +39,8 @@ const SentPage = page(loadSentPage, (m) => m.SentPage);
 const StarredPage = page(loadStarredPage, (m) => m.StarredPage);
 const TrashPage = page(loadTrashPage, (m) => m.TrashPage);
 const MailboxesPage = page(loadMailboxesPage, (m) => m.MailboxesPage);
+const HostedDomainsPage = page(loadHostedDomainsPage, (m) => m.HostedDomainsPage);
+const HostedDomainDetailPage = page(loadHostedDomainDetailPage, (m) => m.HostedDomainDetailPage);
 const ApiKeysPage = page(loadApiKeysPage, (m) => m.ApiKeysPage);
 const ProfilePage = page(loadProfilePage, (m) => m.ProfilePage);
 const UsersPage = page(preloadable(() => import('@/features/admin/users/users-page')), (m) => m.UsersPage);
@@ -47,6 +51,10 @@ const AdminUserMailPage = page(
 const AdminMailPage = page(preloadable(() => import('@/features/admin/mail/admin-mail-page')), (m) => m.AdminMailPage);
 const InvitesPage = page(preloadable(() => import('@/features/admin/invites/invites-page')), (m) => m.InvitesPage);
 const DomainsPage = page(preloadable(() => import('@/features/admin/domains/domains-page')), (m) => m.DomainsPage);
+const AdminHostedDomainsPage = page(
+  preloadable(() => import('@/features/admin/hosted-domains/admin-hosted-domains-page')),
+  (m) => m.AdminHostedDomainsPage,
+);
 const SettingsPage = page(preloadable(() => import('@/features/admin/settings/settings-page')), (m) => m.SettingsPage);
 const AuditPage = page(preloadable(() => import('@/features/admin/audit/audit-page')), (m) => m.AuditPage);
 const AddressesPage = page(
@@ -78,6 +86,8 @@ export const router = createBrowserRouter([
       { path: 'starred', element: <StarredPage />, handle: title('星标') },
       { path: 'trash', element: <TrashPage />, handle: title('回收站') },
       { path: 'mailboxes', element: <MailboxesPage />, handle: title('我的邮箱') },
+      { path: 'domains', element: <HostedDomainsPage />, handle: title('我的域名') },
+      { path: 'domains/:id', element: <HostedDomainDetailPage />, handle: title('域名详情') },
       { path: 'api-keys', element: <ApiKeysPage />, handle: title('API Keys') },
       { path: 'profile', element: <ProfilePage />, handle: title('个人设置') },
       {
@@ -90,6 +100,7 @@ export const router = createBrowserRouter([
           { path: 'mail', element: <AdminMailPage />, handle: title('全站邮件') },
           { path: 'invites', element: <InvitesPage />, handle: title('邀请码') },
           { path: 'domains', element: <DomainsPage />, handle: title('收件域名') },
+          { path: 'hosted-domains', element: <AdminHostedDomainsPage />, handle: title('托管域名') },
           { path: 'addresses', element: <AddressesPage />, handle: title('全站地址') },
           { path: 'addresses/:mailboxId/mail', element: <AdminAddressMailPage />, handle: title('地址邮件') },
           { path: 'shared-mailboxes', element: <Navigate to="/admin/addresses" replace /> },

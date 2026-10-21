@@ -15,6 +15,7 @@ import { dayWindow, minuteWindow, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
+import { syncDueHostedDomains } from './hosted-domain.js';
 import { processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases } from './storage-cleanup.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
@@ -161,6 +162,7 @@ export async function runScheduled(env: Env, maintenance = true): Promise<void> 
   await step(report, 'storage.leases', () => expireDeliveryObjectLeases(env));
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
+  await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
   if (maintenance) await runMaintenance(env, report);
   console.log(JSON.stringify({ event: 'scheduled', maintenance, ms: Date.now() - started, steps: report }));
 }

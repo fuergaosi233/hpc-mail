@@ -24,7 +24,7 @@ import { bumpCounter, dayWindow } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { bodyBytes, D1_BODY_LIMIT, storeMailBody } from './mail-body.js';
 import { forwardReceivedMail } from './forwarding.js';
-import { NOTIFY_OWNER_IDS_SQL } from './mailbox.js';
+import { HOSTED_AUTO_CLAIM_SQL, HOSTED_STATUS_SQL, NOTIFY_OWNER_IDS_SQL, hostedRejectReason } from './mailbox.js';
 import { enqueueMailNotifications } from './notification-jobs.js';
 import { attachmentKey, getExt, putObject, sha256Hex16 } from './storage.js';
 import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
@@ -79,6 +79,8 @@ interface DuplicateRow {
 }
 
 interface InboundLookup {
+  /** 托管域名未生效或已停用时的拒收原因 */
+  rejected: string | null;
   duplicate: DuplicateRow | undefined;
   ownerIds: number[];
   ownerRows: NotifyOwnerRawRow[];
@@ -90,11 +92,14 @@ interface InboundLookup {
  * 合成一个 batch 往返。偏好行只在邮件完整落库后才解析。
  * 全部是原生 SQL、各自显式绑定：归属人子查询复用 NOTIFY_OWNER_IDS_SQL（?1 = 收件地址），
  * 不能与 drizzle 生成的匿名 ? 混在同一条语句里，否则新增条件会和 ?1 撞到同一槽位而静默绑错。
+ * 托管域名的未认领地址在归属结算前认领给域名所有者（同一事务），暂停或删除中的托管域名拒收。
  */
-async function lookupInbound(env: Env, ingestKey: string, address: string): Promise<InboundLookup> {
-  const [dup, owners, ownerUserRows, legacy] = await env.db.batch([
+async function lookupInbound(env: Env, ingestKey: string, address: string, domain: string): Promise<InboundLookup> {
+  const [dup, , hosted, owners, ownerUserRows, legacy] = await env.db.batch([
     env.db.prepare(`SELECT id, status, error_detail, raw_r2_key, body_r2_key, deleted_at, notify_owner_ids
       FROM messages WHERE ingest_key = ?1`).bind(ingestKey),
+    env.db.prepare(HOSTED_AUTO_CLAIM_SQL).bind(address, domain),
+    env.db.prepare(HOSTED_STATUS_SQL).bind(address, domain),
     env.db.prepare(NOTIFY_OWNER_IDS_SQL).bind(address),
     env.db.prepare(`select "id", "status", "role", "notify_prefs" from "users" where "id" in (${NOTIFY_OWNER_IDS_SQL})`).bind(address),
     env.db.prepare(`SELECT key, value FROM settings WHERE key IN (${LEGACY_NOTIFY_KEYS.map((_, i) => `?${i + 1}`).join(', ')})`)
@@ -105,6 +110,7 @@ async function lookupInbound(env: Env, ingestKey: string, address: string): Prom
     deleted_at: number | null; notify_owner_ids: string | null;
   } | undefined;
   return {
+    rejected: hostedRejectReason(hosted),
     duplicate: row && {
       id: Number(row.id), status: row.status, errorDetail: row.error_detail ?? '',
       rawR2Key: row.raw_r2_key, bodyR2Key: row.body_r2_key, deletedAt: row.deleted_at,
@@ -174,7 +180,7 @@ export async function handleInbound(
   const bodySize = bodyBytes(text, html);
 
   // 去重读先发出，往返期间完成 CPU 部分；R2 写入等去重结果出来、确认不是重复投递之后才开始。
-  const lookupReady = lookupInbound(env, ingestKey, toAddress);
+  const lookupReady = lookupInbound(env, ingestKey, toAddress, domain);
   // 下方 CPU 部分若抛错，lookupReady 的失败不能成为未处理的 rejection
   lookupReady.catch(() => {});
 
@@ -219,6 +225,10 @@ export async function handleInbound(
   const attachmentHashes = await Promise.all(parsedAttachments.map((att) => sha256Hex16(att.content)));
 
   const lookup = await lookupReady;
+  if (lookup.rejected) {
+    message.setReject(lookup.rejected);
+    return;
+  }
   let duplicate = lookup.duplicate;
   // 已删除或已完整的重复投递：在任何 R2 写入之前返回
   if (duplicate?.deletedAt || (duplicate && (duplicate.status === 'received' ||

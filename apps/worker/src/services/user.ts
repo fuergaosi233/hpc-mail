@@ -203,10 +203,17 @@ export async function deleteUser(env: Env, actingUserId: number, id: number, ctx
     .get();
   if (!target) throw new AppError('not_found', '用户不存在');
   if (target.role === 'admin') await assertNotLastAdmin(db, id);
+  // 托管域名不能没有所有者：先过户或删除
+  const hosted = await env.db.prepare("SELECT domain FROM hosted_domains WHERE user_id = ? AND status <> 'deleting' LIMIT 5")
+    .bind(id).all<{ domain: string }>();
+  if (hosted.results.length) {
+    throw new AppError('conflict', `该用户还拥有托管域名 ${hosted.results.map((row) => row.domain).join('、')}，请先过户或删除`);
+  }
 
   // D1 batch 作为一个事务提交：最后管理员触发器若拒绝 DELETE，前面的关联清理也会整体回滚。
   try {
     await env.db.batch([
+      env.db.prepare('DELETE FROM hosted_domain_members WHERE user_id = ?').bind(id),
       env.db.prepare('DELETE FROM mailbox_shares WHERE user_id = ?').bind(id),
       env.db
         .prepare('DELETE FROM mailbox_shares WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE user_id = ?)')
