@@ -161,9 +161,12 @@ export function getRouting(creds: CloudflareCredentials, zoneId: string): Promis
   return cf<CfRouting>(creds, 'GET', `/zones/${zoneId}/email/routing`);
 }
 
-/** 开启 Email Routing 并写入锁定的 MX / SPF / DKIM（替代已弃用的 /email/routing/enable） */
-export function enableRouting(creds: CloudflareCredentials, zoneId: string, name: string): Promise<CfRouting> {
-  return cf<CfRouting>(creds, 'POST', `/zones/${zoneId}/email/routing/dns`, { name });
+/**
+ * 在 zone 根域开启 Email Routing 并写入锁定的 MX / SPF / DKIM（替代已弃用的 /email/routing/enable）。
+ * 请求体的 name 只用于子域，传根域名会返回 2007「must be a subdomains of …」，根域必须传空对象。
+ */
+export function enableRouting(creds: CloudflareCredentials, zoneId: string): Promise<CfRouting> {
+  return cf<CfRouting>(creds, 'POST', `/zones/${zoneId}/email/routing/dns`, {});
 }
 
 export function getCatchAll(creds: CloudflareCredentials, zoneId: string): Promise<CfCatchAll> {

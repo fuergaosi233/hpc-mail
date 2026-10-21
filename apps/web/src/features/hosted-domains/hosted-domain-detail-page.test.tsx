@@ -94,6 +94,8 @@ describe('托管域名详情', () => {
     expect(screen.getByText(/等待生效期间本页每 30 秒自动刷新/)).toBeInTheDocument();
     expect(screen.getByText(/逾期仍未生效会自动删除/)).toBeInTheDocument();
     expect(screen.getByText('检测到 DNSSEC 仍开启，请先在注册商处关闭')).toBeInTheDocument();
+    // 等待生效期间只在生效进度里出现一次红字提醒
+    expect(screen.getAllByText(/修改名称服务器后不会立即生效/)).toHaveLength(1);
 
     expect(screen.getByRole('button', { name: /修改名称服务器/ })).toHaveAttribute('aria-expanded', 'true');
     const nameServers = within(screen.getByRole('list', { name: '本站分配的名称服务器' }));

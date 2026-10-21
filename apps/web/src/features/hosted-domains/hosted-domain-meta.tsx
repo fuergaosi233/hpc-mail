@@ -1,5 +1,7 @@
+import { Clock } from 'lucide-react';
 import type { HostedDomainRole, HostedDomainStatus, HostedDomainSteps } from '@hpc-mail/shared';
 import { Badge, type BadgeTone } from '@/components/ui/badge';
+import { cn } from '@/lib/cn';
 
 interface StatusMeta {
   label: string;
@@ -77,3 +79,17 @@ export const HOSTED_DOMAIN_STEPS: ReadonlyArray<{ key: keyof HostedDomainSteps; 
   { key: 'catchAll', label: '全部地址投递到本站', description: '任意前缀的来信都交给本站处理' },
   { key: 'sending', label: '发信', description: '发信所需的退信域与 DKIM、DMARC 记录' },
 ];
+
+/** 修改 NS 后的等待预期：添加弹窗、列表、生效进度与名称服务器指引共用，红字醒目提示 */
+export function NsPropagationNotice({ className }: { className?: string }) {
+  return (
+    <p role="note" className={cn('flex gap-1.5 text-sm font-medium text-critical', className)}>
+      <Clock aria-hidden className="mt-0.5 size-4 shrink-0" />
+      <span>
+        {'修改名称服务器后不会立即生效：通常需要几分钟到数小时，个别注册商最长 24–48 小时。'
+          + '新注册或在国内注册商购买的域名，要先完成实名认证，注册局才会发布新的名称服务器。'
+          + '期间本站每隔几分钟自动检测一次，生效后自动开通收发，不需要重复添加或反复修改。'}
+      </span>
+    </p>
+  );
+}

@@ -13,7 +13,7 @@ import { formatDateTime } from '@/lib/format';
 import { usePublicConfig } from '@/lib/use-config';
 import { useIsMobile } from '@/lib/use-media-query';
 import { AddHostedDomainDialog } from './add-hosted-domain-dialog';
-import { HostedDomainRoleBadge, HostedDomainStatusBadge } from './hosted-domain-meta';
+import { HostedDomainRoleBadge, HostedDomainStatusBadge, NsPropagationNotice } from './hosted-domain-meta';
 import { useHostedDomainsQuery } from './use-hosted-domains';
 
 export const hostedDomainHref = (domain: Pick<HostedDomain, 'id'>) => `/domains/${domain.id}`;
@@ -67,6 +67,9 @@ export function HostedDomainsPage() {
         <p className="mb-4 rounded-md border border-line bg-canvas px-3 py-2 text-sm text-ink-secondary">
           管理员暂未开放域名托管，不能添加新域名；已有的域名照常显示。
         </p>
+      )}
+      {items.some((domain) => domain.status === 'pending' && domain.role !== 'member') && (
+        <NsPropagationNotice className="mb-4 rounded-md border border-critical/40 bg-critical-soft px-3 py-2" />
       )}
 
       {isLoading ? (
