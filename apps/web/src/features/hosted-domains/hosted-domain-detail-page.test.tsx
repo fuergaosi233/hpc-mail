@@ -159,6 +159,8 @@ describe('托管域名详情', () => {
     expect(screen.getByRole('button', { name: '过户' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '删除托管' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '退出共享' })).toBeNull();
+    // 认领入口带上域名，认领弹窗打开时预选它
+    expect(screen.getByRole('link', { name: '认领地址' })).toHaveAttribute('href', '/mailboxes?claim=1&domain=mine.example');
     client.clear();
   });
 

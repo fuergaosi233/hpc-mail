@@ -44,12 +44,13 @@ export async function getVisibleDomains(
     env.db.batch([
       mailboxPolicyUserStatement(env.db, userId),
       env.db.prepare(`SELECT domain FROM hosted_domains h WHERE status IN (${USABLE_HOSTED_SQL})
-        AND (user_id = ?1 OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?1))
+        AND ((SELECT role FROM users WHERE id = ?1) = 'admin' OR user_id = ?1
+          OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?1))
         ORDER BY domain`).bind(userId),
     ]),
     settings ?? getSettingsFresh(env),
   ]);
-  // 自己拥有或被共享的托管域名排在系统域名之后；管理员在托管域名页处理他人的域名
+  // 托管域名排在系统域名之后：普通用户是自己拥有或被共享的，管理员可在任何人的托管域名下认领
   return [
     ...resolveMailboxPolicy(resolved, mailboxPolicyUserFromResult(userResult)).domains.map(({ domain }) => domain),
     ...((hosted?.results ?? []) as { domain: string }[]).map((row) => row.domain),

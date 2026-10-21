@@ -34,6 +34,8 @@ export interface ClaimDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   domains: string[];
+  /** 打开时预选的域名（如从托管域名详情页进入）；不在可认领列表里时忽略 */
+  initialDomain?: string;
 }
 
 interface Row extends AddressDraft {
@@ -118,7 +120,7 @@ function DomainSelect({ value, domains, label, disabled, onValueChange }: {
   );
 }
 
-export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
+export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: ClaimDialogProps) {
   const queryClient = useQueryClient();
   const baseId = useId();
   const nextRowId = useRef(1);
@@ -167,6 +169,13 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
         : current,
     );
   }, [open, domain, domains]);
+
+  // 带着域名打开：预选它，尚未填写前缀的行一并换成该域名
+  useEffect(() => {
+    if (!open || !initialDomain || !domains.includes(initialDomain)) return;
+    setDomain(initialDomain);
+    setRows((current) => current.map((row) => (row.localPart ? row : { ...row, domain: initialDomain })));
+  }, [open, initialDomain, domains]);
 
   useEffect(() => {
     const timer = globalThis.setTimeout(

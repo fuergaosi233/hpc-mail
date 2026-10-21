@@ -124,7 +124,7 @@ function SummarySection({ domain }: { domain: HostedDomain }) {
       {usable && (
         <div className="mt-4 flex flex-wrap gap-2">
           <Button asChild size="sm" variant="secondary">
-            <Link to="/mailboxes?claim=1">
+            <Link to={`/mailboxes?claim=1&domain=${encodeURIComponent(domain.domain)}`}>
               <Plus className="size-4" />
               认领地址
             </Link>
