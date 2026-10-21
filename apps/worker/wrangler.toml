@@ -30,6 +30,8 @@ crons = ["*/5 * * * *", "0 16 * * *"]
 # 系统域名不再写死在 vars，改由 settings.domains.list（管理端维护）；见 services/domain.ts
 site_origin = "https://hpc.email"
 build_sha = "local"
+# 托管域名 catch-all 投递目标，须与上方 name 一致
+worker_name = "hpc-cloud-mail"
 
 [[d1_databases]]
 binding = "db"

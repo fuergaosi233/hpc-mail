@@ -17,6 +17,7 @@ const SETTINGS = {
   ai_model: { baseUrl: 'https://api.deepseek.com', apiKey: '******', model: 'deepseek-flash' },
   translation: { enabled: true, dailyCharsPerUser: 200000 },
   claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 50, dailyLimit: 3 },
+  hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 1000 },
 } as unknown as Settings;
 
 const mocks = vi.hoisted(() => ({
@@ -247,6 +248,35 @@ describe('SettingsPage 随机认领规则', () => {
     );
     await screen.findByText('邮箱认领策略');
     expect(screen.queryByText('随机认领规则')).toBeNull();
+    client.clear();
+  });
+});
+
+describe('SettingsPage 域名托管', () => {
+  it('编辑开关与额度，越界值按范围截断，随整页保存提交完整的 hosted_domains', async () => {
+    mocks.update.mockClear();
+    const { client } = mount();
+    const toggle = await screen.findByRole('switch', { name: '启用域名托管' });
+    expect(toggle).toBeChecked();
+    const days = screen.getByRole('spinbutton', { name: /等待生效天数/ });
+    const pendingPerUser = screen.getByRole('spinbutton', { name: /每人同时等待生效数/ });
+    expect(days).toHaveValue(7);
+    expect(screen.getByRole('spinbutton', { name: /每人最多托管域名数/ })).toHaveValue(3);
+
+    fireEvent.click(toggle);
+    fireEvent.change(days, { target: { value: '40' } });
+    expect(days).toHaveValue(28);
+    fireEvent.change(pendingPerUser, { target: { value: '0' } });
+    expect(pendingPerUser).toHaveValue(1);
+    fireEvent.change(screen.getByRole('spinbutton', { name: /全站同时等待生效数/ }), { target: { value: '20' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存更改' }));
+    await waitFor(() =>
+      expect(mocks.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hosted_domains: { enabled: false, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 20, pendingDays: 28, autoClaimLimit: 1000 },
+        }),
+      ),
+    );
     client.clear();
   });
 });

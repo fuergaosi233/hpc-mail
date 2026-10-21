@@ -132,6 +132,13 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
     } else if (key === 'domains') {
       const current = await loadCurrent();
       const expected = patch.expectedDomainsRevision ?? current.domains.revision ?? 0;
+      // 用户托管的域名由其所有者管理，不能同时登记为系统域名
+      const listed = (parsed.data as Settings['domains']).list.map((entry) => entry.domain);
+      const hosted = await env.db.prepare('SELECT domain FROM hosted_domains WHERE domain IN (SELECT value FROM json_each(?))')
+        .bind(JSON.stringify(listed)).all<{ domain: string }>();
+      if (hosted.results.length) {
+        throw new AppError('conflict', `${hosted.results.map((row) => row.domain).join('、')} 已被用户托管，不能加为系统域名`);
+      }
       domains = { value: JSON.stringify({ ...parsed.data as object, revision: expected + 1 }), expected };
     } else writes.push({ key, value: JSON.stringify(parsed.data) });
   }

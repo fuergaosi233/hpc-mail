@@ -7,6 +7,8 @@ import {
   createUserRequestSchema, updateUserRequestSchema, userMailboxPolicySchema, createApiKeyRequestSchema, updateApiKeyRequestSchema,
   createInviteRequestSchema, replaceMailboxSharesRequestSchema, batchShareMailboxesRequestSchema, updateSettingsRequestSchema,
   updateNotifyPrefsRequestSchema, userNotifyPrefsSchema, translateMessageRequestSchema, aiModelTestRequestSchema,
+  HOSTED_DOMAIN_STATUSES, createHostedDomainRequestSchema, updateHostedDomainRequestSchema, replaceHostedDomainMembersRequestSchema,
+  transferHostedDomainRequestSchema,
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
 } from '@hpc-mail/shared';
 
@@ -145,7 +147,35 @@ export const schemas: Record<string, Schema> = {
       targets: array(object({ address: str, attempts: int, remaining: int })), domains: array(object({ domain: str, attempts: int, remaining: int })) }) }),
   DomainStatus: object({ domain: str, inList: bool, mxReady: bool, spfReady: bool, mxRecords: array(str), resolved: bool }),
   PublicConfig: object({ siteTitle: str, registrationMode: { type: 'string', enum: ['closed', 'invite', 'open'] }, domains: array(str), require2fa: bool,
-    translationEnabled: { ...bool, description: 'translation.enabled is on and ai_model has baseUrl, apiKey and model configured; provider details are never public.' } }),
+    translationEnabled: { ...bool, description: 'translation.enabled is on and ai_model has baseUrl, apiKey and model configured; provider details are never public.' },
+    hostedDomainsEnabled: { ...bool, description: 'hosted_domains.enabled is on and the Worker has Cloudflare credentials, so users can add their own domains.' } }),
+  HostedDomain: (() => {
+    const step = { type: 'string', enum: ['waiting', 'ready', 'error'] };
+    return object({
+      id: positiveId, domain: domainName,
+      status: { type: 'string', enum: HOSTED_DOMAIN_STATUSES,
+        description: 'pending: waiting for the registrar nameservers to be changed; provisioning: nameservers active, Email Routing / catch-all / Email Sending being configured; active: receiving and sending ready; error: active nameservers but configuration or health check failed, retried automatically; moved: nameservers no longer point here; suspended: stopped by an administrator; deleting: mail, addresses and Cloudflare configuration are being removed.' },
+      role: { type: 'string', enum: ['owner', 'member', 'admin'], description: 'Caller relationship: owner, member granted by sharing, or administrator viewing another user’s domain.' },
+      ownerUserId: positiveId, ownerUsername: str,
+      nameServers: { ...array(str), description: 'Set exactly these nameservers at the registrar.' },
+      originalNameServers: { ...array(str), description: 'Nameservers detected when the domain was added; restore them before deleting the hosted domain.' },
+      originalRegistrar: str,
+      steps: object({ nameServers: step, routing: step, catchAll: step, sending: step }),
+      warnings: { ...array(str), description: 'Actions required from the owner, such as disabling DNSSEC before changing nameservers.' },
+      lastError: str, memberLimit: { ...int, description: 'Per-member claim limit on this domain; 0 means unlimited.' },
+      memberCount: int, mailboxCount: { ...int, description: 'Claimed addresses on this domain across all users.' },
+      createdAt: date, activatedAt: nullable(date), checkedAt: nullable(date),
+      expiresAt: { ...nullable(date), description: 'While pending, the domain is deleted automatically if the nameservers are not changed by this time.' },
+    });
+  })(),
+  HostedDomainMember: object({ userId: positiveId, username: str, status: { type: 'string', enum: ['active', 'disabled'] }, grantedAt: date,
+    mailboxCount: { ...int, description: 'Addresses this member claimed on the domain.' } }),
+  HostedDomainTransferResult: object({ domain: ref('HostedDomain'), previousUserId: positiveId, transferred: bool,
+    movedMailboxes: { ...int, description: 'Mailboxes of the previous owner moved with the domain when includeMailboxes was true.' } }),
+  HostedDomainsHealth: object({ enabled: bool, configured: { ...bool, description: 'Worker secrets cf_api_token and cf_account_id are set.' },
+    tokenValid: nullable(bool), error: str, accountZones: nullable(int), accountPendingZones: nullable(int) }),
+  CreateHostedDomainRequest: fromZod(createHostedDomainRequestSchema), UpdateHostedDomainRequest: fromZod(updateHostedDomainRequestSchema),
+  ReplaceHostedDomainMembersRequest: fromZod(replaceHostedDomainMembersRequestSchema), TransferHostedDomainRequest: fromZod(transferHostedDomainRequestSchema),
   TranslateMessageRequest: (() => {
     const schema = fromZod(translateMessageRequestSchema);
     schema.description = `Segments cut from this message subject/body in display order, translated in order. 1–${MAX_TRANSLATE_SEGMENTS} segments, each at most ${MAX_TRANSLATE_SEGMENT_CHARS} characters, combined at most ${MAX_TRANSLATE_BATCH_CHARS} characters; split longer messages into several requests.`;

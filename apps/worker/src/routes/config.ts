@@ -2,6 +2,7 @@ import type { PublicConfig } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { ok } from '../lib/http.js';
 import { getPublicDomains } from '../services/domain.js';
+import { hostedDomainsAvailable } from '../services/hosted-domain.js';
 import { getSettings, isTranslationReady } from '../services/setting.js';
 import type { AppContext } from '../types.js';
 
@@ -19,6 +20,7 @@ app.get('/', async (c) => {
     domains: await getPublicDomains(c.env, settings),
     require2fa: settings.security.require2fa,
     translationEnabled: isTranslationReady(settings),
+    hostedDomainsEnabled: hostedDomainsAvailable(c.env, settings),
   };
   c.header('Cache-Control', 'no-store');
   c.header('X-HPC-Build', c.env.build_sha ?? 'local');

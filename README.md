@@ -62,6 +62,7 @@ HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Ro
 | **AI 翻译** | 邮件详情一键翻译成简体中文，HTML 邮件保留排版，译文缓存、按用户限额 |
 | **发件** | 回复 / 转发 / CC / BCC / 附件，站内互投即时落库，外发配额可配 |
 | **转发通知** | 按「收件地址归属人」分流的个人偏好：邮箱转发（含中转降级）、飞书 Webhook 卡片（HMAC 签名 + 防 SSRF）、通用 Webhook |
+| **托管域名** | 用户在「我的域名」填入自己的域名，系统用站长的 Cloudflare 账户建 zone 并给出 NS；用户改好 NS 后自动开通收件（catch-all）与发信，未认领地址的来信自动归域名所有者；域名可共享给其他用户认领地址、可过户，管理员可暂停、过户或删除任意托管域名 |
 | **多用户** | admin / user 两角色；注册模式默认关闭（可开邀请码/开放）；地址认领制；域名可设「仅管理员」或开放认领，可按域名限制每人认领数；支持用户专属域名范围、总数和单域名上限 |
 | **开放 API** | `/v1` 全套接口，API Key 支持 scope、每分钟限流、IP 白名单、过期时间与调用审计 |
 | **账户安全** | JWT + D1 强一致会话、改密 / 禁用即时踢线、TOTP 两步验证（可全局强制）、新 IP 登录飞书告警 |
@@ -237,9 +238,12 @@ wrangler r2 bucket create hpc-cloud-mail-r2
 | Variable | `KV_NAMESPACE_ID` | 第 1 步输出的 KV ID |
 | Variable | `CUSTOM_DOMAIN` | 站点域名（Worker custom domain，不含 `https://`） |
 | Variable | `ADMIN_USERNAME` | 管理员用户名（3–32 位小写字母/数字/`-`/`_`） |
+| Secret（可选） | `CF_HOSTED_DOMAINS_TOKEN` | 开启「托管域名」：用户添加自己的域名时，Worker 用它在你的 Cloudflare 账户建 zone 并开通收发。不设置则该功能隐藏。权限见下方说明 |
 | Variable（可选） | `PLACEMENT_REGION` | Worker 放置区域，填 D1 主库附近的云区域（如主库在美西填 `aws:us-west-1`，在新加坡填 `aws:ap-southeast-1`）。设置后 API 请求在数据库附近执行，每个请求只跨一次远程；不设则在离用户最近的节点执行。D1 主库位置在建库时用 `wrangler d1 create --location <wnam/enam/weur/apac…>` 指定，应选在多数访问的入口节点附近（Cloudflare 日志里的 colo） |
 
 > **API Token 权限**：用「Edit Cloudflare Workers」模板创建，再手动补两条——**Account → D1:Edit**（模板不含）、**Zone → Workers Routes:Edit** 且 Zone Resources 勾选 `CUSTOM_DOMAIN` 所在 zone（缺这条会在「部署 Worker」步骤失败）。
+>
+> **托管域名 Token（可选）**：单独创建一个 Token，权限 **Zone → Zone:Edit、DNS:Edit、Zone Settings:Edit、Email Routing Rules:Edit**，**Account → Email Sending:Edit**；Zone Resources 选「All zones from an account」并 **Exclude 站点域名等关键 zone**。部署时 CI 把它与 `CLOUDFLARE_ACCOUNT_ID` 写入 Worker secrets（`cf_api_token` / `cf_account_id`）。用户的域名会成为你账户下的 zone：收件、发信额度与信誉都算在你的账户上，可在后台「托管域名」页暂停或删除。Cloudflare 在账户超过 50 个 zone 且 pending 多于 active 时禁止新增，后台「系统设置 → 域名托管」可限制每人域名数与同时等待生效的数量。
 
 **3. 首次部署**：fork 仓库的 **Actions 默认是禁用的**——先进仓库 Actions 页点击启用，然后在 `Deploy HPC Mail` workflow 手动 **Run workflow**（刚 fork 没有新提交，push 不会自动触发）。全新空 D1 **不需要**勾 `reset_database`，迁移会自动从零建表；只有复用了含旧表的数据库才勾它（危险：会清空数据）。此后每次 push 到 `main` 自动部署。
 

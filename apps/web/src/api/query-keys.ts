@@ -41,6 +41,14 @@ export const queryKeys = {
     list: (scope: 'mine' | 'admin') => ['api-keys', 'list', scope] as const,
   },
 
+  /** 托管域名：我拥有的与共享给我的；管理员查看他人域名的详情也挂在这里 */
+  hostedDomains: {
+    root: ['hosted-domains'] as const,
+    list: ['hosted-domains', 'list'] as const,
+    detail: (id: number) => ['hosted-domains', 'detail', id] as const,
+    members: (id: number) => ['hosted-domains', 'members', id] as const,
+  },
+
   admin: {
     users: ['admin', 'users'] as const,
     userSearch: (q: string, excludeUserId?: number) => ['admin', 'users', 'search', q, excludeUserId] as const,
@@ -50,6 +58,9 @@ export const queryKeys = {
     domainClaudeStats: ['admin', 'domain-claude-stats'] as const,
     mailboxShares: ['admin', 'mailbox-shares'] as const,
     mailboxSharesOf: (mailboxId: number) => ['admin', 'mailbox-shares', mailboxId] as const,
+    hostedDomains: ['admin', 'hosted-domains'] as const,
+    hostedDomainList: (filters: { status?: string; q?: string }) => ['admin', 'hosted-domains', filters] as const,
+    hostedDomainsHealth: ['admin', 'hosted-domains-health'] as const,
   },
 } as const;
 

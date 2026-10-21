@@ -97,6 +97,7 @@ count 1–50 默认 1；maxUses 1–1000 默认 1；expiresAt 可选 ISO 8601 �
 | `retention` | `{unclaimedDays,allMessagesDays}`；0–3650 天，0 关闭该项定时清理 |
 | `ai_model` | `{baseUrl,apiKey,model}`；全站唯一的 AI 模型（OpenAI 兼容 Chat Completions），翻译与验证码 AI 兜底共用；三项都非空才算已配置。baseUrl 为 https 根地址，不含 `/chat/completions`；apiKey 只写，回显为 `******`，提交 `******` 保留原值、空串清除 |
 | `translation` | `{enabled,dailyCharsPerUser}`；AI 翻译开关与额度。enabled=true 要求 `ai_model` 已配置，同一请求同时提交两者时按合并后的结果校验（翻译开着时不能单独清空模型）；dailyCharsPerUser 0–10000000，每用户每 UTC 日发送给模型的字符数，0 不限，admin 不豁免 |
+| `hosted_domains` | `{enabled,maxPerUser,maxPendingPerUser,maxPendingTotal,pendingDays,autoClaimLimit}`；用户托管域名开关与额度（Worker 还需配置 Cloudflare 凭据，`/api/config` 的 `hostedDomainsEnabled` 反映两者）。maxPerUser 0–1000（0 不限）为普通用户最多拥有的域名数；maxPendingPerUser 1–100 与 maxPendingTotal 1–1000 限制同时等待 NS 生效的数量，保护站长 Cloudflare 账户的添加额度；pendingDays 1–28 天未改 NS 自动删除；autoClaimLimit 1–100000（默认 1000）为每个托管域名自动认领的地址上限，域内地址达到后未认领新地址的来信拒收，手动认领不受限。管理员不受个人上限，受全站等待数限制。全站托管域名、暂停/恢复与凭据健康检查见 `/api/admin/hosted-domains…`，详情、成员、过户、删除复用 `/api/hosted-domains/:id…`（管理员有全部权限），见[邮箱参考](mailboxes-and-domains.md#用户托管域名) |
 
 外发 dailyRecipients 以每次请求去重后的收件地址计数，不是跨全天同一收件人只计一次；站内/外收件均计入。系统当前策略必须先读取，不把 schema 默认值当线上设置。
 

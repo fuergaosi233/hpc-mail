@@ -164,6 +164,24 @@ export interface AiModelTestResult {
   sample: string;
 }
 
+/**
+ * 用户托管域名：Worker 配置了 Cloudflare 凭据（cf_api_token / cf_account_id）时才可用。
+ * pending 额度保护站长账户：Cloudflare 在账户超过 50 个 zone 且 pending 多于 active 时禁止新增。
+ */
+export const hostedDomainsSettingSchema = z.object({
+  enabled: z.boolean(),
+  /** 普通用户最多拥有的托管域名数（0=不限；管理员不受限） */
+  maxPerUser: z.number().int().min(0).max(1000),
+  /** 普通用户同时处于等待 NS 生效的域名数 */
+  maxPendingPerUser: z.number().int().min(1).max(100),
+  /** 全站同时处于等待 NS 生效的域名数（含管理员） */
+  maxPendingTotal: z.number().int().min(1).max(1000),
+  /** 等待 NS 生效的天数，到期自动删除 zone（Cloudflare Free 计划 28 天后也会删除） */
+  pendingDays: z.number().int().min(1).max(28),
+  /** 未认领地址的来信自动认领给域名所有者，域内地址达到该数后不再自动认领、新地址来信拒收（手动认领不受限） */
+  autoClaimLimit: z.number().int().min(1).max(100000).default(1000),
+});
+
 // gmail_forward / feishu / notify_webhook 已从系统设置下放为「每用户的个人转发与通知偏好」
 // （见 schemas/notify-prefs.ts）；下面三个 schema 定义保留、被个人偏好复用。
 export const SETTING_SCHEMAS = {
@@ -179,6 +197,7 @@ export const SETTING_SCHEMAS = {
   ai_model: aiModelSettingSchema,
   translation: translationSettingSchema,
   claim_random: claimRandomSettingSchema,
+  hosted_domains: hostedDomainsSettingSchema,
 } as const;
 export type SettingKey = keyof typeof SETTING_SCHEMAS;
 
@@ -204,6 +223,7 @@ export const DEFAULT_SETTINGS: Settings = {
   ai_model: { baseUrl: '', apiKey: '', model: '' },
   translation: { enabled: false, dailyCharsPerUser: 200_000 },
   claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 50, dailyLimit: 3 },
+  hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 1000 },
 };
 
 export const updateSettingsRequestSchema = z
@@ -221,6 +241,7 @@ export const updateSettingsRequestSchema = z
     ai_model: aiModelSettingSchema.optional(),
     translation: translationSettingSchema.optional(),
     claim_random: claimRandomSettingSchema.optional(),
+    hosted_domains: hostedDomainsSettingSchema.optional(),
   })
   .refine((v) => Object.keys(SETTING_SCHEMAS).some((key) => v[key as SettingKey] !== undefined), {
     message: '至少提供一个待更新配置',
@@ -252,6 +273,8 @@ export interface PublicConfig {
   require2fa: boolean;
   /** AI 翻译已启用且 ai_model 配置完整（baseUrl、apiKey、model 均非空）；前端据此显示「翻译」按钮 */
   translationEnabled: boolean;
+  /** 托管域名可用（开关打开且 Worker 已配置 Cloudflare 凭据）；前端据此显示「我的域名」 */
+  hostedDomainsEnabled: boolean;
 }
 
 /** 域名接入自检状态：DNS-over-HTTPS 探测 MX/SPF 是否已指向 Cloudflare Email Routing（无需 CF 凭据） */

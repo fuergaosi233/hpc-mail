@@ -1,10 +1,11 @@
-import type {
-  BatchClaimMailboxResult, ClaimMailboxRequest, Mailbox, MailboxAvailability, MailboxTransferResult, MailboxUnavailableReason, Role,
-  TransferMailboxRequest,
+import {
+  HOSTED_DOMAIN_USABLE_STATUSES,
+  type BatchClaimMailboxResult, type ClaimMailboxRequest, type HostedDomainStatus, type Mailbox, type MailboxAvailability,
+  type MailboxTransferResult, type MailboxUnavailableReason, type Role, type TransferMailboxRequest,
 } from '@hpc-mail/shared';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
-import { mailboxes, messages, users } from '../db/schema.js';
+import { hostedDomains, mailboxes, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import {
@@ -71,6 +72,8 @@ interface ClaimPolicy {
   /** 普通用户的全局/按域认领上限（0=不限；管理员恒为 0），供 INSERT 时原子复核 */
   perUserLimit: number;
   perDomainLimit: number;
+  /** 托管域名：INSERT 复核托管权限，不复核系统域名列表与专属配置版本 */
+  hosted: boolean;
   /** 第一条不满足的规则；null 表示规则层面可认领（地址占用另判） */
   blocked: { reason: MailboxUnavailableReason; error: AppError } | null;
 }
@@ -81,20 +84,55 @@ interface OwnedCounts {
   byDomain: Map<string, number>;
 }
 
-/** 一条 GROUP BY 同时给出合计与按域计数（走 idx_mailboxes_user） */
+/** 托管域名下的地址不计入全站每人认领上限，只受域名所有者设置的成员上限约束 */
+const SYSTEM_OWNED_COUNT_SQL = `(SELECT COUNT(*) FROM mailboxes WHERE user_id = ?
+  AND domain NOT IN (SELECT domain FROM hosted_domains))`;
+
+/** 一条 GROUP BY 同时给出按域计数与是否托管域名（走 idx_mailboxes_user）；合计不含托管域名 */
 export function ownedCountsStatement(db: D1Database, userId: number): D1PreparedStatement {
-  return db.prepare('SELECT domain, COUNT(*) AS n FROM mailboxes WHERE user_id = ? GROUP BY domain').bind(userId);
+  return db.prepare(`SELECT domain, COUNT(*) AS n,
+    EXISTS (SELECT 1 FROM hosted_domains WHERE hosted_domains.domain = mailboxes.domain) AS hosted
+    FROM mailboxes WHERE user_id = ? GROUP BY domain`).bind(userId);
 }
 
 export function ownedCountsFromResult(result: D1Result | undefined): OwnedCounts {
   const byDomain = new Map<string, number>();
   let total = 0;
-  for (const row of (result?.results ?? []) as { domain: string; n: number }[]) {
+  for (const row of (result?.results ?? []) as { domain: string; n: number; hosted: number }[]) {
     byDomain.set(row.domain, Number(row.n));
-    total += Number(row.n);
+    if (!Number(row.hosted)) total += Number(row.n);
   }
   return { total, byDomain };
 }
+
+/** 认领人对托管域名的权限：状态、所有者、是否成员与成员上限，与认领上下文一起读取 */
+export interface HostedClaimAccess {
+  status: HostedDomainStatus;
+  ownerId: number;
+  isMember: boolean;
+  memberLimit: number;
+}
+
+function hostedAccessStatement(db: D1Database, userId: number, domains: string[]): D1PreparedStatement {
+  return db.prepare(`SELECT h.domain, h.user_id, h.status, h.member_limit,
+      EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?1) AS is_member
+    FROM hosted_domains h WHERE h.domain IN (SELECT value FROM json_each(?2))`).bind(userId, JSON.stringify(domains));
+}
+
+function hostedAccessFromResult(result: D1Result | undefined): Map<string, HostedClaimAccess> {
+  const rows = (result?.results ?? []) as { domain: string; user_id: number; status: HostedDomainStatus; member_limit: number; is_member: number }[];
+  return new Map(rows.map((row) => [row.domain, {
+    status: row.status, ownerId: Number(row.user_id), isMember: Number(row.is_member) === 1, memberLimit: Number(row.member_limit),
+  }]));
+}
+
+/**
+ * 托管域名的认领守卫（INSERT 内原子复核）：域名已生效，且认领人是所有者、成员或管理员。
+ * 绑定顺序：域名、角色、用户 id、用户 id。
+ */
+const HOSTED_CLAIM_GUARD_SQL = `EXISTS (SELECT 1 FROM hosted_domains h WHERE h.domain = ?
+  AND h.status IN (${HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ')})
+  AND (? = 'admin' OR h.user_id = ? OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?)))`;
 
 /**
  * 认领规则唯一来源：认领、批量认领、可用性检查与过户共用，避免几处判定漂移。
@@ -107,9 +145,25 @@ function evaluateClaimPolicy(
   owned: OwnedCounts,
   localPart: string,
   domain: string,
+  hosted?: HostedClaimAccess,
 ): ClaimPolicy {
-  const allow = (perUserLimit = 0, perDomainLimit = 0): ClaimPolicy => ({ perUserLimit, perDomainLimit, blocked: null });
-  const block = (reason: MailboxUnavailableReason, error: AppError): ClaimPolicy => ({ perUserLimit: 0, perDomainLimit: 0, blocked: { reason, error } });
+  const allow = (perUserLimit = 0, perDomainLimit = 0): ClaimPolicy => ({ perUserLimit, perDomainLimit, hosted: !!hosted, blocked: null });
+  const block = (reason: MailboxUnavailableReason, error: AppError): ClaimPolicy => ({ perUserLimit: 0, perDomainLimit: 0, hosted: !!hosted, blocked: { reason, error } });
+  if (hosted) {
+    // 托管域名：所有者与管理员不受限；成员受保留前缀与成员上限约束；其他人不可见
+    if (!(HOSTED_DOMAIN_USABLE_STATUSES as readonly string[]).includes(hosted.status)) {
+      return block('domain_unavailable', new AppError('forbidden', '该域名尚未生效或已停用'));
+    }
+    if (user.role === 'admin' || hosted.ownerId === user.id) return allow();
+    if (!hosted.isMember) return block('domain_unavailable', new AppError('forbidden', '当前用户无权认领该域名'));
+    if (settings.mailbox_policy.reservedLocalParts.includes(localPart)) {
+      return block('reserved', new AppError('forbidden', `前缀 ${localPart} 为系统保留，无法认领`));
+    }
+    if (hosted.memberLimit > 0 && (owned.byDomain.get(domain) ?? 0) >= hosted.memberLimit) {
+      return block('domain_limit', new AppError('forbidden', `在该域名下最多认领 ${hosted.memberLimit} 个地址`));
+    }
+    return allow(0, hosted.memberLimit);
+  }
   if (!settings.domains.list.some((entry) => entry.domain === domain)) {
     return block('domain_unavailable', new AppError('validation_failed', '域名不在系统域名列表内'));
   }
@@ -143,6 +197,8 @@ interface ClaimContext {
   owned: OwnedCounts;
   /** 已被认领的地址：读取时已存在的，加上本批刚认领的 */
   taken: Set<string>;
+  /** 本次涉及的托管域名及当前用户的权限 */
+  hosted: Map<string, HostedClaimAccess>;
 }
 
 const addressOf = (req: ClaimMailboxRequest) => `${req.localPart}@${req.domain}`;
@@ -154,11 +210,13 @@ const claimSettingsFrom = (result: D1Result | undefined): ClaimSettings =>
 /** 规则所需的全部读取合成一个 D1 batch：认领设置（强一致直读）、用户权限、已认领数、地址占用。 */
 async function loadClaimContext(env: Env, actor: { userId: number; role: Role }, addresses: string[]): Promise<ClaimContext> {
   const unique = [...new Set(addresses)];
-  const [settingsResult, userResult, ownedResult, takenResult] = await env.db.batch([
+  const domains = [...new Set(unique.map((address) => address.slice(address.lastIndexOf('@') + 1)))];
+  const [settingsResult, userResult, ownedResult, takenResult, hostedResult] = await env.db.batch([
     claimSettingsStatement(env.db),
     mailboxPolicyUserStatement(env.db, actor.userId),
     ownedCountsStatement(env.db, actor.userId),
     env.db.prepare('SELECT address FROM mailboxes WHERE address IN (SELECT value FROM json_each(?))').bind(JSON.stringify(unique)),
+    hostedAccessStatement(env.db, actor.userId, domains),
   ]);
   return {
     userId: actor.userId,
@@ -166,6 +224,7 @@ async function loadClaimContext(env: Env, actor: { userId: number; role: Role },
     user: mailboxPolicyUserFromResult(userResult),
     owned: ownedCountsFromResult(ownedResult),
     taken: new Set(((takenResult?.results ?? []) as { address: string }[]).map((row) => row.address)),
+    hosted: hostedAccessFromResult(hostedResult),
   };
 }
 
@@ -182,51 +241,66 @@ interface InsertedMailboxRow {
 /** 规则判定 → 占用判定 → 带守卫的 INSERT（RETURNING 直接带回整行与历史邮件数）。成功后更新 context。 */
 async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailboxRequest): Promise<Mailbox> {
   const { settings, user: policyUser, userId } = context;
-  const policy = evaluateClaimPolicy(settings, policyUser, context.owned, req.localPart, req.domain);
+  const policy = evaluateClaimPolicy(settings, policyUser, context.owned, req.localPart, req.domain, context.hosted.get(req.domain));
   if (policy.blocked) throw policy.blocked.error;
   const { perUserLimit, perDomainLimit } = policy;
 
   const address = addressOf(req);
   if (context.taken.has(address)) throw new AppError('address_taken', '该地址已被占用');
+  const returning = `RETURNING id, address, domain, user_id, display_name, created_at,
+    (SELECT COUNT(*) FROM messages WHERE messages.address = mailboxes.address) AS message_count`;
   try {
     // Domain revision and quotas are checked in the same write as INSERT. A
     // concurrent domain removal/private toggle must not create a stale claim.
-    const inserted = await env.db
-      .prepare(
-        `INSERT INTO mailboxes (address, domain, user_id, display_name)
-         SELECT ?, ?, ?, ''
-         WHERE (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ?) < ?)
-           AND (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ? AND domain = ?) < ?)
-           AND COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) = ?
-           AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active' AND role = ? AND mailbox_policy_revision = ?)
-           AND EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured
-             WHERE settings.key = 'domains'
-               AND lower(trim(CASE WHEN configured.type = 'text' THEN configured.value
-                 ELSE json_extract(configured.value, '$.domain') END)) = ?)
-         RETURNING id, address, domain, user_id, display_name, created_at,
-           (SELECT COUNT(*) FROM messages WHERE messages.address = mailboxes.address) AS message_count`,
-      )
-      .bind(
-        address,
-        req.domain,
-        userId,
-        perUserLimit,
-        userId,
-        perUserLimit,
-        perDomainLimit,
-        userId,
-        req.domain,
-        perDomainLimit,
-        settings.domains.revision ?? 0,
-        userId,
-        policyUser.role,
-        policyUser.mailboxPolicyRevision,
-        req.domain,
-      )
-      .first<InsertedMailboxRow>();
-    if (!inserted) throw await claimGuardError(env, context);
+    // 托管域名改为复核域名状态与认领人权限，不计入全站每人上限。
+    const inserted = policy.hosted
+      ? await env.db
+        .prepare(
+          `INSERT INTO mailboxes (address, domain, user_id, display_name)
+           SELECT ?, ?, ?, ''
+           WHERE (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ? AND domain = ?) < ?)
+             AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active' AND role = ?)
+             AND ${HOSTED_CLAIM_GUARD_SQL}
+           ${returning}`,
+        )
+        .bind(address, req.domain, userId, perDomainLimit, userId, req.domain, perDomainLimit,
+          userId, policyUser.role, req.domain, policyUser.role, userId, userId)
+        .first<InsertedMailboxRow>()
+      : await env.db
+        .prepare(
+          `INSERT INTO mailboxes (address, domain, user_id, display_name)
+           SELECT ?, ?, ?, ''
+           WHERE (? = 0 OR ${SYSTEM_OWNED_COUNT_SQL} < ?)
+             AND (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ? AND domain = ?) < ?)
+             AND COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) = ?
+             AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active' AND role = ? AND mailbox_policy_revision = ?)
+             AND EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured
+               WHERE settings.key = 'domains'
+                 AND lower(trim(CASE WHEN configured.type = 'text' THEN configured.value
+                   ELSE json_extract(configured.value, '$.domain') END)) = ?)
+           ${returning}`,
+        )
+        .bind(
+          address,
+          req.domain,
+          userId,
+          perUserLimit,
+          userId,
+          perUserLimit,
+          perDomainLimit,
+          userId,
+          req.domain,
+          perDomainLimit,
+          settings.domains.revision ?? 0,
+          userId,
+          policyUser.role,
+          policyUser.mailboxPolicyRevision,
+          req.domain,
+        )
+        .first<InsertedMailboxRow>();
+    if (!inserted) throw await claimGuardError(env, context, policy.hosted);
     context.taken.add(address);
-    context.owned.total += 1;
+    if (!policy.hosted) context.owned.total += 1;
     context.owned.byDomain.set(req.domain, (context.owned.byDomain.get(req.domain) ?? 0) + 1);
     return serialize({
       id: Number(inserted.id),
@@ -246,7 +320,8 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
 }
 
 /** INSERT 守卫未通过：一次读回当前域名修订与用户权限，区分是配置变化还是并发用尽了配额 */
-async function claimGuardError(env: Env, context: ClaimContext): Promise<AppError> {
+async function claimGuardError(env: Env, context: ClaimContext, hosted = false): Promise<AppError> {
+  if (hosted) return new AppError('conflict', '域名状态、权限或成员上限已改变，请刷新后重试');
   const [settingsResult, userResult] = await env.db.batch([
     claimSettingsStatement(env.db),
     mailboxPolicyUserStatement(env.db, context.userId),
@@ -286,7 +361,7 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
     SELECT domain, COUNT(*) AS n FROM mailboxes WHERE user_id = ?2 GROUP BY domain
   ),
   live_total AS MATERIALIZED (
-    SELECT COALESCE(SUM(n), 0) AS n FROM live_owned
+    SELECT COALESCE(SUM(n), 0) AS n FROM live_owned WHERE domain NOT IN (SELECT domain FROM hosted_domains)
   ),
   input AS (
     SELECT CAST(key AS INTEGER) AS position,
@@ -296,6 +371,7 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
       json_extract(value, '$.perDomainLimit') AS domain_limit,
       json_extract(value, '$.ownedDomain') AS owned_domain,
       json_extract(value, '$.wasTaken') AS was_taken,
+      json_extract(value, '$.hosted') AS hosted,
       json_extract(value, '$.code') AS policy_code,
       json_extract(value, '$.message') AS policy_message
     FROM json_each(?1)
@@ -307,7 +383,7 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
   ),
   counted AS (
     SELECT *, (was_taken = 0 AND existing = 0 AND occurrence = 1) AS is_new,
-      COALESCE(SUM(was_taken = 0 AND existing = 0 AND occurrence = 1) OVER (
+      COALESCE(SUM(was_taken = 0 AND existing = 0 AND occurrence = 1 AND hosted = 0) OVER (
         ORDER BY position ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS added,
       COALESCE(SUM(was_taken = 0 AND existing = 0 AND occurrence = 1) OVER (
         PARTITION BY domain ORDER BY position ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS domain_added
@@ -321,11 +397,16 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
       WHEN was_taken = 0 AND (existing OR occurrence = 1) AND (
         (user_limit > 0 AND (SELECT n FROM live_total) + added >= user_limit)
         OR (domain_limit > 0 AND COALESCE((SELECT n FROM live_owned WHERE domain = counted.domain), 0) + domain_added >= domain_limit)
-        OR COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) != ?4
-        OR NOT EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active' AND role = ?5 AND mailbox_policy_revision = ?6)
-        OR NOT EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured
+        OR (hosted = 0 AND COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) != ?4)
+        OR NOT EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active' AND role = ?5
+          AND (counted.hosted = 1 OR mailbox_policy_revision = ?6))
+        OR (hosted = 0 AND NOT EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured
           WHERE settings.key = 'domains' AND lower(trim(CASE WHEN configured.type = 'text' THEN configured.value
-            ELSE json_extract(configured.value, '$.domain') END)) = counted.domain)
+            ELSE json_extract(configured.value, '$.domain') END)) = counted.domain))
+        OR (hosted = 1 AND NOT EXISTS (SELECT 1 FROM hosted_domains h WHERE h.domain = counted.domain
+          AND h.status IN (${HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ')})
+          AND (?5 = 'admin' OR h.user_id = ?2
+            OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?2))))
       ) THEN 'guard'
       ELSE NULL END AS blocked
     FROM counted
@@ -347,9 +428,10 @@ interface PlannedClaimRow {
 async function claimChunk(env: Env, context: ClaimContext, items: ClaimMailboxRequest[]) {
   const inputs = items.map((item) => {
     // 配额在事务内按实际成功的前缀累计；这里仅冻结域名、权限和保留前缀规则。
-    const policy = evaluateClaimPolicy(context.settings, context.user, { total: 0, byDomain: new Map() }, item.localPart, item.domain);
+    const policy = evaluateClaimPolicy(context.settings, context.user, { total: 0, byDomain: new Map() }, item.localPart, item.domain,
+      context.hosted.get(item.domain));
     return {
-      address: addressOf(item), domain: item.domain,
+      address: addressOf(item), domain: item.domain, hosted: policy.hosted ? 1 : 0,
       perUserLimit: policy.perUserLimit, perDomainLimit: policy.perDomainLimit,
       ownedDomain: context.owned.byDomain.get(item.domain) ?? 0,
       wasTaken: context.taken.has(addressOf(item)) ? 1 : 0,
@@ -391,7 +473,7 @@ export async function claimMailboxes(
       for (const row of plan) {
         const item = items[index]!;
         if (row.blocked) {
-          if (row.blocked === 'guard') throw await claimGuardError(env, context);
+          if (row.blocked === 'guard') throw await claimGuardError(env, context, context.hosted.has(item.domain));
           if (row.blocked === 'quota') throw new AppError('forbidden', `认领地址数已达上限（${row.user_limit}）`);
           if (row.blocked === 'domain_limit') throw new AppError('forbidden', `在该域名下最多认领 ${row.domain_limit} 个地址`);
           throw new AppError(row.blocked as AppError['code'], row.policy_message!);
@@ -407,7 +489,7 @@ export async function claimMailboxes(
             createdAt: new Date(Number(mailbox.created_at)),
           }, Number(mailbox.message_count)));
           context.taken.add(row.address);
-          context.owned.total++;
+          if (!context.hosted.has(item.domain)) context.owned.total++;
           context.owned.byDomain.set(item.domain, (context.owned.byDomain.get(item.domain) ?? 0) + 1);
         }
         index++;
@@ -430,7 +512,7 @@ export async function claimMailboxes(
 
 function availabilityOf(context: ClaimContext, req: ClaimMailboxRequest): MailboxAvailability {
   const address = addressOf(req);
-  const policy = evaluateClaimPolicy(context.settings, context.user, context.owned, req.localPart, req.domain);
+  const policy = evaluateClaimPolicy(context.settings, context.user, context.owned, req.localPart, req.domain, context.hosted.get(req.domain));
   if (policy.blocked) return { address, available: false, reason: policy.blocked.reason };
   return context.taken.has(address) ? { address, available: false, reason: 'taken' } : { address, available: true };
 }
@@ -479,8 +561,9 @@ export async function transferMailbox(
   // 重试已完成的过户不清理新主人后来建立的共享，也不重复记审计。
   if (row.userId === target.id) return resultFor(row, false);
   if (row.userId !== req.expectedOwnerId) throw new AppError('conflict', '邮箱归属已改变，请刷新后重新确认');
-  // 公共配置用户保留管理员强制过户行为；专属用户的新增归属遵守其完整认领规则。
-  const settings = target.role === 'user' && target.mailboxPolicy !== null ? await getSettingsFresh(env) : undefined;
+  // 公共配置用户保留管理员强制过户行为；专属用户的新增归属遵守其完整认领规则。托管域名的地址由管理员强制过户。
+  const hosted = await db.select({ id: hostedDomains.id }).from(hostedDomains).where(eq(hostedDomains.domain, row.domain)).get();
+  const settings = !hosted && target.role === 'user' && target.mailboxPolicy !== null ? await getSettingsFresh(env) : undefined;
   const policy = settings ? evaluateClaimPolicy(settings, target, ownedCountsFromResult(await ownedCountsStatement(env.db, target.id).all()),
     row.address.slice(0, row.address.lastIndexOf('@')), row.domain) : undefined;
   if (policy?.blocked) throw policy.blocked.error;
@@ -491,7 +574,7 @@ export async function transferMailbox(
   const results = await env.db.batch([
     env.db.prepare(`UPDATE mailboxes SET user_id = ? WHERE id = ? AND user_id = ? AND user_id <> ?
       AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active' AND role = ? AND mailbox_policy_revision = ?)
-      AND (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ?) < ?)
+      AND (? = 0 OR ${SYSTEM_OWNED_COUNT_SQL} < ?)
       AND (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ? AND domain = ?) < ?)
       AND (? = 0 OR COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) = ?)`)
       .bind(target.id, id, req.expectedOwnerId, target.id, target.id, target.role, target.mailboxPolicyRevision,
@@ -597,10 +680,51 @@ export const NOTIFY_OWNER_IDS_SQL = `SELECT user_id AS id FROM mailboxes WHERE a
     SELECT id FROM users WHERE role = 'admin' AND status = 'active'
       AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE address = ?1)`;
 
-/** 通知归属：已认领 → 主人；未认领 → 全部启用中的管理员。收信当时结算，一次查询完成。 */
+/**
+ * 通知归属：已认领 → 主人；未认领 → 全部启用中的管理员。收信当时结算，一次查询完成。
+ * 托管域名的未认领地址在结算前已由 HOSTED_AUTO_CLAIM_SQL 认领给域名所有者，不会落到管理员。
+ */
 export async function resolveNotifyOwnerIds(env: Env, address: string): Promise<number[]> {
   const rows = await env.db.prepare(NOTIFY_OWNER_IDS_SQL).bind(address).all<{ id: number }>();
   return rows.results.map((row) => Number(row.id));
+}
+
+const USABLE_HOSTED_SQL = HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ');
+
+/**
+ * 托管域名收件（?1 = 收件地址，?2 = 域名）：未认领的地址先认领给域名所有者，邮件随即出现在他的收件箱。
+ * 只在域名已生效、且域内地址数低于 hosted_domains.autoClaimLimit 时认领，防止随机地址的来信无限建地址。
+ * 须排在 HOSTED_STATUS_SQL 与归属结算之前执行。
+ */
+export const HOSTED_AUTO_CLAIM_SQL = `INSERT OR IGNORE INTO mailboxes (address, domain, user_id, display_name)
+  SELECT ?1, ?2, user_id, '' FROM hosted_domains WHERE domain = ?2 AND status IN (${USABLE_HOSTED_SQL})
+    AND (SELECT COUNT(*) FROM mailboxes WHERE domain = ?2) < COALESCE(
+      (SELECT json_extract(value, '$.autoClaimLimit') FROM settings WHERE key = 'hosted_domains'), 1000)`;
+
+/** 收件域名的托管状态与该地址是否已有主人（?1 = 收件地址，?2 = 域名）；非托管域名无结果 */
+export const HOSTED_STATUS_SQL = `SELECT status, EXISTS (SELECT 1 FROM mailboxes WHERE address = ?1) AS claimed
+  FROM hosted_domains WHERE domain = ?2`;
+
+/** 托管域名的拒收原因：未生效、已停用，或地址数已达上限而新地址没能认领；其余返回 null */
+export function hostedRejectReason(result: D1Result | undefined): string | null {
+  const row = result?.results?.[0] as { status?: HostedDomainStatus; claimed?: number } | undefined;
+  if (!row?.status) return null;
+  if (!(HOSTED_DOMAIN_USABLE_STATUSES as readonly string[]).includes(row.status)) {
+    return row.status === 'pending' ? '收件域名尚未生效' : '收件域名已停用';
+  }
+  return Number(row.claimed) ? null : '收件域名的地址数已达上限';
+}
+
+/** 站内投递的收件归属：托管域名停用则拒收；未认领地址先归域名所有者，再结算通知归属，一次往返 */
+export async function resolveDeliveryOwners(env: Env, address: string): Promise<{ rejected: string | null; ownerIds: number[] }> {
+  const domain = address.slice(address.lastIndexOf('@') + 1);
+  const [, status, owners] = await env.db.batch([
+    env.db.prepare(HOSTED_AUTO_CLAIM_SQL).bind(address, domain),
+    env.db.prepare(HOSTED_STATUS_SQL).bind(address, domain),
+    env.db.prepare(NOTIFY_OWNER_IDS_SQL).bind(address),
+  ]);
+  const rejected = hostedRejectReason(status);
+  return { rejected, ownerIds: rejected ? [] : (owners?.results ?? []).map((row) => Number((row as { id: number }).id)) };
 }
 
 /** 校验地址归属（发件身份校验用） */

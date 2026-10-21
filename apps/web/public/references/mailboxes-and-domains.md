@@ -1,12 +1,12 @@
 # 邮箱、共享与多域名
 
-shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD 在 JWT `/api` 与 Key `/v1` 均可用；共享管理只用 JWT `/api`；强制过户、全站共享和域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
+shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD 在 JWT `/api` 与 Key `/v1` 均可用；共享管理与用户托管域名只用 JWT `/api`；强制过户、全站共享和系统域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
 
 ## 发现域名与邮箱
 
 | 路径 | JWT `/api` | Key `/v1` |
 |---|---|---|
-| `GET /domains` | `data` 为域名字符串数组 | `data:{domains:[...]}`，任一有效 Key |
+| `GET /domains` | `data` 为域名字符串数组；系统域名之后附上自己拥有或被共享、已生效的托管域名 | `data:{domains:[...]}`，任一有效 Key，范围同左 |
 | `GET /mailboxes` | 自己认领的数组 | 同左，`mailbox.read` |
 | `GET /mailboxes?all=1` | 管理员全站数组；普通用户不能请求全站范围 | 同左，`mailbox.read` 加管理员角色 |
 | `GET /mailboxes/shared` | 分享给自己的只读管理员邮箱数组 | 同左，`mailbox.read` |
@@ -97,3 +97,27 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 - 配置为空且无存量邮箱时没有可用发件/认领域；需管理员先完成实际域名接入。不应承诺外部投递由“保存域名”即可成功。
 
 接入检查 `GET /api/admin/settings/domain-status?domain=…` 返回 `domain,inList,mxReady,spfReady,mxRecords,resolved`。`resolved:false` 是查询失败，不是证明没接入；MX 指向 `*.mx.cloudflare.net`、SPF 包含 `_spf.mx.cloudflare.net` 只验证 DNS，不能证明 catch-all 指向本 Worker、外发授权或真实投递成功。完整接入需用户授权范围内的 DNS/Cloudflare 配置与真实收发验证，这些操作并非本邮箱管理 API 的能力。
+
+## 用户托管域名
+
+`GET /api/config` 的 `hostedDomainsEnabled` 为 true 时，任何登录用户都能把自己的域名托管到本站（JWT 专用，Key 无对应接口）。域名只用于邮箱：站点在站长的 Cloudflare 账户建 zone，用户在注册商把 NS 改成返回的两条，原有网站等 DNS 记录不会迁移。
+
+| 路径（JWT `/api`） | 说明 |
+|---|---|
+| `GET /hosted-domains` | 自己拥有（`role:"owner"`）与被共享（`role:"member"`）的域名；管理员全站用 `GET /admin/hosted-domains?status=&q=` |
+| `POST /hosted-domains` | `{domain}`，填已注册的根域名 → 201，`status:"pending"`、`nameServers` 两条、`originalNameServers`、`warnings`（如需先关闭 DNSSEC）、`expiresAt`（到期未改 NS 自动删除） |
+| `GET /hosted-domains/:id` | 进度：`status` 与 `steps:{nameServers,routing,catchAll,sending}`（各为 waiting/ready/error）、`lastError`、`checkedAt` |
+| `POST /hosted-domains/:id/check` | 所有者或管理员：请 Cloudflare 立即复查 NS 并推进开通，15 秒内重复调用直接返回当前状态 |
+| `PUT /hosted-domains/:id` | `{memberLimit}`：每位成员在该域最多认领数，0 不限 |
+| `GET` / `PUT /hosted-domains/:id/members` | 成员名单；PUT `{userIds,expectedOwnerId}` 整体替换（已禁用的现有成员可保留，新增的须为启用中的用户），选人用 `GET /mailboxes/share-users` |
+| `DELETE /hosted-domains/:id/members/:userId` | 移除成员；成员传自己的 id 即退出共享。已认领的地址保留 |
+| `POST /hosted-domains/:id/transfer` | `{userId,expectedOwnerId,includeMailboxes}`；`includeMailboxes:true` 连同原所有者在该域的地址与全部历史一起过户。调用者过户后失去权限时返回 `domain:null` |
+| `DELETE /hosted-domains/:id` | 不可逆：立即拒收，随后永久删除该域全部邮件、释放全部地址并删除 zone。先在注册商把 NS 改回 `originalNameServers` |
+
+状态：`pending` 等待改 NS → NS 生效后系统自动开通收件与发信（`provisioning`）→ `active`。`error` 为开通或巡检未通过（自动重试），`moved` 为 NS 已不再指向本站，`suspended` 为管理员暂停（拒收、禁止发信与新认领），`deleting` 为删除中。定时任务约每 5 分钟推进一次。
+
+- 权限：所有者与管理员可查看进度、管理成员、过户、删除；成员只能在该域认领地址（受 `memberLimit` 与系统保留前缀约束），看不到域名设置，也看不到他人地址的邮件；其他用户看到 404。管理员额外可用 `POST /admin/hosted-domains/:id/suspend|resume`。
+- 收件：已生效域名上**未认领地址的来信自动认领给域名所有者**，直接出现在所有者收件箱并按其个人偏好通知；域内地址达到 `hosted_domains.autoClaimLimit`（默认 1000）后，未认领新地址的来信拒收；暂停或删除中的域名拒收。释放托管域名下的地址且保留历史时，下一封来信会把该地址连同历史邮件自动认领给域名所有者；不想留给所有者就用 `deleteHistory=1` 释放。
+- 认领与发信：托管域名的地址不占全站每人认领上限；所有者不受保留前缀限制。从托管域名发信要求 `steps.sending` 为 ready，否则返回 400。
+- 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400；Cloudflare 限流 429。
+

@@ -229,7 +229,7 @@ describe('批量认领', () => {
     expect(result.claimed).toHaveLength(999);
     expect(result).toMatchObject({ taken: [], notAttempted: [], stoppedBy: null });
     expect(explained).toBe(true);
-    expect(probe.queries()).toBe(24);
+    expect(probe.queries()).toBe(25);
   });
 
   it('重复地址不重复计额度，但达到额度时先判额度再判占用', async () => {
@@ -361,7 +361,7 @@ describe('批量可用性', () => {
 });
 
 describe('认领与可用性的 D1 往返', () => {
-  it('999 个批量认领仅 11 次往返、24 条 SQL；单个认领与可用性往返保持不变', async () => {
+  it('999 个批量认领仅 11 次往返、25 条 SQL；单个认领与可用性往返保持不变', async () => {
     const f = await fixture();
     let probe = counting();
     await claimMailbox(probe.env, f.user.id, 'user', f.item('one'));
@@ -380,7 +380,7 @@ describe('认领与可用性的 D1 往返', () => {
     const result = await claimMailboxes(probe.env, f.user.id, 'user', items);
     expect(result.claimed).toHaveLength(MAX_BATCH_CLAIM);
     expect(probe.trips()).toBe(11);
-    expect(probe.queries()).toBe(24);
+    expect(probe.queries()).toBe(25);
 
     // 并发认领在写入前占满按域额度：守卫拒绝，再读一次判定为并发用尽
     probe = counting(async (sql) => {

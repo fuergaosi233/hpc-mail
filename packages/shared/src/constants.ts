@@ -79,6 +79,8 @@ export const MAX_BATCH_CLAIM = 999;
 export const MAX_BATCH_SHARE_MAILBOXES = 100;
 /** 每只邮箱最多共享给多少人（替换与批量追加共用） */
 export const MAX_MAILBOX_GRANTEES = 100;
+/** 每个托管域名最多共享给多少位成员 */
+export const MAX_HOSTED_DOMAIN_MEMBERS = 100;
 export const MAX_DRAFT_ATTACHMENT_BYTES_PER_USER = 100 * 1024 * 1024;
 
 /** 用户名：小写字母/数字开头，3-32 位，允许 - _ */

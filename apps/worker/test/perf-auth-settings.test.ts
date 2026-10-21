@@ -324,7 +324,7 @@ describe('/api/domains 往返', () => {
     { domain: 'perf-priv.example', public: false, perUserLimit: 0 },
   ];
 
-  it('鉴权 batch 之后用户策略与设置并行直读（最多 2 层 D1），结果与认领口径一致', async () => {
+  it('鉴权 batch 之后用户策略（含托管域名）与设置并行直读（最多 2 层 D1），结果与认领口径一致', async () => {
     await updateSettings(env, { domains: { list } });
     const userId = await seedUser('perf-domains-user');
     const adminId = await seedUser('perf-domains-admin', { role: 'admin' });
@@ -339,7 +339,7 @@ describe('/api/domains 往返', () => {
       const coldBody = ((await cold.json()) as { data: string[] }).data;
       expect(coldBody).toEqual(want);
       expect(coldBody).toEqual(await expected(id));
-      expect(traced.calls.map((call) => call.kind)).toEqual(['batch', 'single', 'single']);
+      expect(traced.calls.map((call) => call.kind)).toEqual(['batch', 'batch', 'single']);
       expect(traced.layers()).toBe(2);
       expect(traced.kvCalls).toEqual([]);
 
@@ -347,7 +347,7 @@ describe('/api/domains 往返', () => {
       const hot = await request('/api/domains', bearer(token), traced.env);
       expect(((await hot.json()) as { data: string[] }).data).toEqual(want);
       // 设置直读 D1（认领弹窗的前端闸门要立即反映域名变更），与策略读取并行，仍是 2 层
-      expect(traced.calls.map((call) => call.kind)).toEqual(['batch', 'single', 'single']);
+      expect(traced.calls.map((call) => call.kind)).toEqual(['batch', 'batch', 'single']);
       expect(traced.layers()).toBe(2);
     }
   });
