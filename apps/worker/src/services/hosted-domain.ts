@@ -335,7 +335,7 @@ async function ensureMailConfig(creds: CloudflareCredentials, row: HostedRow, zo
   if (zoneActive) {
     try {
       let routing = await getRouting(creds, zoneId).catch(() => null);
-      if (!routing?.enabled || routing.status !== 'ready') routing = await enableRouting(creds, zoneId, row.domain);
+      if (!routing?.enabled || routing.status !== 'ready') routing = await enableRouting(creds, zoneId);
       out.routingStatus = routing.status ?? '';
       if (out.routingStatus !== 'ready') fail('收件路由', `Cloudflare 状态为 ${out.routingStatus || '未知'}`);
     } catch (error) {

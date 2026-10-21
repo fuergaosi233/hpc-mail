@@ -35,6 +35,8 @@ describe('添加托管域名', () => {
     expect(screen.getByText(/只用于邮箱/)).toBeInTheDocument();
     expect(screen.getByText(/原有网站、解析等其他 DNS/)).toBeInTheDocument();
     expect(screen.getByText(/关闭 DNSSEC/)).toBeInTheDocument();
+    // 红字提醒：改 NS 后需要等待生效
+    expect(screen.getByText(/修改名称服务器后不会立即生效/).closest('p')).toHaveClass('text-critical');
     expect(screen.getByText(/超过等待期限仍未生效会自动删除/)).toBeInTheDocument();
     client.clear();
   });

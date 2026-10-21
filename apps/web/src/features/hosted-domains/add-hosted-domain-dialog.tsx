@@ -11,6 +11,7 @@ import { FormField } from '@/components/ui/form-field';
 import { Input } from '@/components/ui/input';
 import { toast } from '@/components/ui/toast';
 import { hostedDomainApi } from './hosted-domains-api';
+import { NsPropagationNotice } from './hosted-domain-meta';
 
 export function AddHostedDomainDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const queryClient = useQueryClient();
@@ -90,6 +91,7 @@ export function AddHostedDomainDialog({ open, onOpenChange }: { open: boolean; o
                 <li>提交后请尽快修改名称服务器，超过等待期限仍未生效会自动删除，截止时间见详情页。</li>
               </ul>
             </div>
+            <NsPropagationNotice className="mt-3" />
           </DialogBody>
           <DialogFooter>
             <Button type="button" variant="secondary" disabled={create.isPending} onClick={() => onOpenChange(false)}>

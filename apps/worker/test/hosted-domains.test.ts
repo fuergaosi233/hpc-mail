@@ -82,6 +82,10 @@ function fakeCloudflare(opts: { dnssec?: string[]; existing?: string[]; createEr
     if (rest === '/email/routing' && method === 'GET') return ok(zone.routing);
     if (rest === '/email/routing/dns' && method === 'POST') {
       if (zone.status !== 'active') return fail(400, 2009, 'Active zone required');
+      // 与真实 Cloudflare 一致：name 只用于子域，传根域名返回 2007
+      if (body.name !== undefined && !String(body.name).endsWith(`.${zone.name}`)) {
+        return fail(400, 2007, `Invalid Input: must be a subdomains of ${zone.name}`);
+      }
       zone.routing = { enabled: true, status: 'ready' };
       return ok(zone.routing);
     }

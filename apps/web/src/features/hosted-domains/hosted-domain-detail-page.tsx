@@ -36,6 +36,7 @@ import {
   HOSTED_DOMAIN_STEPS,
   HostedDomainRoleBadge,
   HostedDomainStatusBadge,
+  NsPropagationNotice,
 } from './hosted-domain-meta';
 import { HostedDomainMembersSection } from './hosted-domain-members';
 import { hostedDomainApi } from './hosted-domains-api';
@@ -216,6 +217,7 @@ function ProgressSection({ domain, canManage }: { domain: HostedDomain; canManag
           </p>
         )}
       </div>
+      {domain.status === 'pending' && <NsPropagationNotice />}
     </Section>
   );
 }
@@ -309,9 +311,10 @@ function NameServerSection({ domain }: { domain: HostedDomain }) {
               选择「自定义名称服务器」，删除原有的全部条目，只填写上面两条。
             </GuideStep>
             <GuideStep n={4} title="保存并等待生效">
-              保存后通常几分钟到 24 小时生效。生效后本页会自动更新，也可以点「立即检测」。
+              保存后需要等注册局发布新的名称服务器并由 Cloudflare 确认。生效后本页会自动更新，也可以点「立即检测」。
             </GuideStep>
           </ol>
+          {domain.status === 'moved' && <NsPropagationNotice />}
         </div>
       )}
     </section>
