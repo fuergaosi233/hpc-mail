@@ -79,16 +79,20 @@ export function hostedDnsFqdn(name: string, domain: string): string {
 export function hostedDnsRelativeName(fqdn: string, domain: string): string {
   const value = fqdn.toLowerCase().replace(/\.$/, '');
   if (value === domain) return '@';
-  return value.endsWith(`.${domain}`) ? value.slice(0, -domain.length - 1) : value;
+  if (!value.endsWith(`.${domain}`)) return value;
+  const relative = value.slice(0, -domain.length - 1);
+  // 去掉后缀后仍是本域名或其子域（如 www.example.com.example.com）时保留完整域名，
+  // 否则 hostedDnsFqdn 会把相对名当作完整域名，编辑保存时记录被改名
+  return relative === domain || relative.endsWith(`.${domain}`) ? value : relative;
 }
 
 /**
- * 保守判断 SPF：多段字符串解析时直接拼接（"v=sp" "f1 -all"），还可能有 RFC 1035 转义（\118 即 v），
+ * 保守判断 SPF：多段字符串解析时直接拼接（"v=sp" "f1 -all"），还可能有 RFC 1035 转义（\118 即 v，部分实现对超过 255 的值取模），
  * 所以解码转义、去掉引号与空白后以 v=spf1 开头的一律算作 SPF
  */
 function isSpf(content: string): boolean {
   const decoded = content
-    .replace(/\\(\d{3})/g, (_, code: string) => String.fromCharCode(Number(code)))
+    .replace(/\\(\d{3})/g, (_, code: string) => String.fromCharCode(Number(code) % 256))
     .replace(/\\(.)/g, '$1');
   return decoded.replace(/["\s]/g, '').toLowerCase().startsWith('v=spf1');
 }
@@ -129,6 +133,9 @@ const hostnameSchema = z.string().trim().toLowerCase().min(1, '请填写目标�
 const ttlSchema = z.number().int()
   .refine((value) => value === HOSTED_DNS_TTL_AUTO || (value >= 60 && value <= 86400), 'TTL 为自动或 60–86400 秒');
 
+const IPV4_MESSAGE = '请填写 IPv4 地址，例如 203.0.113.10';
+const IPV6_MESSAGE = '请填写 IPv6 地址，例如 2001:db8::1';
+
 const base = {
   name: nameSchema,
   ttl: ttlSchema,
@@ -137,8 +144,9 @@ const base = {
 
 /** 新增与修改共用；修改时 type 必须与原记录一致 */
 export const hostedDnsRecordInputSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('A'), ...base, content: z.ipv4('请填写 IPv4 地址，例如 203.0.113.10') }),
-  z.object({ type: z.literal('AAAA'), ...base, content: z.ipv6('请填写 IPv6 地址，例如 2001:db8::1') }),
+  z.object({ type: z.literal('A'), ...base, content: z.string().trim().pipe(z.ipv4(IPV4_MESSAGE)) }),
+  // zod 的 IPv6 校验基于 URL 解析，会忽略中间的制表符与换行，先限定字符集
+  z.object({ type: z.literal('AAAA'), ...base, content: z.string().trim().regex(/^[0-9a-f:.]+$/i, IPV6_MESSAGE).pipe(z.ipv6(IPV6_MESSAGE)) }),
   z.object({ type: z.literal('CNAME'), ...base, content: hostnameSchema }),
   z.object({ type: z.literal('TXT'), ...base, content: z.string().trim().min(1, '请填写记录值').max(2048, '记录值最多 2048 个字符') }),
   z.object({ type: z.literal('MX'), ...base, content: hostnameSchema, priority: z.number().int().min(0).max(65535) }),

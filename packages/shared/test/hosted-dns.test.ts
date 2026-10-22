@@ -16,6 +16,11 @@ describe('托管域名 DNS 记录名', () => {
     expect(hostedDnsFqdn('*.dev', domain)).toBe('*.dev.example.com');
     expect(hostedDnsRelativeName('example.com', domain)).toBe('@');
     expect(hostedDnsRelativeName('_acme-challenge.Example.com.', domain)).toBe('_acme-challenge');
+    // 去掉后缀后仍以本域名结尾的名称保留完整写法，转回完整域名时不变
+    for (const fqdn of ['www.example.com.example.com', 'example.com.example.com']) {
+      expect(hostedDnsRelativeName(fqdn, domain)).toBe(fqdn);
+      expect(hostedDnsFqdn(hostedDnsRelativeName(fqdn, domain), domain)).toBe(fqdn);
+    }
   });
 
   it('通配符只能在最前面，标签不能以连字符开头', () => {
@@ -36,6 +41,7 @@ describe('与邮箱冲突的记录', () => {
     expect(reason('TXT', '@', '"\\118=spf1 -all"')).toContain('SPF');
     expect(reason('TXT', '@', '"v\\=spf1 include:x -all"')).toContain('SPF');
     expect(reason('TXT', '@', 'v=sp"f1 -all"')).toContain('SPF');
+    expect(reason('TXT', '@', '"\\374=spf1 -all"')).toContain('SPF');
     expect(reason('TXT', '@', '"hello" "v=spf1"')).toBe('');
     expect(reason('TXT', '@', 'google-site-verification=v=spf1')).toBe('');
     expect(reason('TXT', '_dmarc', 'v=DMARC1; p=none')).toContain('DMARC');
@@ -65,6 +71,8 @@ describe('托管域名 DNS 记录请求', () => {
   it('按类型校验并归一化', () => {
     expect(hostedDnsRecordInputSchema.parse({ type: 'A', name: ' WWW. ', ttl: 1, content: '203.0.113.10' }))
       .toEqual({ type: 'A', name: 'www', ttl: 1, content: '203.0.113.10', comment: '' });
+    expect(hostedDnsRecordInputSchema.parse({ type: 'A', name: 'www', ttl: 1, content: ' 203.0.113.10\n' })).toMatchObject({ content: '203.0.113.10' });
+    expect(hostedDnsRecordInputSchema.parse({ type: 'AAAA', name: 'www', ttl: 1, content: '2001:DB8::1 ' })).toMatchObject({ content: '2001:DB8::1' });
     expect(hostedDnsRecordInputSchema.parse({ type: 'CNAME', name: 'blog', ttl: 300, content: 'Target.Example.NET.' }))
       .toMatchObject({ content: 'target.example.net' });
     expect(hostedDnsRecordInputSchema.parse({ type: 'MX', name: 'mail', ttl: 1, content: 'mx.example.net', priority: 10 }))
@@ -82,6 +90,8 @@ describe('托管域名 DNS 记录请求', () => {
       { type: 'A', name: 'www', ttl: 90000, content: '1.2.3.4' },
       { type: 'A', name: 'www', ttl: 1, content: '1.2.3' },
       { type: 'AAAA', name: 'www', ttl: 1, content: '1.2.3.4' },
+      { type: 'AAAA', name: 'www', ttl: 1, content: '2001:db8::\t1' },
+      { type: 'AAAA', name: 'www', ttl: 1, content: '2001:db8::\n1' },
       { type: 'CNAME', name: 'www', ttl: 1, content: 'localhost' },
       { type: 'MX', name: 'mail', ttl: 1, content: 'mx.example.net' },
       { type: 'TXT', name: 'a.*', ttl: 1, content: 'x' },
