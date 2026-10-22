@@ -1,5 +1,5 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { QueryClient, type QueryClientConfig, QueryClientProvider } from '@tanstack/react-query';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HostedDnsRecord, HostedDomain, SessionUser } from '@hpc-mail/shared';
@@ -70,9 +70,11 @@ const RECORDS = [apex, mailMx, spf, dmarc, shop, www];
 
 const dnsKey = ['hosted-domains', 'dns-records', 1];
 
-function mount(target: HostedDomain = domain(), user: SessionUser = alice) {
+type Retry = NonNullable<NonNullable<QueryClientConfig['defaultOptions']>['queries']>['retry'];
+
+function mount(target: HostedDomain = domain(), user: SessionUser = alice, retry: Retry = false) {
   mocks.get.mockResolvedValue(target);
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  const client = new QueryClient({ defaultOptions: { queries: { retry }, mutations: { retry: false } } });
   const router = createMemoryRouter([{ path: '/domains/:id', element: <HostedDomainDetailPage /> }], {
     initialEntries: ['/domains/1'],
   });
@@ -206,13 +208,53 @@ describe('托管域名 DNS 解析', () => {
     client.clear();
   });
 
-  it('名称服务器未生效时提示先补原有记录', async () => {
+  it('名称服务器未生效时提示先补原有记录，说明根域邮件被接管与逾期删除', async () => {
     const client = mount(domain({ status: 'pending', activatedAt: null, expiresAt: '2026-10-28T00:00:00Z' }));
     const section = within(await dnsSection());
-    expect(section.getByText(/名称服务器生效前就可以添加解析/)).toBeInTheDocument();
+    expect(section.getByText(/名称服务器生效前就可以添加解析/)).toHaveTextContent('网站等记录切换时不中断（根域邮件由本站接管）');
+    expect(section.getByText(/前完成名称服务器修改，逾期未生效时域名会连同已添加的解析一起删除/)).toBeInTheDocument();
     expect(await section.findByRole('button', { name: '添加记录' })).toBeEnabled();
-    // 名称服务器指引里同样提醒
-    expect(screen.getByText(/修改名称服务器前，先在下方「DNS 解析」补上网站等原有记录/)).toBeInTheDocument();
+    // 名称服务器指引里同样提醒，「不中断」只限网站等记录
+    expect(screen.getByText(/修改名称服务器前，先在下方「DNS 解析」补上网站等原有记录/)).toHaveTextContent(
+      '网站等记录切换时不中断（根域邮件由本站接管）',
+    );
+    expect(screen.queryByText(/切换后这些服务不会中断/)).toBeNull();
+    client.clear();
+  });
+
+  it('暂停的域名：管理员自己拥有的域名也可以修改', async () => {
+    const client = mount(domain({ status: 'suspended', role: 'owner', ownerUserId: 7, ownerUsername: 'root' }), root);
+    const section = within(await dnsSection());
+    expect(await section.findByRole('button', { name: '编辑 A 记录 @' })).toBeInTheDocument();
+    expect(section.getByRole('button', { name: '添加记录' })).toBeEnabled();
+    expect(section.queryByText('域名已被管理员暂停，解析只读。')).toBeNull();
+    client.clear();
+  });
+
+  it('后台刷新失败时保留已加载的列表与添加按钮，只给轻提示', async () => {
+    const client = mount();
+    await screen.findByRole('table', { name: '解析记录' });
+    mocks.dnsRecords.mockRejectedValueOnce(new ApiError('解析操作过于频繁，请稍后再试', { code: 'rate_limited', httpStatus: 429 }));
+    await act(async () => {
+      await client.refetchQueries({ queryKey: dnsKey });
+    });
+    const notice = await screen.findByText(/刷新失败：解析操作过于频繁，请稍后再试/);
+    expect(screen.getByRole('table', { name: '解析记录' })).toBeInTheDocument();
+    expect(screen.queryByText('加载失败')).toBeNull();
+    expect(screen.getByRole('button', { name: '添加记录' })).toBeEnabled();
+
+    fireEvent.click(within(notice.closest('p')!).getByRole('button', { name: '重试' }));
+    await waitFor(() => expect(screen.queryByText(/刷新失败/)).toBeNull());
+    expect(mocks.dnsRecords).toHaveBeenCalledTimes(3);
+    client.clear();
+  });
+
+  it('首次加载失败不自动重试，避免多次消耗限流额度', async () => {
+    mocks.dnsRecords.mockRejectedValue(new ApiError('Cloudflare 暂时没有响应，请稍后重试', { code: 'internal', httpStatus: 500 }));
+    // 与线上全局配置一致：5xx 默认重试 2 次
+    const client = mount(domain(), alice, (failureCount) => failureCount < 2);
+    expect(await screen.findByText('Cloudflare 暂时没有响应，请稍后重试')).toBeInTheDocument();
+    expect(mocks.dnsRecords).toHaveBeenCalledTimes(1);
     client.clear();
   });
 
@@ -351,6 +393,36 @@ describe('托管域名 DNS 解析', () => {
     fireEvent.click(dialog.getByRole('button', { name: '添加' }));
     expect(await dialog.findByText('已存在冲突的记录：同名下已有相同或不能共存的记录')).toBeInTheDocument();
     expect(screen.getByRole('dialog', { name: '添加解析记录' })).toBeInTheDocument();
+    client.clear();
+  });
+
+  it('保存被拒绝（域名刚被暂停）：刷新域名详情与解析列表', async () => {
+    mocks.createDnsRecord.mockRejectedValue(new ApiError('域名已被管理员暂停，解析只读', { code: 'forbidden', httpStatus: 403 }));
+    const client = mount();
+    await screen.findByRole('table', { name: '解析记录' });
+    mocks.get.mockResolvedValue(domain({ status: 'suspended' }));
+    const dialog = await openAddDialog();
+    type(dialog, /^名称/, 'blog');
+    type(dialog, /^IPv4 地址/, '203.0.113.40');
+    fireEvent.click(dialog.getByRole('button', { name: '添加' }));
+    await waitFor(() => expect(mocks.createDnsRecord).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+    expect(mocks.dnsRecords).toHaveBeenCalledTimes(2);
+    // 刷新后按暂停状态只读，弹窗随之关闭
+    expect(await screen.findByText('域名已被管理员暂停，解析只读。')).toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByRole('button', { name: '添加记录' })).toBeNull();
+    client.clear();
+  });
+
+  it('删除结果不确定（Cloudflare 无响应）：刷新解析列表', async () => {
+    mocks.deleteDnsRecord.mockRejectedValue(new ApiError('Cloudflare 暂时没有响应，请稍后重试', { code: 'internal', httpStatus: 500 }));
+    const client = mount();
+    fireEvent.click(await screen.findByRole('button', { name: '删除 A 记录 @' }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: '删除' }));
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Cloudflare 暂时没有响应，请稍后重试' })));
+    await waitFor(() => expect(mocks.dnsRecords).toHaveBeenCalledTimes(2));
+    expect(mocks.get).toHaveBeenCalledTimes(1);
     client.clear();
   });
 

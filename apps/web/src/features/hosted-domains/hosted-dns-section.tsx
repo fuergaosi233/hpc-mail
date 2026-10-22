@@ -3,7 +3,6 @@ import { ChevronDown, Lock, Pencil, Plus, Trash2 } from 'lucide-react';
 import { useLayoutEffect, useState } from 'react';
 import { type HostedDnsRecord, type HostedDomain, MAX_HOSTED_DNS_RECORDS } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
-import { queryKeys } from '@/api/query-keys';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -14,11 +13,13 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { toast } from '@/components/ui/toast';
 import { cn } from '@/lib/cn';
+import { formatDateTime } from '@/lib/format';
 import { useIsMobile } from '@/lib/use-media-query';
+import { useCurrentUser } from '@/lib/use-session';
 import { dnsRecordPriority, formatDnsTtl } from './hosted-dns-meta';
 import { HostedDnsRecordDialog } from './hosted-dns-record-dialog';
 import { hostedDomainApi } from './hosted-domains-api';
-import { removeDnsRecord, useHostedDnsRecordsQuery } from './use-hosted-domains';
+import { refreshAfterDnsWriteError, removeDnsRecord, useHostedDnsRecordsQuery } from './use-hosted-domains';
 
 interface RecordActions {
   onEdit: (record: HostedDnsRecord) => void;
@@ -237,14 +238,15 @@ function EmptyHints({ readOnly }: { readOnly: boolean }) {
 /** 所有者与管理员维护域名的常用解析；邮箱占用的记录只读 */
 export function HostedDnsSection({ domain }: { domain: HostedDomain }) {
   const queryClient = useQueryClient();
+  const currentUser = useCurrentUser();
   const mobile = useIsMobile();
   const records = useHostedDnsRecordsQuery(domain.id);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<HostedDnsRecord | null>(null);
   const [deleting, setDeleting] = useState<HostedDnsRecord | null>(null);
 
-  // 暂停的域名：所有者只读，管理员仍可修改
-  const readOnly = domain.status === 'suspended' && domain.role !== 'admin';
+  // 暂停的域名：所有者只读，管理员仍可修改；与服务端一致按当前用户角色判断（管理员自己的域名 role 为 owner）
+  const readOnly = domain.status === 'suspended' && currentUser.role !== 'admin';
   const list = records.data ?? [];
   const mailRecords = list.filter((record) => record.kind === 'mail');
   const otherRecords = list.filter((record) => record.kind !== 'mail');
@@ -259,11 +261,9 @@ export function HostedDnsSection({ domain }: { domain: HostedDomain }) {
     },
     onError: (error) => {
       toast({ title: error instanceof ApiError ? error.message : '删除失败，请重试', variant: 'error' });
-      // 记录已不存在：列表过期，重拉并关闭确认框
-      if (error instanceof ApiError && error.code === 'not_found') {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.hostedDomains.dnsRecords(domain.id) });
-        setDeleting(null);
-      }
+      refreshAfterDnsWriteError(queryClient, domain.id, error);
+      // 记录已不存在或已无权修改：重试没有意义，关闭确认框
+      if (error instanceof ApiError && (error.code === 'not_found' || error.code === 'forbidden')) setDeleting(null);
     },
   });
 
@@ -292,7 +292,7 @@ export function HostedDnsSection({ domain }: { domain: HostedDomain }) {
           <Button
             size="sm"
             variant="secondary"
-            disabled={!records.isSuccess || full}
+            disabled={!records.data || full}
             onClick={() => {
               setEditing(null);
               setDialogOpen(true);
@@ -305,9 +305,14 @@ export function HostedDnsSection({ domain }: { domain: HostedDomain }) {
       </div>
 
       {domain.status === 'pending' && (
-        <p className="rounded-md border border-accent/30 bg-accent-soft p-3 text-[13px] text-ink">
-          名称服务器生效前就可以添加解析：建议先把网站等原有记录补到这里，再修改名称服务器，切换时不中断。
-        </p>
+        <div className="flex flex-col gap-1 rounded-md border border-accent/30 bg-accent-soft p-3 text-[13px] text-ink">
+          <p>
+            名称服务器生效前就可以添加解析：建议先把网站等原有记录补到这里，再修改名称服务器，网站等记录切换时不中断（根域邮件由本站接管）。
+          </p>
+          <p>
+            请在{domain.expiresAt ? ` ${formatDateTime(domain.expiresAt)} ` : '截止时间'}前完成名称服务器修改，逾期未生效时域名会连同已添加的解析一起删除。
+          </p>
+        </div>
       )}
       {domain.status === 'suspended' &&
         (readOnly ? (
@@ -318,12 +323,22 @@ export function HostedDnsSection({ domain }: { domain: HostedDomain }) {
           <p className="text-xs text-ink-tertiary">域名已暂停：所有者只能查看解析，管理员仍可修改。</p>
         ))}
 
-      {records.isPending ? (
-        <Skeleton className="h-24 w-full rounded-md" />
-      ) : records.isError ? (
-        <QueryErrorState error={records.error} onRetry={() => void records.refetch()} />
-      ) : (
+      {/* 已有数据时后台刷新失败（如限流）只给轻提示，继续显示上次的列表 */}
+      {records.data ? (
         <>
+          {records.isError && (
+            <p role="alert" className="flex flex-wrap items-center gap-x-2 text-xs text-caution">
+              <span>刷新失败：{records.error instanceof Error ? records.error.message : '网络异常'}，下面是上次加载的结果。</span>
+              <button
+                type="button"
+                disabled={records.isFetching}
+                onClick={() => void records.refetch()}
+                className="rounded-sm font-medium text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus disabled:opacity-50"
+              >
+                重试
+              </button>
+            </p>
+          )}
           {otherRecords.length > 0 && (
             <RecordList records={otherRecords} label="解析记录" actions={actions} mobile={mobile} />
           )}
@@ -334,6 +349,10 @@ export function HostedDnsSection({ domain }: { domain: HostedDomain }) {
           </p>
           {mailRecords.length > 0 && <MailRecordsGroup records={mailRecords} mobile={mobile} />}
         </>
+      ) : records.isError ? (
+        <QueryErrorState error={records.error} onRetry={() => void records.refetch()} />
+      ) : (
+        <Skeleton className="h-24 w-full rounded-md" />
       )}
 
       {!readOnly && (
