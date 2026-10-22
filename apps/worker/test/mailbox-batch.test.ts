@@ -6,7 +6,7 @@ import {
 } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
-import { claudeAddressFacts, hostedDomains, mailboxes, messages, users } from '../src/db/schema.js';
+import { claudeAddressFacts, hostedDomainMembers, hostedDomains, mailboxes, messages, users } from '../src/db/schema.js';
 import { createApiKey } from '../src/services/api-key.js';
 import { planRandomDomains } from '../src/services/claim-plan.js';
 import type { AppError } from '../src/lib/errors.js';
@@ -575,6 +575,106 @@ describe('Claude 0 封号认领', () => {
     expect(await ownedBy(f.admin.id)).toEqual(result.claimed.map((box) => box.address));
   });
 
+  it.each(['private', 'dedicated', 'foreign-hosted', 'unconfigured'] as const)('无权域名 %s 的单项/批量可用性与认领不暴露封号事实', async (kind) => {
+    const f = await zeroFixture();
+    const domain = kind === 'foreign-hosted' || kind === 'unconfigured' ? `${f.prefix}-${kind}.test` : f.unsafe;
+    if (kind === 'private') await updateSettings(env, { domains: { list: [
+      { domain: f.safe, public: true, perUserLimit: 0 }, { domain, public: false, perUserLimit: 0 },
+    ] } });
+    if (kind === 'dedicated') await updateUser(env, f.admin.id, f.user.id, {
+      mailboxPolicy: { perUserLimit: 0, domains: [{ domain: f.safe, perUserLimit: 0 }] }, expectedMailboxPolicyRevision: 0,
+    });
+    if (kind === 'foreign-hosted') await db.insert(hostedDomains).values({ domain, userId: f.other.id, status: 'active' });
+    const item = { ...f.item('private-fact', domain), strategy: 'claude' as const };
+    const availability = { address: `${item.localPart}@${domain}`, available: false, reason: 'domain_unavailable' };
+    const error = kind === 'unconfigured'
+      ? { code: 'validation_failed', message: '域名不在系统域名列表内' }
+      : { code: 'forbidden', message: '当前用户无权认领该域名' };
+    // 添加封号前后，两个只读和两个写接口的可观察响应完全相同。
+    for (const hasFact of [false, true]) {
+      if (hasFact) await suspend(domain);
+      expect(await data<MailboxAvailability>(await request(`/mailboxes/availability?${new URLSearchParams(item)}`, f.user.jwt))).toEqual(availability);
+      expect(await data<MailboxAvailability[]>(await request('/mailboxes/availability/batch', f.user.jwt, 'POST', { items: [item] }))).toEqual([availability]);
+      const rejected = await request('/mailboxes', f.user.jwt, 'POST', item);
+      expect(rejected.status).toBe(kind === 'unconfigured' ? 400 : 403);
+      expect(await rejected.json()).toMatchObject({ error });
+      expect(await data<BatchClaimMailboxResult>(await request('/mailboxes/batch', f.user.jwt, 'POST', { items: [item] })))
+        .toEqual({ claimed: [], taken: [], notAttempted: [item], stoppedBy: error });
+    }
+    const key = await createApiKey(env, f.user.id, { name: 'privacy', scopes: ['mailbox.read', 'mailbox.write'], rateLimit: 120, allowedIps: [] });
+    for (const method of ['GET', 'POST']) {
+      const ctx = createExecutionContext();
+      const response = await app.request(method === 'GET' ? `/v1/mailboxes/availability?${new URLSearchParams(item)}` : '/v1/mailboxes', {
+        method, headers: { Authorization: `Bearer ${key.key}`, 'Content-Type': 'application/json' },
+        ...(method === 'POST' ? { body: JSON.stringify(item) } : {}),
+      }, env, ctx);
+      await waitOnExecutionContext(ctx);
+      if (method === 'GET') expect(await data<MailboxAvailability>(response)).toEqual(availability);
+      else {
+        expect(response.status).toBe(kind === 'unconfigured' ? 400 : 403);
+        expect(await response.json()).toMatchObject({ error });
+      }
+    }
+    expect(await ownedBy(f.user.id)).toEqual([]);
+  });
+
+  it.each(['system', 'dedicated', 'hosted'] as const)('撤权同时新增封号（%s）时单项/批量只报告权限变化', async (kind) => {
+    for (const batch of [false, true]) {
+      const f = await zeroFixture();
+      const domain = kind === 'hosted' ? `${f.prefix}-revoked.test` : f.unsafe;
+      let revoke: () => Promise<unknown>;
+      if (kind === 'hosted') {
+        const hosted = await db.insert(hostedDomains).values({ domain, userId: f.other.id, status: 'active' }).returning().get();
+        await db.insert(hostedDomainMembers).values({ domainId: hosted!.id, userId: f.user.id, grantedBy: f.other.id });
+        revoke = () => db.delete(hostedDomainMembers).where(eq(hostedDomainMembers.domainId, hosted!.id));
+      } else if (kind === 'dedicated') {
+        revoke = () => updateUser(env, f.admin.id, f.user.id, {
+          mailboxPolicy: { perUserLimit: 0, domains: [{ domain: f.safe, perUserLimit: 0 }] }, expectedMailboxPolicyRevision: 0,
+        });
+      } else {
+        revoke = () => updateSettings(env, { domains: { list: [
+          { domain: f.safe, public: true, perUserLimit: 0 }, { domain, public: false, perUserLimit: 0 },
+        ] } });
+      }
+      const item = { ...f.item('revoked-race', domain), strategy: 'claude' as const };
+      let injected = false;
+      const change = async () => { if (!injected) { injected = true; await revoke(); await suspend(domain); } };
+      const racing = batch
+        ? counting(undefined, async (sqls) => { if (sqls.some((sql) => sql.includes('INSERT INTO mailboxes'))) await change(); })
+        : counting(async (sql) => { if (sql.includes('INSERT INTO mailboxes')) await change(); });
+      if (batch) {
+        const result = await claimMailboxes(racing.env, f.user.id, 'user', [item]);
+        expect(result).toMatchObject({ claimed: [], notAttempted: [item], stoppedBy: { code: 'conflict' } });
+        expect(result.stoppedBy!.message).not.toContain('Claude');
+      } else {
+        await expect(claimMailbox(racing.env, f.user.id, 'user', item)).rejects.toMatchObject({ code: 'conflict', message: expect.not.stringContaining('Claude') });
+      }
+      expect(injected).toBe(true);
+      expect(racing.trips()).toBe(3); // 读取、写入与错误复核；托管权限仍并入复核 batch
+      expect(await ownedBy(f.user.id)).toEqual([]);
+    }
+  });
+
+  it('已占用地址在批量复核时也不能泄露已撤销托管成员权限后的封号事实', async () => {
+    const f = await zeroFixture();
+    const domain = `${f.prefix}-taken-hosted.test`;
+    const hosted = await db.insert(hostedDomains).values({ domain, userId: f.other.id, status: 'active' }).returning().get();
+    await db.insert(hostedDomainMembers).values({ domainId: hosted!.id, userId: f.user.id, grantedBy: f.other.id });
+    const item = { ...f.item('taken-revoked', domain), strategy: 'claude' as const };
+    await f.own(f.other.id, item);
+    let injected = false;
+    const racing = counting(undefined, async (sqls) => {
+      if (!injected && sqls.some((sql) => sql.includes('INSERT INTO mailboxes'))) {
+        injected = true;
+        await db.delete(hostedDomainMembers).where(eq(hostedDomainMembers.domainId, hosted!.id));
+        await suspend(domain);
+      }
+    });
+    expect(await claimMailboxes(racing.env, f.user.id, 'user', [item]))
+      .toMatchObject({ claimed: [], taken: [], notAttempted: [item], stoppedBy: { code: 'conflict', message: expect.not.stringContaining('Claude') } });
+    expect(injected).toBe(true);
+  });
+
   it('Claude 策略读取仍只需一个 batch，写入保持两次往返', async () => {
     const f = await zeroFixture();
     const items = [f.item('one', f.safe), f.item('two', f.safe)].map((item) => ({ ...item, strategy: 'claude' as const }));
@@ -587,6 +687,44 @@ describe('Claude 0 封号认领', () => {
     const batch = counting();
     expect((await claimMailboxes(batch.env, f.user.id, 'user', items)).claimed).toHaveLength(1);
     expect(batch.trips()).toBe(2);
+    expect(batch.queries()).toBe(7); // 5 条上下文读取 + 事务 2 条，无额外封号快照
+  });
+
+  it('批量封号事实按去重域名物化，EXPLAIN 不随同域地址数量重复读取事实', async () => {
+    const f = await zeroFixture();
+    const captures: { sql: string; params: unknown[] }[] = [];
+    const runtime = { ...env, db: new Proxy(env.db, { get(target, property) {
+      if (property === 'prepare') return (sql: string) => {
+        const statement = target.prepare(sql);
+        return new Proxy(statement, { get(value, key) {
+          if (key === 'bind') return (...params: unknown[]) => { captures.push({ sql, params }); return value.bind(...params); };
+          const member = Reflect.get(value, key);
+          return typeof member === 'function' ? member.bind(value) : member;
+        } });
+      };
+      const member = Reflect.get(target, property);
+      return typeof member === 'function' ? member.bind(target) : member;
+    } }) } as Env;
+    await claimMailboxes(runtime, f.user.id, 'user', [{ ...f.item('explain', f.safe), strategy: 'claude' }]);
+    const captured = captures.find(({ sql }) => sql.startsWith('WITH') && !sql.includes('INSERT INTO mailboxes'))!;
+    const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${captured.sql}`).bind(...captured.params).all<{ detail: string }>();
+    const details = plan.results.map(({ detail }) => detail).join('\n');
+    expect(details).toContain('MATERIALIZE claude_domains');
+    expect(details).toContain('MATERIALIZE blocked_domains');
+    expect(details).toContain('idx_claude_facts_domain');
+    // 只重放物化的事实查询，不执行认领；放入数百条无封号事实比较 1/100 地址的读取量。
+    await env.db.prepare(`INSERT INTO claude_address_facts (address, domain, first_seen_at)
+      SELECT 'normal' || key || '@' || ?1, ?1, 0 FROM json_each(?2)`)
+      .bind(f.safe, JSON.stringify(Array.from({ length: 200 }, (_, n) => n))).run();
+    const input = (JSON.parse(captured.params[0] as string) as Record<string, unknown>[])[0]!;
+    const factsSql = `${captured.sql.slice(0, captured.sql.indexOf('  numbered AS (')).trimEnd().replace(/,$/, '')}
+      SELECT domain FROM blocked_domains`;
+    const readFacts = (count: number) => env.db.prepare(factsSql).bind(JSON.stringify(Array.from({ length: count }, () => input)), f.user.id).all();
+    const one = await readFacts(1);
+    const many = await readFacts(100);
+    expect(one.results).toEqual([]);
+    expect(many.results).toEqual([]);
+    expect(many.meta.rows_read).toBeLessThanOrEqual(one.meta.rows_read + 1000);
   });
 });
 

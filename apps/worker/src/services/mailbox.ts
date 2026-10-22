@@ -138,7 +138,7 @@ const CLAUDE_SUSPENDED_MESSAGE = '该域名有 Claude 封号记录，不能在 C
 
 /**
  * 认领规则唯一来源：认领、批量认领、可用性检查与过户共用，避免几处判定漂移。
- * 顺序：Claude 封号（显式选择时）→ 域名可用 → 保留前缀 → 全局上限 → 按域名上限。
+ * 顺序：域名存在与授权 → 保留前缀 → 全局上限 → 按域名上限 → Claude 封号（显式选择时）。
  * 管理员同样受 Claude 策略约束；纯函数，所需数据由调用方一次读齐。
  */
 function evaluateClaimPolicy(
@@ -150,9 +150,11 @@ function evaluateClaimPolicy(
   hosted?: HostedClaimAccess,
   claudeSuspended = false,
 ): ClaimPolicy {
-  const allow = (perUserLimit = 0, perDomainLimit = 0): ClaimPolicy => ({ perUserLimit, perDomainLimit, hosted: !!hosted, blocked: null });
   const block = (reason: MailboxUnavailableReason, error: AppError): ClaimPolicy => ({ perUserLimit: 0, perDomainLimit: 0, hosted: !!hosted, blocked: { reason, error } });
-  if (claudeSuspended) return block('claude_suspended', new AppError('forbidden', CLAUDE_SUSPENDED_MESSAGE));
+  // 所有放行分支（含管理员与托管域所有者）统一检查封号，但不能向无权认领的用户泄露域名事实。
+  const allow = (perUserLimit = 0, perDomainLimit = 0): ClaimPolicy => claudeSuspended
+    ? block('claude_suspended', new AppError('forbidden', CLAUDE_SUSPENDED_MESSAGE))
+    : { perUserLimit, perDomainLimit, hosted: !!hosted, blocked: null };
   if (hosted) {
     // 托管域名：所有者与管理员不受限；成员受保留前缀与成员上限约束；其他人不可见
     if (!(HOSTED_DOMAIN_USABLE_STATUSES as readonly string[]).includes(hosted.status)) {
@@ -214,10 +216,10 @@ const claimSettingsFrom = (result: D1Result | undefined): ClaimSettings =>
   mergeSettingRows((result?.results ?? []) as { key: string; value: string }[]);
 
 /** 规则所需的全部读取合成一个 D1 batch：认领设置（强一致直读）、用户权限、已认领数、地址占用。 */
-async function loadClaimContext(env: Env, actor: { userId: number; role: Role }, items: ClaimMailboxRequest[]): Promise<ClaimContext> {
+async function loadClaimContext(env: Env, actor: { userId: number; role: Role }, items: ClaimMailboxRequest[], loadSuspensions = true): Promise<ClaimContext> {
   const unique = [...new Set(items.map(addressOf))];
   const domains = [...new Set(items.map((item) => item.domain))];
-  const claudeDomains = [...new Set(items.filter((item) => item.strategy === 'claude').map((item) => item.domain))];
+  const claudeDomains = loadSuspensions ? [...new Set(items.filter((item) => item.strategy === 'claude').map((item) => item.domain))] : [];
   const [settingsResult, userResult, ownedResult, takenResult, hostedResult, suspendedResult] = await env.db.batch([
     claimSettingsStatement(env.db),
     mailboxPolicyUserStatement(env.db, actor.userId),
@@ -334,24 +336,32 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
   }
 }
 
-/** INSERT 守卫未通过：一次读回当前域名修订与用户权限，区分是配置变化还是并发用尽了配额 */
+/** INSERT 守卫未通过：合批读回域名、用户与封号事实，先复核当前授权再报告封号。 */
 async function claimGuardError(env: Env, context: ClaimContext, req: ClaimMailboxRequest, hosted = false): Promise<AppError> {
-  if (hosted && req.strategy !== 'claude') return new AppError('conflict', '域名状态、权限或成员上限已改变，请刷新后重试');
-  const [settingsResult, userResult, suspendedResult] = await env.db.batch([
+  const hostedConflict = () => new AppError('conflict', '域名状态、权限或成员上限已改变，请刷新后重试');
+  if (hosted && req.strategy !== 'claude') return hostedConflict();
+  const [settingsResult, userResult, suspendedResult, hostedResult] = await env.db.batch([
     claimSettingsStatement(env.db),
     mailboxPolicyUserStatement(env.db, context.userId),
     ...(req.strategy === 'claude' ? [env.db.prepare('SELECT 1 FROM claude_address_facts WHERE domain = ? AND suspended > 0 LIMIT 1').bind(req.domain)] : []),
+    ...(hosted ? [hostedAccessStatement(env.db, context.userId, [req.domain])] : []),
   ]);
-  if (suspendedResult?.results.length) return new AppError('forbidden', CLAUDE_SUSPENDED_MESSAGE);
-  if (hosted) return new AppError('conflict', '域名状态、权限或成员上限已改变，请刷新后重试');
   const current = claimSettingsFrom(settingsResult);
-  if ((current.domains.revision ?? 0) !== (context.settings.domains.revision ?? 0)) {
+  if (!hosted && (current.domains.revision ?? 0) !== (context.settings.domains.revision ?? 0)) {
     return new AppError('conflict', '域名配置已改变，请刷新后重试');
   }
   const currentUser = mailboxPolicyUserFromResult(userResult);
-  if (currentUser.mailboxPolicyRevision !== context.user.mailboxPolicyRevision || currentUser.role !== context.user.role) {
+  if ((!hosted && currentUser.mailboxPolicyRevision !== context.user.mailboxPolicyRevision) || currentUser.role !== context.user.role) {
     return new AppError('conflict', '邮箱权限已改变，请刷新后重试');
   }
+  if (hosted) {
+    const access = hostedAccessFromResult(hostedResult).get(req.domain);
+    if (!access || evaluateClaimPolicy(current, currentUser, { total: 0, byDomain: new Map() }, req.localPart, req.domain, access).blocked) {
+      return hostedConflict();
+    }
+  }
+  if (suspendedResult?.results.length) return new AppError('forbidden', CLAUDE_SUSPENDED_MESSAGE);
+  if (hosted) return hostedConflict();
   return new AppError('forbidden', '认领配额已在并发请求中用尽，请刷新后重试');
 }
 
@@ -395,6 +405,14 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
       json_extract(value, '$.message') AS policy_message
     FROM json_each(?1)
   ),
+  claude_domains AS MATERIALIZED (
+    SELECT DISTINCT domain FROM input WHERE strategy = 'claude'
+  ),
+  blocked_domains AS MATERIALIZED (
+    SELECT domain FROM claude_domains WHERE EXISTS (
+      SELECT 1 FROM claude_address_facts f WHERE f.domain = claude_domains.domain AND f.suspended > 0
+    )
+  ),
   numbered AS (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY address ORDER BY position) AS occurrence,
       EXISTS (SELECT 1 FROM mailboxes WHERE mailboxes.address = input.address) AS existing
@@ -410,12 +428,10 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
   ),
   checked AS (
     SELECT *, CASE
-      WHEN strategy = 'claude' AND EXISTS (SELECT 1 FROM claude_address_facts f WHERE f.domain = counted.domain AND f.suspended > 0)
-        THEN 'claude_suspended'
       WHEN policy_code IS NOT NULL THEN policy_code
       WHEN user_limit > 0 AND ?3 + added >= user_limit THEN 'quota'
       WHEN domain_limit > 0 AND owned_domain + domain_added >= domain_limit THEN 'domain_limit'
-      WHEN was_taken = 0 AND (existing OR occurrence = 1) AND (
+      WHEN (strategy = 'claude' OR (was_taken = 0 AND (existing OR occurrence = 1))) AND (
         (user_limit > 0 AND (SELECT n FROM live_total) + added >= user_limit)
         OR (domain_limit > 0 AND COALESCE((SELECT n FROM live_owned WHERE domain = counted.domain), 0) + domain_added >= domain_limit)
         OR (hosted = 0 AND COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) != ?4)
@@ -429,6 +445,7 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
           AND (?5 = 'admin' OR h.user_id = ?2
             OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?2))))
       ) THEN 'guard'
+      WHEN strategy = 'claude' AND domain IN (SELECT domain FROM blocked_domains) THEN 'claude_suspended'
       ELSE NULL END AS blocked
     FROM counted
   ),
@@ -486,7 +503,8 @@ export async function claimMailboxes(
   let index = 0;
   let started = false;
   try {
-    const context = await loadClaimContext(env, { userId, role }, items);
+    // 批量在每块事务内读取最新封号事实，无需在上下文中预读不会使用的快照。
+    const context = await loadClaimContext(env, { userId, role }, items, false);
     started = true;
     while (index < items.length) {
       const chunk = items.slice(index, index + CLAIM_CHUNK_SIZE);

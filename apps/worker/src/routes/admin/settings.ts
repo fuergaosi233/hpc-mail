@@ -50,7 +50,7 @@ app.get('/domain-status', async (c) => {
   return ok(c, status);
 });
 
-/** 每个系统域名的 Claude 账号/封号统计与 Claude 低风险模式的排除原因（根据历史官方来信判定） */
+/** 每个系统域名的 Claude 账号/封号统计与 Claude 0 封号模式的排除原因（根据历史官方来信判定） */
 app.get('/domain-claude-stats', async (c) => ok(c, await getDomainClaudeStats(c.env)));
 
 const AI_MODEL_TEST_SAMPLE = 'Your verification code is 123456. It expires in 10 minutes.';
