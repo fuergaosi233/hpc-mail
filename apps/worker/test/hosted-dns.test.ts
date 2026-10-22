@@ -236,6 +236,30 @@ describe('托管域名 DNS 列表', () => {
     ]);
     expect(cf.writes()).toEqual([]);
   });
+
+  it('tag 或 flags 超出表单范围的 CAA 记录只读，不能修改或删除', async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture(cf);
+    const owner = await f.actor('owner');
+    const site = await f.hosted(owner);
+    const caa = (flags: number, tag: string, value: string) =>
+      record({ type: 'CAA', name: site.domain, content: `${flags} ${tag} "${value}"`, data: { flags, tag, value } });
+    const [mailTag, oddFlags, wild, critical] = cf.add(site.zoneId,
+      caa(0, 'issuemail', 'letsencrypt.org'), caa(1, 'issue', 'letsencrypt.org'), caa(0, 'issuewild', 'pki.goog'), caa(128, 'iodef', 'mailto:ca@example.net'));
+    const byId = new Map((await data<HostedDnsRecord[]>(await call('GET', `/hosted-domains/${site.id}/dns-records`, owner.jwt)))
+      .map((item) => [item.id, item]));
+    for (const locked of [mailTag!, oddFlags!]) {
+      expect(byId.get(locked.id)).toMatchObject({ kind: 'readonly', lockedReason: '本站暂不支持编辑该 CAA 记录' });
+    }
+    expect(byId.get(wild!.id)).toMatchObject({ kind: 'user', lockedReason: '' });
+    expect(byId.get(critical!.id)).toMatchObject({ kind: 'user', caa: { flags: 128, tag: 'iodef', value: 'mailto:ca@example.net' } });
+
+    const path = `/hosted-domains/${site.id}/dns-records/${mailTag!.id}`;
+    const input = { type: 'CAA', name: '@', ttl: 1, caa: { flags: 0, tag: 'issue', value: 'letsencrypt.org' } };
+    expect((await errorOf(await call('PUT', path, owner.jwt, input), 403)).message).toBe('本站暂不支持编辑该 CAA 记录');
+    expect((await errorOf(await call('DELETE', path, owner.jwt), 403)).message).toBe('本站暂不支持编辑该 CAA 记录');
+    expect(cf.writes()).toEqual([]);
+  });
 });
 
 describe('新增与冲突', () => {

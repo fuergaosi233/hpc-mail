@@ -1,5 +1,5 @@
 import {
-  HOSTED_DNS_RECORD_TYPES, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE, hostedDnsConflictReason, hostedDnsFqdn,
+  HOSTED_DNS_CAA_TAGS, HOSTED_DNS_RECORD_TYPES, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE, hostedDnsConflictReason, hostedDnsFqdn,
   hostedDnsMailReason, hostedDnsRelativeName, type HostedDnsCaaData, type HostedDnsRecord, type HostedDnsRecordKind,
   type HostedDnsRecordParsed,
 } from '@hpc-mail/shared';
@@ -24,6 +24,8 @@ type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
 export const HOSTED_DNS_RATE_SCOPE = 'hosted_dns';
 const AUDIT_VALUE_MAX = 80;
 const SUPPORTED = new Set<string>(HOSTED_DNS_RECORD_TYPES);
+const CAA_TAGS = new Set<string>(HOSTED_DNS_CAA_TAGS);
+const CAA_FLAGS = new Set([0, 128]);
 
 interface DnsZone {
   creds: CloudflareCredentials;
@@ -79,6 +81,10 @@ function classify(record: CfDnsRecord, fqdn: string, domain: string): { kind: Ho
   if (mail) return { kind: 'mail', lockedReason: mail };
   if (record.meta?.read_only || record.meta?.email_routing) return { kind: 'mail', lockedReason: '由 Cloudflare 邮件服务自动维护' };
   if (!SUPPORTED.has(type)) return { kind: 'readonly', lockedReason: `本站暂不支持编辑 ${type} 记录` };
+  // 表单只支持这几种 tag 与 flags，其他 CAA 记录无法回填编辑
+  if (type === 'CAA' && !(CAA_TAGS.has(String(record.data?.tag)) && CAA_FLAGS.has(Number(record.data?.flags)))) {
+    return { kind: 'readonly', lockedReason: '本站暂不支持编辑该 CAA 记录' };
+  }
   if (record.proxied) return { kind: 'readonly', lockedReason: '已开启 Cloudflare 代理，请联系管理员修改' };
   return { kind: 'user', lockedReason: '' };
 }
