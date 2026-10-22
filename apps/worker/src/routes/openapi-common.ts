@@ -197,7 +197,7 @@ export const schemas: Record<string, Schema> = {
     proxied: { ...bool, description: 'Cloudflare proxy. This site never enables it; proxied records are readonly.' },
     comment: str,
     kind: { type: 'string', enum: ['user', 'mail', 'readonly'],
-      description: 'user: editable here. mail: used by receiving or sending (root MX and SPF, _dmarc, DKIM under _domainkey, cf-bounce, or marked email_routing by Cloudflare); never editable. readonly: a type this site does not edit, a CAA record outside the editable flags/tags, a record that would conflict with mail such as a root CNAME, a proxied record, or one maintained by another Cloudflare service (marked read_only only).' },
+      description: 'user: editable here; an existing record that conflicts with mail, such as a root CNAME created in the Cloudflare dashboard, is still user so it can be deleted, while saving it returns 400 with the conflict reason. mail: used by receiving or sending (root MX and SPF, _dmarc, DKIM under _domainkey, cf-bounce, or marked email_routing by Cloudflare); never editable. readonly: a type this site does not edit, a CAA record outside the editable flags/tags, a proxied record, or one maintained by another Cloudflare service (marked read_only only).' },
     lockedReason: { ...str, description: 'Why a mail or readonly record cannot be changed; empty for user records.' },
     modifiedAt: nullable(date),
   }),
