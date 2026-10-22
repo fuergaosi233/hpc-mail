@@ -115,9 +115,7 @@ function classify(record: CfDnsRecord, fqdn: string, domain: string): { kind: Ho
   // 只有 read_only 的记录来自 Worker 自定义域名等其他服务
   if (record.meta?.read_only) return { kind: 'readonly', lockedReason: '由 Cloudflare 其他服务自动维护' };
   if (!SUPPORTED.has(type)) return { kind: 'readonly', lockedReason: `本站暂不支持编辑 ${type} 记录` };
-  // 在控制台建的根域 CNAME 等：本站保存时会被冲突校验拒绝，只读展示
-  const conflict = hostedDnsConflictReason({ type, fqdn, content: record.content ?? '' }, domain);
-  if (conflict) return { kind: 'readonly', lockedReason: conflict };
+  // 控制台建的根域 CNAME 等冲突记录仍为 user：可以删除，修改保存时由 checkInput 给出冲突原因
   // 表单只支持这几种 tag 与 flags，其他 CAA 记录无法回填编辑
   if (type === 'CAA' && !(CAA_TAGS.has(String(record.data?.tag)) && CAA_FLAGS.has(Number(record.data?.flags)))) {
     return { kind: 'readonly', lockedReason: '本站暂不支持编辑该 CAA 记录' };

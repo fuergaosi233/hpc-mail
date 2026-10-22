@@ -281,24 +281,26 @@ describe('托管域名 DNS 列表', () => {
     expect(cf.writes()).toEqual([]);
   });
 
-  it('只带 email_routing 的记录判为 mail；控制台建的根域 CNAME 只读，原因与保存时的冲突校验一致', async () => {
+  it('只带 email_routing 的记录判为 mail；控制台建的根域 CNAME 仍可删除，修改保存时返回冲突原因', async () => {
     const cf = fakeCloudflare();
     const f = await fixture(cf);
     const owner = await f.actor('owner');
     const site = await f.hosted(owner);
-    const [routing, apex, sub] = cf.add(site.zoneId,
+    const path = `/hosted-domains/${site.id}/dns-records`;
+    const [routing, apex] = cf.add(site.zoneId,
       record({ type: 'TXT', name: `_mail-check.${site.domain}`, content: 'x', meta: { email_routing: true } }),
       record({ type: 'CNAME', name: site.domain, content: 'cname.vercel-dns.com' }),
-      record({ type: 'CNAME', name: `blog.${site.domain}`, content: 'cname.vercel-dns.com' }),
     );
-    const byId = new Map((await data<HostedDnsRecord[]>(await call('GET', `/hosted-domains/${site.id}/dns-records`, owner.jwt)))
-      .map((item) => [item.id, item]));
+    const byId = new Map((await data<HostedDnsRecord[]>(await call('GET', path, owner.jwt))).map((item) => [item.id, item]));
     expect(byId.get(routing!.id)).toMatchObject({ kind: 'mail', lockedReason: '由 Cloudflare 邮件服务自动维护' });
+    expect(byId.get(apex!.id)).toMatchObject({ kind: 'user', lockedReason: '' });
     const apexReason = '根域已有收件所需的 MX、TXT 记录，不能设置 CNAME，请改用 A 或 AAAA 记录';
-    expect(byId.get(apex!.id)).toMatchObject({ kind: 'readonly', lockedReason: apexReason });
-    expect(byId.get(sub!.id)).toMatchObject({ kind: 'user', lockedReason: '' });
-    expect((await errorOf(await call('DELETE', `/hosted-domains/${site.id}/dns-records/${apex!.id}`, owner.jwt), 403)).message).toBe(apexReason);
+    const error = await errorOf(await call('PUT', `${path}/${apex!.id}`, owner.jwt, { type: 'CNAME', name: '@', ttl: 300, content: 'other.vercel-dns.com' }), 400);
+    expect(error).toEqual({ code: 'validation_failed', message: expect.stringContaining(apexReason) });
     expect(cf.writes()).toEqual([]);
+    expect(await data(await call('DELETE', `${path}/${apex!.id}`, owner.jwt))).toEqual({ success: true });
+    expect(cf.zones.get(site.zoneId)!.records.has(apex!.id)).toBe(false);
+    expect(await audits(site.domain)).toEqual(['删除 CNAME @ → cname.vercel-dns.com']);
   });
 });
 
@@ -621,6 +623,9 @@ describe('上限与限流', () => {
     await data(await call('GET', records(site.id), admin.jwt));
     await data(await call('POST', records(suspended.id), admin.jwt, input), 201);
     expect(await siteCalls()).toBe(MAX_HOSTED_DNS_REQUESTS_PER_MINUTE + 3);
+    // 暂停时所有者仍能列出记录，照常计入
+    await data(await call('GET', records(suspended.id), owner.jwt));
+    expect(await siteCalls()).toBe(MAX_HOSTED_DNS_REQUESTS_PER_MINUTE + 4);
   }, 30_000);
 });
 

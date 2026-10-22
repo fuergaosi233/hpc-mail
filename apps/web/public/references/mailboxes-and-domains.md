@@ -140,9 +140,9 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 
 `kind` 决定能否修改，不能修改时 `lockedReason` 给出原因：
 
-- `user`：可在本站修改、删除。
+- `user`：可在本站修改、删除。在 Cloudflare 控制台建的根域 CNAME 等与邮箱冲突的现存记录也属于此类：可以删除，修改保存时返回 400 并说明冲突原因。
 - `mail`：邮箱收发占用，只读。包括根域 MX 与 SPF、`_dmarc`、`_domainkey` 下的 DKIM、`cf-bounce` 子域，以及 Cloudflare 邮件服务自动维护的记录。
-- `readonly`：本站不编辑的类型（如 NS）、不在支持范围内的 CAA（`flags` 不是 0/128 或 `tag` 不是 `issue|issuewild|iodef`）、在 Cloudflare 控制台建的根域 CNAME 等与邮箱冲突的记录、已开启 Cloudflare 代理的记录，以及 Cloudflare 其他服务（如 Worker 自定义域名）自动维护的记录，只读。
+- `readonly`：本站不编辑的类型（如 NS）、不在支持范围内的 CAA（`flags` 不是 0/128 或 `tag` 不是 `issue|issuewild|iodef`）、已开启 Cloudflare 代理的记录，以及 Cloudflare 其他服务（如 Worker 自定义域名）自动维护的记录，只读。
 
 请求体按 `type` 区分，新增与修改相同：
 
