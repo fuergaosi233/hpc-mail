@@ -10,3 +10,4 @@ export * from './schemas/admin-settings.js';
 export * from './schemas/notify-prefs.js';
 export * from './schemas/audit.js';
 export * from './schemas/hosted-domain.js';
+export * from './schemas/hosted-dns.js';
