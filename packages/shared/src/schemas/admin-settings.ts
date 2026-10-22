@@ -64,7 +64,7 @@ export const securitySettingSchema = z.object({
  * 单个系统域名条目。
  * - `public`：是否对普通用户开放（可见 + 可认领）。默认 false = 仅管理员可用。
  * - `perUserLimit`：普通用户在**该域名**下最多可认领的地址数（0=不限，仅受全局 mailbox_policy.perUserLimit 约束）；管理员豁免。
- * - `random`：是否参与认领弹窗的随机后缀（均匀随机与 Claude 低风险两种模式）。缺省视为参与；false 时只能手动选择。
+ * - `random`：是否参与认领弹窗的随机后缀（均匀随机与 Claude 0 封号两种模式）。缺省视为参与；false 时只能手动选择。
  * preprocess：兼容历史存储的纯字符串形态（`"example.com"` → `{ domain: "example.com" }`），
  * 老数据升级后自动落到 public=false（默认仅管理员），不影响存量已认领地址。
  */

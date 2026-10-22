@@ -1,6 +1,6 @@
 import {
   HOSTED_DOMAIN_USABLE_STATUSES,
-  type BatchClaimMailboxResult, type ClaimMailboxRequest, type HostedDomainStatus, type Mailbox, type MailboxAvailability,
+  type BatchClaimMailboxResult, type ClaimMailboxRequest, type ClaimPlanStrategy, type HostedDomainStatus, type Mailbox, type MailboxAvailability,
   type MailboxTransferResult, type MailboxUnavailableReason, type Role, type TransferMailboxRequest,
 } from '@hpc-mail/shared';
 import { and, desc, eq, sql } from 'drizzle-orm';
@@ -134,10 +134,12 @@ const HOSTED_CLAIM_GUARD_SQL = `EXISTS (SELECT 1 FROM hosted_domains h WHERE h.d
   AND h.status IN (${HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ')})
   AND (? = 'admin' OR h.user_id = ? OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?)))`;
 
+const CLAUDE_SUSPENDED_MESSAGE = '该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领';
+
 /**
  * 认领规则唯一来源：认领、批量认领、可用性检查与过户共用，避免几处判定漂移。
- * 顺序：域名可用 → 保留前缀 → 全局上限 → 按域名上限（管理员只受域名存在性约束）。
- * 纯函数：所需数据由调用方一次读齐。
+ * 顺序：Claude 封号（显式选择时）→ 域名可用 → 保留前缀 → 全局上限 → 按域名上限。
+ * 管理员同样受 Claude 策略约束；纯函数，所需数据由调用方一次读齐。
  */
 function evaluateClaimPolicy(
   settings: ClaimSettings,
@@ -146,9 +148,11 @@ function evaluateClaimPolicy(
   localPart: string,
   domain: string,
   hosted?: HostedClaimAccess,
+  claudeSuspended = false,
 ): ClaimPolicy {
   const allow = (perUserLimit = 0, perDomainLimit = 0): ClaimPolicy => ({ perUserLimit, perDomainLimit, hosted: !!hosted, blocked: null });
   const block = (reason: MailboxUnavailableReason, error: AppError): ClaimPolicy => ({ perUserLimit: 0, perDomainLimit: 0, hosted: !!hosted, blocked: { reason, error } });
+  if (claudeSuspended) return block('claude_suspended', new AppError('forbidden', CLAUDE_SUSPENDED_MESSAGE));
   if (hosted) {
     // 托管域名：所有者与管理员不受限；成员受保留前缀与成员上限约束；其他人不可见
     if (!(HOSTED_DOMAIN_USABLE_STATUSES as readonly string[]).includes(hosted.status)) {
@@ -199,6 +203,8 @@ interface ClaimContext {
   taken: Set<string>;
   /** 本次涉及的托管域名及当前用户的权限 */
   hosted: Map<string, HostedClaimAccess>;
+  /** 本次 Claude 策略涉及的域名中，存在任意历史封号事实的域名 */
+  claudeSuspended: Set<string>;
 }
 
 const addressOf = (req: ClaimMailboxRequest) => `${req.localPart}@${req.domain}`;
@@ -208,15 +214,18 @@ const claimSettingsFrom = (result: D1Result | undefined): ClaimSettings =>
   mergeSettingRows((result?.results ?? []) as { key: string; value: string }[]);
 
 /** 规则所需的全部读取合成一个 D1 batch：认领设置（强一致直读）、用户权限、已认领数、地址占用。 */
-async function loadClaimContext(env: Env, actor: { userId: number; role: Role }, addresses: string[]): Promise<ClaimContext> {
-  const unique = [...new Set(addresses)];
-  const domains = [...new Set(unique.map((address) => address.slice(address.lastIndexOf('@') + 1)))];
-  const [settingsResult, userResult, ownedResult, takenResult, hostedResult] = await env.db.batch([
+async function loadClaimContext(env: Env, actor: { userId: number; role: Role }, items: ClaimMailboxRequest[]): Promise<ClaimContext> {
+  const unique = [...new Set(items.map(addressOf))];
+  const domains = [...new Set(items.map((item) => item.domain))];
+  const claudeDomains = [...new Set(items.filter((item) => item.strategy === 'claude').map((item) => item.domain))];
+  const [settingsResult, userResult, ownedResult, takenResult, hostedResult, suspendedResult] = await env.db.batch([
     claimSettingsStatement(env.db),
     mailboxPolicyUserStatement(env.db, actor.userId),
     ownedCountsStatement(env.db, actor.userId),
     env.db.prepare('SELECT address FROM mailboxes WHERE address IN (SELECT value FROM json_each(?))').bind(JSON.stringify(unique)),
     hostedAccessStatement(env.db, actor.userId, domains),
+    ...(claudeDomains.length ? [env.db.prepare(`SELECT DISTINCT domain FROM claude_address_facts
+      WHERE domain IN (SELECT value FROM json_each(?)) AND suspended > 0`).bind(JSON.stringify(claudeDomains))] : []),
   ]);
   return {
     userId: actor.userId,
@@ -225,6 +234,7 @@ async function loadClaimContext(env: Env, actor: { userId: number; role: Role },
     owned: ownedCountsFromResult(ownedResult),
     taken: new Set(((takenResult?.results ?? []) as { address: string }[]).map((row) => row.address)),
     hosted: hostedAccessFromResult(hostedResult),
+    claudeSuspended: new Set(((suspendedResult?.results ?? []) as { domain: string }[]).map((row) => row.domain)),
   };
 }
 
@@ -241,7 +251,8 @@ interface InsertedMailboxRow {
 /** 规则判定 → 占用判定 → 带守卫的 INSERT（RETURNING 直接带回整行与历史邮件数）。成功后更新 context。 */
 async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailboxRequest): Promise<Mailbox> {
   const { settings, user: policyUser, userId } = context;
-  const policy = evaluateClaimPolicy(settings, policyUser, context.owned, req.localPart, req.domain, context.hosted.get(req.domain));
+  const policy = evaluateClaimPolicy(settings, policyUser, context.owned, req.localPart, req.domain, context.hosted.get(req.domain),
+    req.strategy === 'claude' && context.claudeSuspended.has(req.domain));
   if (policy.blocked) throw policy.blocked.error;
   const { perUserLimit, perDomainLimit } = policy;
 
@@ -261,10 +272,11 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
            WHERE (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ? AND domain = ?) < ?)
              AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active' AND role = ?)
              AND ${HOSTED_CLAIM_GUARD_SQL}
+             AND (? = 0 OR NOT EXISTS (SELECT 1 FROM claude_address_facts WHERE domain = ? AND suspended > 0))
            ${returning}`,
         )
         .bind(address, req.domain, userId, perDomainLimit, userId, req.domain, perDomainLimit,
-          userId, policyUser.role, req.domain, policyUser.role, userId, userId)
+          userId, policyUser.role, req.domain, policyUser.role, userId, userId, req.strategy === 'claude' ? 1 : 0, req.domain)
         .first<InsertedMailboxRow>()
       : await env.db
         .prepare(
@@ -278,6 +290,7 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
                WHERE settings.key = 'domains'
                  AND lower(trim(CASE WHEN configured.type = 'text' THEN configured.value
                    ELSE json_extract(configured.value, '$.domain') END)) = ?)
+             AND (? = 0 OR NOT EXISTS (SELECT 1 FROM claude_address_facts WHERE domain = ? AND suspended > 0))
            ${returning}`,
         )
         .bind(
@@ -296,9 +309,11 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
           policyUser.role,
           policyUser.mailboxPolicyRevision,
           req.domain,
+          req.strategy === 'claude' ? 1 : 0,
+          req.domain,
         )
         .first<InsertedMailboxRow>();
-    if (!inserted) throw await claimGuardError(env, context, policy.hosted);
+    if (!inserted) throw await claimGuardError(env, context, req, policy.hosted);
     context.taken.add(address);
     if (!policy.hosted) context.owned.total += 1;
     context.owned.byDomain.set(req.domain, (context.owned.byDomain.get(req.domain) ?? 0) + 1);
@@ -320,12 +335,15 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
 }
 
 /** INSERT 守卫未通过：一次读回当前域名修订与用户权限，区分是配置变化还是并发用尽了配额 */
-async function claimGuardError(env: Env, context: ClaimContext, hosted = false): Promise<AppError> {
-  if (hosted) return new AppError('conflict', '域名状态、权限或成员上限已改变，请刷新后重试');
-  const [settingsResult, userResult] = await env.db.batch([
+async function claimGuardError(env: Env, context: ClaimContext, req: ClaimMailboxRequest, hosted = false): Promise<AppError> {
+  if (hosted && req.strategy !== 'claude') return new AppError('conflict', '域名状态、权限或成员上限已改变，请刷新后重试');
+  const [settingsResult, userResult, suspendedResult] = await env.db.batch([
     claimSettingsStatement(env.db),
     mailboxPolicyUserStatement(env.db, context.userId),
+    ...(req.strategy === 'claude' ? [env.db.prepare('SELECT 1 FROM claude_address_facts WHERE domain = ? AND suspended > 0 LIMIT 1').bind(req.domain)] : []),
   ]);
+  if (suspendedResult?.results.length) return new AppError('forbidden', CLAUDE_SUSPENDED_MESSAGE);
+  if (hosted) return new AppError('conflict', '域名状态、权限或成员上限已改变，请刷新后重试');
   const current = claimSettingsFrom(settingsResult);
   if ((current.domains.revision ?? 0) !== (context.settings.domains.revision ?? 0)) {
     return new AppError('conflict', '域名配置已改变，请刷新后重试');
@@ -344,7 +362,7 @@ export async function claimMailbox(
   role: Role,
   req: ClaimMailboxRequest,
 ): Promise<Mailbox> {
-  const context = await loadClaimContext(env, { userId, role }, [addressOf(req)]);
+  const context = await loadClaimContext(env, { userId, role }, [req]);
   // await：规则不通过时 claimWithContext 在首个 await 前就已 reject，直接 return 会被 workerd 记为未处理
   return await claimWithContext(env, context, req);
 }
@@ -372,6 +390,7 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
       json_extract(value, '$.ownedDomain') AS owned_domain,
       json_extract(value, '$.wasTaken') AS was_taken,
       json_extract(value, '$.hosted') AS hosted,
+      json_extract(value, '$.strategy') AS strategy,
       json_extract(value, '$.code') AS policy_code,
       json_extract(value, '$.message') AS policy_message
     FROM json_each(?1)
@@ -391,6 +410,8 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
   ),
   checked AS (
     SELECT *, CASE
+      WHEN strategy = 'claude' AND EXISTS (SELECT 1 FROM claude_address_facts f WHERE f.domain = counted.domain AND f.suspended > 0)
+        THEN 'claude_suspended'
       WHEN policy_code IS NOT NULL THEN policy_code
       WHEN user_limit > 0 AND ?3 + added >= user_limit THEN 'quota'
       WHEN domain_limit > 0 AND owned_domain + domain_added >= domain_limit THEN 'domain_limit'
@@ -431,7 +452,7 @@ async function claimChunk(env: Env, context: ClaimContext, items: ClaimMailboxRe
     const policy = evaluateClaimPolicy(context.settings, context.user, { total: 0, byDomain: new Map() }, item.localPart, item.domain,
       context.hosted.get(item.domain));
     return {
-      address: addressOf(item), domain: item.domain, hosted: policy.hosted ? 1 : 0,
+      address: addressOf(item), domain: item.domain, hosted: policy.hosted ? 1 : 0, strategy: item.strategy ?? 'uniform',
       perUserLimit: policy.perUserLimit, perDomainLimit: policy.perDomainLimit,
       ownedDomain: context.owned.byDomain.get(item.domain) ?? 0,
       wasTaken: context.taken.has(addressOf(item)) ? 1 : 0,
@@ -465,7 +486,7 @@ export async function claimMailboxes(
   let index = 0;
   let started = false;
   try {
-    const context = await loadClaimContext(env, { userId, role }, items.map(addressOf));
+    const context = await loadClaimContext(env, { userId, role }, items);
     started = true;
     while (index < items.length) {
       const chunk = items.slice(index, index + CLAIM_CHUNK_SIZE);
@@ -473,7 +494,8 @@ export async function claimMailboxes(
       for (const row of plan) {
         const item = items[index]!;
         if (row.blocked) {
-          if (row.blocked === 'guard') throw await claimGuardError(env, context, context.hosted.has(item.domain));
+          if (row.blocked === 'claude_suspended') throw new AppError('forbidden', CLAUDE_SUSPENDED_MESSAGE);
+          if (row.blocked === 'guard') throw await claimGuardError(env, context, item, context.hosted.has(item.domain));
           if (row.blocked === 'quota') throw new AppError('forbidden', `认领地址数已达上限（${row.user_limit}）`);
           if (row.blocked === 'domain_limit') throw new AppError('forbidden', `在该域名下最多认领 ${row.domain_limit} 个地址`);
           throw new AppError(row.blocked as AppError['code'], row.policy_message!);
@@ -512,7 +534,8 @@ export async function claimMailboxes(
 
 function availabilityOf(context: ClaimContext, req: ClaimMailboxRequest): MailboxAvailability {
   const address = addressOf(req);
-  const policy = evaluateClaimPolicy(context.settings, context.user, context.owned, req.localPart, req.domain, context.hosted.get(req.domain));
+  const policy = evaluateClaimPolicy(context.settings, context.user, context.owned, req.localPart, req.domain, context.hosted.get(req.domain),
+    req.strategy === 'claude' && context.claudeSuspended.has(req.domain));
   if (policy.blocked) return { address, available: false, reason: policy.blocked.reason };
   return context.taken.has(address) ? { address, available: false, reason: 'taken' } : { address, available: true };
 }
@@ -637,9 +660,10 @@ export async function checkAvailability(
   actor: { userId: number; role: Role },
   localPart: string,
   domain: string,
+  strategy?: ClaimPlanStrategy,
 ): Promise<MailboxAvailability> {
-  const req = { localPart, domain };
-  return availabilityOf(await loadClaimContext(env, actor, [addressOf(req)]), req);
+  const req = { localPart, domain, strategy };
+  return availabilityOf(await loadClaimContext(env, actor, [req]), req);
 }
 
 /** 批量可用性提示：全部读取合成一个 D1 batch，逐项结果与单个检查相同，保持请求顺序 */
@@ -648,7 +672,7 @@ export async function checkAvailabilityBatch(
   actor: { userId: number; role: Role },
   items: ClaimMailboxRequest[],
 ): Promise<MailboxAvailability[]> {
-  const context = await loadClaimContext(env, actor, items.map(addressOf));
+  const context = await loadClaimContext(env, actor, items);
   return items.map((item) => availabilityOf(context, item));
 }
 

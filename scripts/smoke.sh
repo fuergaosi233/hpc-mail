@@ -79,6 +79,45 @@ for endpoint in mailboxes mailboxes/shared mailboxes/shares admin/mailbox-shares
   curl -fsS "$BASE_URL/api/$endpoint" -H "Authorization: Bearer $TOKEN" | jq -e '.data | type == "array"' >/dev/null || fail "$endpoint 结构异常"
 done
 
+step "Claude 0 封号规划与可用性（只读）"
+claude_stats=$(curl -fsS "$BASE_URL/api/admin/settings/domain-claude-stats" -H "Authorization: Bearer $TOKEN")
+jq -e '.data | type == "array" and all(.[]; if .suspended > 0 then .risk == "suspended" else .risk == null end)' \
+  <<< "$claude_stats" >/dev/null || fail "Claude 域名风险未按任意历史封号标记"
+claude_plan=$(curl -fsS "$BASE_URL/api/mailboxes/random-plan?strategy=claude&count=10" -H "Authorization: Bearer $TOKEN")
+jq --argjson stats "$claude_stats" -e '
+  ($stats.data | map(select(.suspended > 0) | .domain)) as $blocked |
+  .data | .strategy == "claude" and (.items | type == "array") and (.pool | type == "array") and
+  all(.items[]; .suspended == 0 and (.domain as $domain | $blocked | index($domain) == null)) and
+  all(.pool[]; . as $domain | $blocked | index($domain) == null) and
+  (.shortfall == 10 - (.items | length))
+' <<< "$claude_plan" >/dev/null || fail "Claude 规划包含有封号域名或结构异常"
+claude_probe="smoke-claude-$(date +%s)"
+suspended_domain=$(jq -r '[.data[] | select(.suspended > 0)][0].domain // empty' <<< "$claude_stats")
+if [ -n "$suspended_domain" ]; then
+  curl -fsS --get "$BASE_URL/api/mailboxes/availability" -H "Authorization: Bearer $TOKEN" \
+    --data-urlencode "localPart=$claude_probe" --data-urlencode "domain=$suspended_domain" --data-urlencode 'strategy=claude' |
+    jq -e '.data.available == false and .data.reason == "claude_suspended"' >/dev/null || fail "Claude 封号域名可用性未拒绝"
+else
+  printf '%s\n' '    （没有历史封号域名，跳过封号域名可用性检查）'
+fi
+zero_domain=$(jq -r '[.data[] | select(.suspended == 0)][0].domain // empty' <<< "$claude_stats")
+if [ -n "$zero_domain" ]; then
+  curl -fsS --get "$BASE_URL/api/mailboxes/availability" -H "Authorization: Bearer $TOKEN" \
+    --data-urlencode "localPart=$claude_probe" --data-urlencode "domain=$zero_domain" --data-urlencode 'strategy=claude' |
+    jq -e '.data | .available == true or (.available == false and (.reason == "taken" or .reason == "quota" or .reason == "domain_limit"))' \
+      >/dev/null || fail "Claude 零封号域名可用性未遵循普通权限配额"
+else
+  printf '%s\n' '    （没有零封号域名，跳过零封号域名可用性检查）'
+fi
+for namespace in api v1; do
+  curl -fsS "$BASE_URL/$namespace/openapi.json" | jq -e '
+    .components.schemas.ClaimMailboxRequest.properties.strategy.enum == ["uniform", "claude"] and
+    (.components.schemas.ClaimMailboxRequest.required | index("strategy") == null) and
+    any(.paths["/mailboxes/availability"].get.parameters[]; .name == "strategy" and .schema.enum == ["uniform", "claude"]) and
+    (.components.schemas.MailboxAvailability.properties.reason.enum | index("claude_suspended") != null)
+  ' >/dev/null || fail "$namespace Claude 认领契约缺失"
+done
+
 step "通知状态和转发配额可读"
 curl -fsS "$BASE_URL/api/me/notify-prefs/health" -H "Authorization: Bearer $TOKEN" | jq -e '.data | (.channels | type == "array") and (.forward.targets | type == "array")' >/dev/null || fail "通知状态结构异常"
 
