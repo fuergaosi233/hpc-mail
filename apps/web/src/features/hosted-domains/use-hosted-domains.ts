@@ -1,6 +1,6 @@
 import { type QueryClient, queryOptions, useQuery } from '@tanstack/react-query';
 import type { HostedDnsRecord, HostedDomain, HostedDomainStatus } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
+import { ApiError, isRejectedRequest } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { hostedDomainApi } from './hosted-domains-api';
 
@@ -68,13 +68,14 @@ export function useHostedDnsRecordsQuery(id: number) {
 }
 
 /**
- * 解析写操作失败后按错误码刷新：记录已不存在或冲突时列表过期；forbidden 多半是域名刚被暂停或权限变化，
- * 连同域名详情一起刷新；internal 与超时时 Cloudflare 可能已经写入，结果不确定
+ * 解析写操作失败后刷新：不是确定被拒绝的请求（网络中断、超时、5xx、边缘返回的非 JSON 页面）时 Cloudflare 可能已经写入，
+ * 结果不确定；被拒绝时只有记录已不存在、冲突或权限变化说明列表过期。forbidden 多半是域名刚被暂停，连同域名详情一起刷新
  */
 export function refreshAfterDnsWriteError(client: QueryClient, domainId: number, error: unknown): void {
-  if (!(error instanceof ApiError)) return;
-  if (error.code === 'forbidden') void client.invalidateQueries({ queryKey: queryKeys.hostedDomains.detail(domainId) });
-  if (['not_found', 'conflict', 'forbidden', 'internal', 'timeout'].includes(error.code)) {
+  if (error instanceof ApiError && error.code === 'forbidden') {
+    void client.invalidateQueries({ queryKey: queryKeys.hostedDomains.detail(domainId) });
+  }
+  if (!isRejectedRequest(error) || ['not_found', 'conflict', 'forbidden'].includes(error.code)) {
     void client.invalidateQueries({ queryKey: queryKeys.hostedDomains.dnsRecords(domainId) });
   }
 }
