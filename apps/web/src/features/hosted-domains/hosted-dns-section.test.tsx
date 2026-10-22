@@ -144,6 +144,10 @@ describe('托管域名 DNS 解析', () => {
     expect(within(mail).getByText('根域的 MX 记录用于本站收件，由系统维护')).toBeInTheDocument();
     expect(within(mail).getByText('DMARC 记录用于本站发信，由系统维护')).toBeInTheDocument();
     expect(within(mail).queryByRole('button')).toBeNull();
+    // 邮箱记录没有操作，不留空的操作列；用户记录表格保留
+    expect(within(mail).getAllByRole('columnheader')).toHaveLength(5);
+    expect(within(mail).queryByRole('columnheader', { name: '操作' })).toBeNull();
+    expect(within(table).getByRole('columnheader', { name: '操作' })).toBeInTheDocument();
     client.clear();
   });
 
@@ -410,5 +414,56 @@ describe('托管域名 DNS 解析', () => {
     expect(within(screen.getByRole('table', { name: '解析记录' })).getAllByRole('row').slice(1)).toHaveLength(2);
     expect(screen.getByText('已添加 2 / 100 条')).toBeInTheDocument();
     client.clear();
+  });
+
+  it('小屏卡片：名称折行完整显示，被截断的内容点按展开/收起全文', async () => {
+    const minecraft = record({
+      type: 'SRV', name: '_minecraft._tcp.play.verylongsubdomain', content: '5 25565 mc.example.com',
+      srv: { priority: 0, weight: 5, port: 25565, target: 'mc.example.com' },
+    });
+    const dkimValue = `"v=DKIM1; h=sha256; k=rsa; p=${'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA'.repeat(4)}"`;
+    const dkim = record({ type: 'TXT', name: 'cf2024-1._domainkey', content: dkimValue, kind: 'mail', lockedReason: 'DKIM（_domainkey）记录用于本站收发，由系统维护' });
+    mocks.dnsRecords.mockResolvedValue([apex, mailMx, dkim, minecraft]);
+    // 窄屏；jsdom 不排版，按每行 40 个字符估算高度，line-clamp-3 时最多显示 3 行
+    globalThis.matchMedia = ((query: string) =>
+      ({ matches: true, media: query, addEventListener() {}, removeEventListener() {} }) as unknown as MediaQueryList);
+    const lines = (element: HTMLElement) => Math.ceil((element.textContent ?? '').length / 40);
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, get() { return lines(this) * 20; } });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get() { return (this.classList.contains('line-clamp-3') ? Math.min(lines(this), 3) : lines(this)) * 20; },
+    });
+    try {
+      const client = mount();
+      const list = await screen.findByRole('list', { name: '解析记录' });
+      expect(screen.queryByRole('table')).toBeNull();
+      const name = within(list).getByText('_minecraft._tcp.play.verylongsubdomain');
+      expect(name).toHaveClass('break-all');
+      expect(name).not.toHaveClass('truncate');
+      // 没被截断的短内容不是按钮
+      expect(within(list).getByText('203.0.113.10')).toBeInTheDocument();
+      expect(within(list).queryByRole('button', { name: /203\.0\.113\.10/ })).toBeNull();
+
+      fireEvent.click(screen.getByRole('button', { name: '邮箱记录（2 条，由系统维护）' }));
+      const mail = within(screen.getByRole('list', { name: '邮箱记录' }));
+      const toggle = mail.getByRole('button', { name: /v=DKIM1/ });
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      expect(within(toggle).getByText('展开全文')).toBeInTheDocument();
+      expect(mail.getByText(dkimValue)).toHaveClass('line-clamp-3');
+      expect(mail.queryByRole('button', { name: /route1\.mx\.cloudflare\.net/ })).toBeNull();
+
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      expect(mail.getByText(dkimValue)).not.toHaveClass('line-clamp-3');
+      expect(within(toggle).getByText('收起')).toBeInTheDocument();
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      expect(mail.getByText(dkimValue)).toHaveClass('line-clamp-3');
+      client.clear();
+    } finally {
+      Reflect.deleteProperty(globalThis, 'matchMedia');
+      Reflect.deleteProperty(HTMLElement.prototype, 'scrollHeight');
+      Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight');
+    }
   });
 });
