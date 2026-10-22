@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   get: vi.fn(),
   check: vi.fn(),
   members: vi.fn(),
+  dnsRecords: vi.fn(),
   replaceMembers: vi.fn(),
   removeMember: vi.fn(),
   transfer: vi.fn(),
@@ -22,6 +23,7 @@ vi.mock('./hosted-domains-api', () => ({
     get: mocks.get,
     check: mocks.check,
     members: mocks.members,
+    dnsRecords: mocks.dnsRecords,
     replaceMembers: mocks.replaceMembers,
     removeMember: mocks.removeMember,
     transfer: mocks.transfer,
@@ -77,6 +79,7 @@ function mount(user: SessionUser = alice) {
 describe('托管域名详情', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.dnsRecords.mockResolvedValue([]);
     mocks.members.mockResolvedValue([
       { userId: 3, username: 'carol', status: 'active', grantedAt: '2026-10-20T02:00:00Z', mailboxCount: 4 },
     ]);

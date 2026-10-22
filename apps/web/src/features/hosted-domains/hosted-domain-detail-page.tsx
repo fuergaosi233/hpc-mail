@@ -39,6 +39,7 @@ import {
   NsPropagationNotice,
 } from './hosted-domain-meta';
 import { HostedDomainMembersSection } from './hosted-domain-members';
+import { HostedDnsSection } from './hosted-dns-section';
 import { hostedDomainApi } from './hosted-domains-api';
 import { TransferHostedDomainDialog } from './transfer-hosted-domain-dialog';
 import { forgetHostedDomain, storeHostedDomain, useHostedDomainQuery } from './use-hosted-domains';
@@ -300,6 +301,9 @@ function NameServerSection({ domain }: { domain: HostedDomain }) {
               </ul>
             </div>
           )}
+          <p className="text-[13px] text-ink-secondary">
+            修改名称服务器前，先在下方「DNS 解析」补上网站等原有记录，切换后这些服务不会中断。
+          </p>
           <ol className="flex flex-col gap-4">
             <GuideStep n={1} title="登录域名注册商">
               登录购买该域名的服务商控制台{domain.originalRegistrar ? `（${domain.originalRegistrar}）` : ''}，进入域名管理。
@@ -453,6 +457,7 @@ export function HostedDomainDetailPage() {
 
       <ProgressSection domain={domain} canManage={canManage} />
       {canManage && active && <NameServerSection domain={domain} />}
+      {canManage && active && <HostedDnsSection domain={domain} />}
       {canManage && active && <HostedDomainMembersSection domain={domain} />}
       {canManage && active && <ManageSection domain={domain} />}
     </div>
