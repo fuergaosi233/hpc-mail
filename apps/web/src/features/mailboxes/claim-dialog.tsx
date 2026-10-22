@@ -5,7 +5,6 @@ import { type ClaimPlan, type ClaimPlanStrategy, claimMailboxRequestSchema, loca
 import { ApiError } from '@/api/errors';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { writeClipboard } from '@/components/ui/copy-button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
@@ -57,13 +56,13 @@ type SuffixMode = 'fixed' | ClaimPlanStrategy;
 const SUFFIX_MODES: readonly SegmentedOption<SuffixMode>[] = [
   { value: 'fixed', label: '固定后缀' },
   { value: 'uniform', label: '均匀随机' },
-  { value: 'claude', label: 'Claude 低风险' },
+  { value: 'claude', label: 'Claude 0 封号' },
 ];
 
 const SUFFIX_HINTS: Record<SuffixMode, string> = {
   fixed: '都用当前选择的域名',
   uniform: '从参与随机的可用域名中等概率选',
-  claude: '排除高风险后缀，按 Claude 封号数、账号数从少到多分配，每个后缀每天限量',
+  claude: '有历史 Claude 封号记录的域名禁止认领，其余按账号数分配、每天限量；0 封号不保证未来不会封号',
 };
 
 /** 后端没能分配满时的说明 */
@@ -72,10 +71,10 @@ function shortfallText(plan: ClaimPlan): string | null {
   const allocated = plan.items.length;
   const partial = allocated > 0 ? `，只分配了 ${allocated} 个` : '';
   if (plan.reason === 'quota') return allocated > 0 ? `额度不足，只分配了 ${allocated} 个` : '认领额度已用完，无法再分配';
-  if (plan.reason === 'daily_limit') return `低风险后缀今天的新增名额已用完${partial}，可稍后再试或手动选择域名`;
-  if (plan.reason === 'domain_quota') return `可选后缀的每域名额已用完${partial}，可手动选择其他域名`;
+  if (plan.reason === 'daily_limit') return `0 封号后缀今天的新增名额已用完${partial}，可稍后再试`;
+  if (plan.reason === 'domain_quota') return `可选后缀的每域名额已用完${partial}${plan.strategy === 'claude' ? '；有历史封号记录的域名在此模式下禁止认领' : '，可手动选择其他域名'}`;
   if (allocated > 0) return `可用后缀的名额不足，只分配了 ${allocated} 个`;
-  return plan.strategy === 'claude' ? '没有可用于 Claude 的低风险后缀，可手动选择域名' : '没有参与随机的可用域名，可手动选择域名';
+  return plan.strategy === 'claude' ? '没有可分配的 Claude 0 封号后缀；有历史封号记录的域名在此模式下禁止认领' : '没有参与随机的可用域名，可手动选择域名';
 }
 
 function announceClaimed(address: string) {
@@ -134,7 +133,7 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
   const [error, setError] = useState<string | null>(null);
   const [countText, setCountText] = useState('1');
   const [mode, setMode] = useState<SuffixMode>('fixed');
-  /** 最近一次后端分配：单个重新随机的候选、各后缀封号数与未分配满的说明 */
+  /** 最近一次后端分配：单个重新随机的候选与未分配满的说明 */
   const [plan, setPlan] = useState<ClaimPlan | null>(null);
   const [planning, setPlanning] = useState(false);
   /** 关闭对话框后返回的分配结果作废 */
@@ -151,10 +150,11 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
   const refocusShare = useRef(false);
   const currentUser = useCurrentUser();
   const count = parseBatchCount(countText);
+  const strategy = mode === 'claude' ? 'claude' : undefined;
   /** 同一轮发起的可用性查询（随机生成一批）合成一次批量请求 */
   const [checkAvailability] = useState(() =>
     createAvailabilityLoader({
-      one: (item) => mailboxApi.availability(item.localPart, item.domain),
+      one: (item) => mailboxApi.availability(item.localPart, item.domain, item.strategy),
       many: (items) => mailboxApi.batchAvailability(items),
     }),
   );
@@ -189,8 +189,8 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
     queries: rows.map((row) => {
       const target = settled[row.id] ?? { localPart: '', domain: row.domain };
       return {
-        queryKey: queryKeys.mailboxes.availability(target.localPart, target.domain),
-        queryFn: () => checkAvailability(target),
+        queryKey: [...queryKeys.mailboxes.availability(target.localPart, target.domain), strategy ?? 'uniform'],
+        queryFn: () => checkAvailability({ ...target, ...(strategy ? { strategy } : {}) }),
         notifyOnChangeProps: ['data', 'isFetching'] as const,
         // 失败由 loader 整批重试；逐行重试各有定时器，会绕过合批变成一串单个请求
         retry: false,
@@ -277,6 +277,16 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
     }
   };
 
+  const changeMode = (value: SuffixMode) => {
+    if (claiming || value === mode) return;
+    // 模式切换立即作废旧规划；旧请求稍后返回也不能覆盖当前地址或提示。
+    planRequest.current++;
+    setPlanning(false);
+    setPlan(null);
+    setError(null);
+    setMode(value);
+  };
+
   const randomizeAll = async () => {
     if (mode === 'fixed') {
       fillRows(randomAddresses(count, () => domain).map((draft) => newRow(draft)));
@@ -328,7 +338,7 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
       return;
     }
     for (const row of rows) {
-      const parsed = claimMailboxRequestSchema.safeParse({ localPart: row.localPart, domain: row.domain });
+      const parsed = claimMailboxRequestSchema.safeParse({ localPart: row.localPart, domain: row.domain, strategy });
       if (!parsed.success) {
         setError(parsed.error.issues[0]?.message ?? '请检查输入');
         return;
@@ -337,7 +347,7 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
     if (!canSubmit) return;
 
     setClaiming(true);
-    const outcome = await claimList(rows, mailboxApi);
+    const outcome = await claimList(rows, mailboxApi, strategy);
     setClaiming(false);
 
     // 结果未知时也可能已认领了一部分：同样刷新邮箱列表与归属相关缓存
@@ -379,10 +389,6 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
     );
 
   const multiple = rows.length > 1;
-  /** Claude 模式分配后，各后缀收到过封号信的地址数（按当前每行的后缀计，手动改过的行也算） */
-  const suspendedOf = (rowDomain: string) =>
-    plan?.strategy === 'claude' ? (plan.items.find((item) => item.domain === rowDomain)?.suspended ?? 0) : 0;
-  const riskyCount = rows.filter((row) => suspendedOf(row.domain) > 0).length;
   const planShortfall = plan ? shortfallText(plan) : null;
   const busy = claiming || planning;
   /** 管理员认领多个后，可把认领成功的这批邮箱一键共享给其他人（结果页只在认领成功后出现） */
@@ -537,9 +543,7 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
                       <SegmentedControl
                         aria-label="随机后缀模式"
                         value={mode}
-                        onValueChange={(value) => {
-                          if (!busy) setMode(value);
-                        }}
+                        onValueChange={changeMode}
                         options={SUFFIX_MODES}
                         className="h-8"
                       />
@@ -547,10 +551,8 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
                     <p className="text-xs text-ink-tertiary">{SUFFIX_HINTS[mode]}</p>
                   </div>
                 )}
-                {(planShortfall || riskyCount > 0) && (
-                  <p className="text-xs font-medium text-caution">
-                    {[planShortfall, riskyCount > 0 && `其中 ${riskyCount} 个落在有封号记录的后缀`].filter(Boolean).join('；')}
-                  </p>
+                {planShortfall && (
+                  <p className="text-xs font-medium text-caution">{planShortfall}</p>
                 )}
 
                 <ul className={cn('flex flex-col gap-2', multiple && 'max-h-72 gap-3 overflow-y-auto p-1 -m-1 sm:gap-2')}>
@@ -603,11 +605,6 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
                               <span className="truncate text-sm text-ink-tertiary" aria-hidden>
                                 {row.domain}
                               </span>
-                            )}
-                            {suspendedOf(row.domain) > 0 && (
-                              <Badge tone="caution" title={`该后缀历史上有 ${suspendedOf(row.domain)} 个地址收到 Claude 封号信`}>
-                                封 {suspendedOf(row.domain)}
-                              </Badge>
                             )}
                           </div>
                           {multiple && (

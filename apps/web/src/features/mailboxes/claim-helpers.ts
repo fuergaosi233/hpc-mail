@@ -33,6 +33,7 @@ const REASON_MESSAGES: Record<MailboxUnavailableReason, string> = {
   quota: '你认领的地址数已达个人上限，释放不用的地址后再试',
   domain_limit: '你在该域名下的认领数已达上限，可换一个域名',
   domain_unavailable: '该域名当前不可认领（不存在或未对你开放）',
+  claude_suspended: '该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领',
 };
 
 /** 不可认领时给用户看的原因；后端未给出 reason 时回退到通用提示 */
@@ -131,8 +132,9 @@ export async function claimList(
     claim: (body: ClaimMailboxRequest) => Promise<ClaimedMailbox>;
     batchClaim: (items: ClaimMailboxRequest[]) => Promise<BatchClaimMailboxResult>;
   },
+  strategy?: ClaimMailboxRequest['strategy'],
 ): Promise<ClaimListResult> {
-  const items = drafts.map(({ localPart, domain }) => ({ localPart, domain }));
+  const items = drafts.map(({ localPart, domain }) => ({ localPart, domain, ...(strategy ? { strategy } : {}) }));
   if (items.length === 1) {
     const draft = items[0]!;
     try {

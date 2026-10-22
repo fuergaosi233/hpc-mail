@@ -1,6 +1,7 @@
 import { LOCAL_PART_REGEX, DEFAULT_RESERVED_LOCAL_PARTS, MAX_BATCH_CLAIM, type BatchClaimMailboxResult } from '@hpc-mail/shared';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/errors';
+import { mailboxApi } from '@/api/resources';
 import {
   claimList,
   createAvailabilityLoader,
@@ -237,6 +238,41 @@ describe('fromBatchResult', () => {
       stoppedBy: '认领中断，部分地址可能已认领，请以邮箱列表为准',
       uncertain: true,
     });
+  });
+});
+
+describe('Claude strategy HTTP 请求', () => {
+  it.each([1, 2])('%i 个地址的可用性与认领请求实际携带 strategy', async (count) => {
+    const drafts = Array.from({ length: count }, (_, index) => ({ localPart: `hello${index}`, domain: 'a.test' }));
+    const items = drafts.map((draft) => ({ ...draft, strategy: 'claude' as const }));
+    const availability = items.map((item) => ({ address: `${item.localPart}@${item.domain}`, available: true }));
+    const claimed = items.map((item, index) => ({ id: index + 1, address: `${item.localPart}@${item.domain}` }));
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: count === 1 ? availability[0] : availability }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: count === 1 ? claimed[0] : { claimed, taken: [], notAttempted: [], stoppedBy: null } }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    try {
+      const load = createAvailabilityLoader({
+        one: (item) => mailboxApi.availability(item.localPart, item.domain, item.strategy),
+        many: mailboxApi.batchAvailability,
+      });
+      await Promise.all(items.map(load));
+      const result = await claimList(drafts, mailboxApi, 'claude');
+      expect(result.claimed).toEqual(claimed);
+      const [checkUrl, checkInit] = fetchMock.mock.calls[0]!;
+      const [claimUrl, claimInit] = fetchMock.mock.calls[1]!;
+      if (count === 1) {
+        expect(checkUrl).toBe('/api/mailboxes/availability?localPart=hello0&domain=a.test&strategy=claude');
+        expect(claimUrl).toBe('/api/mailboxes');
+        expect(JSON.parse(String(claimInit?.body))).toEqual(items[0]);
+      } else {
+        expect(checkUrl).toBe('/api/mailboxes/availability/batch');
+        expect(JSON.parse(String(checkInit?.body))).toEqual({ items });
+        expect(claimUrl).toBe('/api/mailboxes/batch');
+        expect(JSON.parse(String(claimInit?.body))).toEqual({ items });
+      }
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 });
 

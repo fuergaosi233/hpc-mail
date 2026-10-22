@@ -86,6 +86,7 @@ describe('domain configuration safety', () => {
   });
   it('显示每个域名的 Claude 统计与风险标记，不参与随机的域名有标记', async () => {
     mocks.get.mockResolvedValue({domains:{revision:3,list:[
+      {domain:'suspended.example',public:false,perUserLimit:0,random:true},
       {domain:'wiped.example',public:false,perUserLimit:0,random:true},
       {domain:'paid.example',public:false,perUserLimit:0,random:true},
       {domain:'rate.example',public:false,perUserLimit:0,random:true},
@@ -93,6 +94,7 @@ describe('domain configuration safety', () => {
       {domain:'off.example',public:false,perUserLimit:0,random:false},
     ]},claim_random:{paidSuspendedLimit:2,pendingDays:7,suspendedPercent:50,dailyLimit:3}});
     mocks.stats.mockResolvedValueOnce([
+      {domain:'suspended.example',accounts:100,suspended:1,paid:0,paidSuspended:0,pending:0,recent:3,risk:'suspended'},
       {domain:'wiped.example',accounts:3,suspended:3,paid:1,paidSuspended:1,pending:0,recent:0,risk:'wiped'},
       {domain:'paid.example',accounts:5,suspended:2,paid:3,paidSuspended:2,pending:1,recent:1,risk:'paid_suspended'},
       {domain:'rate.example',accounts:4,suspended:2,paid:0,paidSuspended:0,pending:0,recent:0,risk:'suspended_rate'},
@@ -101,9 +103,10 @@ describe('domain configuration safety', () => {
     ]);
     const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
     render(<QueryClientProvider client={client}><MemoryRouter><DomainsPage /></MemoryRouter></QueryClientProvider>);
-    expect(await screen.findByText('全军覆没')).toBeInTheDocument();
-    expect(screen.getByText('付费被封达阈值，已排除')).toBeInTheDocument();
-    expect(screen.getByText('封号率达阈值，已排除')).toBeInTheDocument();
+    const excluded = await screen.findAllByText('有封号记录，已排除');
+    expect(excluded).toHaveLength(4);
+    expect(excluded[0]).toHaveAttribute('title', '该域名有历史 Claude 封号记录，Claude 0 封号模式禁止认领');
+    expect(screen.queryByText(/达阈值，已排除/)).not.toBeInTheDocument();
     expect(screen.getAllByText('今日新增已满')).toHaveLength(1);
     expect(screen.getByText('Claude：账号 5 · 封 2 · 付费 3 · 付费封 2 · 未注册 1 · 24 小时新增 1')).toBeInTheDocument();
     expect(screen.getByText('Claude：暂无记录')).toBeInTheDocument();

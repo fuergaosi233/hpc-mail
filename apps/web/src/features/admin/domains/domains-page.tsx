@@ -159,15 +159,13 @@ function DomainRow({
           <StatusBadge isFetching={isFetching} status={status} />
           {entry.public && <Badge tone="accent">公开</Badge>}
           {entry.random === false && <Badge>不参与随机</Badge>}
-          {stats?.risk === 'wiped' && (
-            <Badge tone="critical" title="账号全被封，或付费账号全被封；Claude 低风险模式不会分配这个后缀">
-              全军覆没
+          {stats && (stats.suspended > 0 || stats.risk !== null) && (
+            <Badge tone="critical" title="该域名有历史 Claude 封号记录，Claude 0 封号模式禁止认领">
+              有封号记录，已排除
             </Badge>
           )}
-          {stats?.risk === 'paid_suspended' && <Badge tone="caution">付费被封达阈值，已排除</Badge>}
-          {stats?.risk === 'suspended_rate' && <Badge tone="caution">封号率达阈值，已排除</Badge>}
-          {stats && stats.risk === null && entry.random !== false && dailyLimit > 0 && stats.recent >= dailyLimit && (
-            <Badge tone="caution" title="近 24 小时新增已达每日上限，Claude 低风险模式暂不分配这个后缀">今日新增已满</Badge>
+          {stats && stats.suspended === 0 && stats.risk === null && entry.random !== false && dailyLimit > 0 && stats.recent >= dailyLimit && (
+            <Badge tone="caution" title="近 24 小时新增已达每日上限，Claude 0 封号模式暂不分配这个后缀">今日新增已满</Badge>
           )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
@@ -409,10 +407,10 @@ export function DomainsPage() {
           <p className="mt-0.5 text-[13px] text-ink-secondary">
             系统只检测 MX 是否已指向 Cloudflare；请另外确认 Catch-all 指向本 Worker，并发送测试邮件验证完整链路。
             <b>公开</b>开关决定普通用户是否可见并认领该域名；<b>每人可认领</b>限制普通用户在该域名下的地址数（管理员不受限）。
-            <b>参与随机生成</b>关掉后，认领时的「均匀随机」和「Claude 低风险」都不会分配这个域名，仍可手动选择。
+            <b>参与随机生成</b>关掉后，认领时的「均匀随机」和「Claude 0 封号」都不会分配这个域名，仍可手动选择；Claude 0 封号模式下，有历史封号记录的域名始终禁止认领。
           </p>
           <p className="mt-1 text-xs text-ink-tertiary">
-            Claude 统计根据历史官方来信判定，可能有约 5 分钟延迟；全军覆没（账号全被封或付费账号全被封）的后缀在 Claude 低风险模式下始终排除，付费被封、封号率与每日新增上限见「系统设置 · 随机认领规则」。
+            Claude 统计根据历史官方来信判定，可能有约 5 分钟延迟；任意历史封号记录都会禁止该域名在 Claude 0 封号模式下认领，不受付费状态或封号比例影响。0 封号不保证未来不会封号；每日新增上限见「系统设置 · 随机认领规则」。
             {statsQuery.isError && ' Claude 统计暂时加载失败。'}
           </p>
         </div>
