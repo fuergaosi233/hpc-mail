@@ -242,7 +242,7 @@ export function SettingsPage() {
       setDraft(structuredClone(saved));
       setReservedText(null);
       void queryClient.invalidateQueries({ queryKey: queryKeys.config });
-      // 排除阈值与未注册天数会改变各域名的 Claude 统计与排除原因
+      // 未注册天数与每日上限会改变各域名的 Claude 统计与名额提示
       void queryClient.invalidateQueries({ queryKey: queryKeys.admin.domainClaudeStats });
       // 托管总开关会改变运行状态卡片
       void queryClient.invalidateQueries({ queryKey: queryKeys.admin.hostedDomainsHealth });
@@ -440,27 +440,11 @@ export function SettingsPage() {
         {draft.claim_random && (
           <Section
             title="随机认领规则"
-            description="认领时选「Claude 低风险」，先排除高风险后缀，再按 Claude 封号数、账号数从少到多分配，每个后缀每天新增有上限。全军覆没的后缀始终排除；哪些域名参与随机请在「收件域名」页逐个设置。"
+            description="认领时选「Claude 0 封号」，有历史封号记录的域名禁止认领，其余按 Claude 账号数从少到多分配，每个后缀每天新增有上限。0 封号仅指已观测的历史记录，不保证未来不会封号；哪些域名参与随机请在「收件域名」页逐个设置。"
           >
             <NumberRow
-              label="付费被封排除阈值"
-              description="后缀上付费后被封的地址达到这个数就不再分配。0 表示不按此条排除。"
-              value={draft.claim_random.paidSuspendedLimit}
-              onChange={(v) => patch((s) => void (s.claim_random.paidSuspendedLimit = v))}
-              max={1000}
-              suffix="个"
-            />
-            <NumberRow
-              label="封号率排除阈值"
-              description="后缀上至少 2 个地址被封、且被封地址占 Claude 账号的比例达到这个值就不再分配。0 表示不按此条排除。"
-              value={draft.claim_random.suspendedPercent}
-              onChange={(v) => patch((s) => void (s.claim_random.suspendedPercent = v))}
-              max={100}
-              suffix="%"
-            />
-            <NumberRow
               label="每个后缀每日新增上限"
-              description="近 24 小时新注册的 Claude 账号加新认领、还没收到 Claude 来信的邮箱达到这个数，该后缀当天不再分配；封号最少的后缀都满了就停止，不挪到封号更多的后缀。0 表示不限。"
+              description="近 24 小时新注册的 Claude 账号加新认领、还没收到 Claude 来信的邮箱达到这个数，该后缀当天不再分配；0 封号后缀都满了就停止。0 表示不限。"
               value={draft.claim_random.dailyLimit}
               onChange={(v) => patch((s) => void (s.claim_random.dailyLimit = v))}
               max={1000}

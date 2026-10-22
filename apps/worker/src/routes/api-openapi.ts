@@ -1,6 +1,6 @@
 import { HOSTED_DOMAIN_STATUSES, MAX_BATCH_CLAIM } from '@hpc-mail/shared';
 import {
-  array, bool, changed, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, okResult, operation,
+  array, bool, changed, claimStrategy, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, okResult, operation,
   page, pageQuery, query, ref, scopeQuery, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
 } from './openapi-common.js';
 
@@ -56,7 +56,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/mailboxes': {
       get: operation('List caller-owned mailboxes', array(ref('Mailbox')), { parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator all=1 or true includes all owners; ordinary users cannot request this range.')] }),
       post: operation('Claim an address on a configured domain', ref('Mailbox'), { request: 'ClaimMailboxRequest', status: 201,
-        description: 'Claim only a domain returned by /domains. Existing history at the address becomes visible to the claimant. Ordinary users obey their effective public or dedicated domain/global/per-domain quotas and system reserved-prefix restrictions. Dedicated policies do not revoke existing owned mailboxes. Does not provision a domain or Email Routing.' }),
+        description: 'Claim only a domain returned by /domains. Existing history at the address becomes visible to the claimant. Ordinary users obey their effective public or dedicated domain/global/per-domain quotas and system reserved-prefix restrictions. Dedicated policies do not revoke existing owned mailboxes. Does not provision a domain or Email Routing. Optional strategy=claude rejects any historical Claude suspension with 403 forbidden, including for administrators and hosted domains; checked atomically at insertion. Omitted or uniform preserves ordinary claims.' }),
     },
     '/mailboxes/shared': { get: operation('List inboxes shared with the caller', array(ref('SharedMailbox')), { description: 'Read-only inbound access; no sending, deletion or owner notifications. The read state of shared mail belongs to the owner: readers cannot change it, and it is excluded from their unread count and unread=1 list filter. Stars are personal.' }) },
     '/mailboxes/shares': {
@@ -74,15 +74,15 @@ export function buildSessionOpenApiSpec(origin: string) {
       description: 'JWT only. Returns only id, username and role for active candidates; no account details or mailbox lists. hasMore means refine the search.'
     }) },
     '/mailboxes/batch': { post: operation('Claim several addresses in order', ref('BatchClaimMailboxResult'), { request: 'BatchMailboxRequest',
-      description: 'Same rules as POST /mailboxes, applied to each item in request order. An already-claimed address is skipped into taken and the batch continues; any other error stops the batch, keeps the addresses already claimed and reports stoppedBy with the remaining items in notAttempted.' }) },
+      description: 'Same rules as POST /mailboxes, applied to each item in request order. Each item accepts optional strategy; claude rechecks current suspension facts inside the write transaction and stops with forbidden when a domain has any historical suspension. An already-claimed address is skipped into taken and the batch continues; any other error stops the batch, keeps the addresses already claimed and reports stoppedBy with the remaining items in notAttempted.' }) },
     '/mailboxes/availability/batch': { post: operation('Check availability of several addresses', array(ref('MailboxAvailability')), { request: 'BatchMailboxRequest',
       description: 'Advisory only, same rules as GET /mailboxes/availability. Results follow request order.' }) },
     '/mailboxes/random-plan': { get: operation('Allocate random suffixes for a batch claim', ref('ClaimPlan'), {
       parameters: [query('count', { type: 'integer', minimum: 1, maximum: MAX_BATCH_CLAIM }, 'Number of addresses to allocate.', true),
-        query('strategy', { type: 'string', enum: ['uniform', 'claude'] }, 'uniform: equal chance among eligible domains; claude: fewest Claude suspensions first, then fewest Claude accounts plus pending claims, spread evenly.', true)],
-      description: 'JWT only. Read-only: allocates domains, does not claim or reserve. Candidates are the domains the caller may claim with domains.list[].random true, trimmed by per-domain and per-user remaining quota. The claude strategy also excludes domains with claim_random risk (wiped, paid_suspended or suspended_rate), skips domains whose additions in the last 24 hours reached claim_random.dailyLimit (stopping rather than moving to domains with more suspensions), and reports how many Claude suspensions each allocated domain has. Generate prefixes, then check availability and claim with the batch endpoints.' }) },
-    '/mailboxes/availability': { get: operation('Check mailbox availability', ref('MailboxAvailability'), { parameters: [query('localPart', str, undefined, true), query('domain', str, undefined, true)],
-      description: 'Advisory only, not a reservation. Same rules as claiming; when available=false, reason is taken, reserved, quota, domain_limit or domain_unavailable. Claim still re-checks everything.' }) },
+        query('strategy', { type: 'string', enum: ['uniform', 'claude'] }, 'uniform: equal chance among eligible domains; claude: only zero-suspension domains, balanced by Claude accounts plus pending claims.', true)],
+      description: 'JWT only. Read-only: allocates domains, does not claim or reserve. Candidates are the domains the caller may claim with domains.list[].random true, trimmed by per-domain and per-user remaining quota. The claude strategy excludes every domain with any historical Claude suspension from both items and pool, regardless of paid status or deprecated thresholds. It balances accounts plus recent pending claims and stops at claim_random.dailyLimit or claim quotas without spilling over to suspended domains. Generate prefixes, then pass strategy=claude on each item for availability and actual claims, including after manual suffix changes. Claims atomically recheck suspension facts; a plan does not reserve eligibility.' }) },
+    '/mailboxes/availability': { get: operation('Check mailbox availability', ref('MailboxAvailability'), { parameters: [query('localPart', str, undefined, true), query('domain', str, undefined, true), query('strategy', claimStrategy)],
+      description: 'Advisory only, not a reservation. Same rules as claiming; when available=false, reason is taken, reserved, quota, domain_limit, domain_unavailable or claude_suspended. Claim still re-checks everything.' }) },
     '/mailboxes/{id}': {
       put: operation('Set mailbox display name', ref('Mailbox'), { request: 'UpdateMailboxRequest', description: 'Mailbox owner or administrator only.' }),
       delete: operation('Release mailbox ownership', object({ success: bool, deletedMessages: int }), { parameters: [query('deleteHistory', { type: 'string', enum: ['1', 'true', '0', 'false'] })],

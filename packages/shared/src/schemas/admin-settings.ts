@@ -64,7 +64,7 @@ export const securitySettingSchema = z.object({
  * 单个系统域名条目。
  * - `public`：是否对普通用户开放（可见 + 可认领）。默认 false = 仅管理员可用。
  * - `perUserLimit`：普通用户在**该域名**下最多可认领的地址数（0=不限，仅受全局 mailbox_policy.perUserLimit 约束）；管理员豁免。
- * - `random`：是否参与认领弹窗的随机后缀（均匀随机与 Claude 低风险两种模式）。缺省视为参与；false 时只能手动选择。
+ * - `random`：是否参与认领弹窗的随机后缀（均匀随机与 Claude 0 封号两种模式）。缺省视为参与；false 时只能手动选择。
  * preprocess：兼容历史存储的纯字符串形态（`"example.com"` → `{ domain: "example.com" }`），
  * 老数据升级后自动落到 public=false（默认仅管理员），不影响存量已认领地址。
  */
@@ -110,15 +110,15 @@ export const mailboxPolicySettingSchema = z.object({
 });
 
 /**
- * 随机认领规则（Claude 低风险模式）：按后缀的 Claude 账号与封号统计分配随机后缀。
- * 全军覆没（账号全被封或付费号全被封）的后缀始终排除；哪些域名参与随机由 domains.list[].random 决定。
+ * 随机认领规则（Claude 0 封号模式）：仅在没有历史封号记录的域名中按账号负载分配。
+ * 任意封号记录始终排除；哪些域名参与随机由 domains.list[].random 决定。
  */
 export const claimRandomSettingSchema = z.object({
-  /** 付费被封数达到该值的后缀也排除（0=不按此条排除） */
+  /** @deprecated 仅保留配置解析与存储兼容，不影响零封号准入 */
   paidSuspendedLimit: z.number().int().min(0).max(1000).default(2),
   /** 近 N 天认领、尚未收到 Claude 来信的邮箱计入后缀账号负载（0=不计） */
   pendingDays: z.number().int().min(0).max(90).default(7),
-  /** 封号数至少 2 且封号率（封号数 / 账号数）达到该百分比的后缀也排除（0=不按此条排除） */
+  /** @deprecated 仅保留配置解析与存储兼容，不影响零封号准入 */
   suspendedPercent: z.number().int().min(0).max(100).default(50),
   /** 每个后缀近 24 小时新增（新注册的 Claude 账号 + 新认领的未注册邮箱）达到该数后当天不再分配（0=不限） */
   dailyLimit: z.number().int().min(0).max(1000).default(3),
@@ -260,8 +260,8 @@ export interface DomainClaudeStats {
   pending: number;
   /** 近 24 小时新增：新注册的 Claude 账号 + 新认领、还没收到 Claude 来信的邮箱；达到 claim_random.dailyLimit 当天不再分配 */
   recent: number;
-  /** wiped：全军覆没；paid_suspended：付费被封达到阈值；suspended_rate：封号率达到阈值；都会被 Claude 低风险模式排除 */
-  risk: 'wiped' | 'paid_suspended' | 'suspended_rate' | null;
+  /** suspended：存在任意历史封号，Claude 0 封号模式排除；旧值仅为兼容保留 */
+  risk: 'suspended' | 'wiped' | 'paid_suspended' | 'suspended_rate' | null;
 }
 
 /** 公开配置（无鉴权 GET /api/config） */

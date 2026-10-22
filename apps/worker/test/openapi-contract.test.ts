@@ -31,6 +31,25 @@ describe('OpenAPI routes and public contracts', () => {
       expect(specs.api.paths[path]!.post!.requestBody).toMatchObject({ content: { 'application/json': { schema: { $ref: '#/components/schemas/BatchMailboxRequest' } } } });
     }
   });
+  it('publishes the optional zero-suspension strategy consistently in JWT and API Key requests', () => {
+    for (const spec of Object.values(specs)) {
+      const request = spec.components.schemas.ClaimMailboxRequest!;
+      expect((request.properties as Record<string, Schema>).strategy).toMatchObject({ enum: ['uniform', 'claude'] });
+      expect(request.required).not.toContain('strategy');
+      const params = spec.paths['/mailboxes/availability']!.get!.parameters as Array<{ name: string; required: boolean; schema: Schema }>;
+      expect(params.find((param) => param.name === 'strategy')).toMatchObject({ required: false, schema: { enum: ['uniform', 'claude'] } });
+      expect((spec.components.schemas.MailboxAvailability!.properties as Record<string, Schema>).reason!.enum).toContain('claude_suspended');
+    }
+    const batchItem = ((specs.api.components.schemas.BatchMailboxRequest!.properties as Record<string, Schema>).items!.items as Schema);
+    expect((batchItem.properties as Record<string, Schema>).strategy).toMatchObject({ enum: ['uniform', 'claude'] });
+    const risk = (specs.api.components.schemas.DomainClaudeStats!.properties as Record<string, Schema>).risk!;
+    expect(risk).toMatchObject({ anyOf: [{ enum: expect.arrayContaining(['suspended']) }, { type: 'null' }] });
+    const settings = specs.api.components.schemas.Settings!;
+    const rules = (settings.properties as Record<string, Schema>).claim_random!.properties as Record<string, Schema>;
+    expect(rules.paidSuspendedLimit!.deprecated).toBe(true);
+    expect(rules.suspendedPercent!.deprecated).toBe(true);
+  });
+
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
     const mounted = [...new Set(app.routes.filter(route => methods.has(route.method.toLowerCase()) && !route.path.includes('*'))
       .map(route => `${route.method} ${route.path.replace(/\/$/, '').replace(/:([^/]+)/g, '{$1}')}`))].sort();
@@ -141,7 +160,7 @@ describe('OpenAPI routes and public contracts', () => {
       expect(readAll.content['application/json']!.schema).toEqual({ $ref: '#/components/schemas/MarkAllReadRequest' });
       expect(Object.keys(spec.components.schemas.MarkAllReadRequest!.properties as Schema).sort()).toEqual(['address', 'domain', 'q', 'scope']);
       const availability = spec.components.schemas.MailboxAvailability!;
-      expect(((availability.properties as Record<string, Schema>).reason!).enum).toEqual(['taken', 'reserved', 'quota', 'domain_limit', 'domain_unavailable']);
+      expect(((availability.properties as Record<string, Schema>).reason!).enum).toEqual(['taken', 'reserved', 'quota', 'domain_limit', 'domain_unavailable', 'claude_suspended']);
       expect(availability.required).toEqual(['address', 'available']);
       expect(spec.components.schemas).not.toHaveProperty('MutationScopeRequest');
     }

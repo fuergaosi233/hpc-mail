@@ -1,10 +1,10 @@
 import { onlineManager, QueryClient, type QueryClientConfig, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ClaimPlan, SessionUser } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { CurrentUserContext } from '@/lib/use-session';
-type Draft = { localPart: string; domain: string };
+type Draft = { localPart: string; domain: string; strategy?: 'uniform' | 'claude' };
 const mocks = vi.hoisted(() => {
   /** 后端给每个地址分配的邮箱 id：同一地址固定，用来核对共享时提交的 mailboxIds */
   const ids = new Map<string, number>();
@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => {
   const claimOne = vi.fn(async (body: Draft) => mailbox(body));
   /** 后端对单个地址的可用性结果：单个与批量查询共用 */
   const availableOf = vi.fn(
-    async (_localPart = '', _domain = ''): Promise<{ available: boolean; reason?: string }> => ({ available: true }),
+    async (_localPart = '', _domain = '', _strategy?: Draft['strategy']): Promise<{ available: boolean; reason?: string }> => ({ available: true }),
   );
   return {
     selectContentRender: vi.fn(),
@@ -51,8 +51,8 @@ const mocks = vi.hoisted(() => {
       }
       return result;
     }),
-    availability: vi.fn((localPart: string, domain: string) => availableOf(localPart, domain)),
-    batchAvailability: vi.fn((items: Draft[]) => Promise.all(items.map((item) => availableOf(item.localPart, item.domain)))),
+    availability: vi.fn((localPart: string, domain: string, strategy?: Draft['strategy']) => availableOf(localPart, domain, strategy)),
+    batchAvailability: vi.fn((items: Draft[]) => Promise.all(items.map((item) => availableOf(item.localPart, item.domain, item.strategy)))),
     /** 后端随机后缀分配：默认按 a/b/c 轮流分配、都没有封号记录 */
     randomPlan: vi.fn(async (count: number, strategy: 'uniform' | 'claude') => ({
       strategy,
@@ -178,7 +178,7 @@ describe('随机生成与认领成功', () => {
     fireEvent.click(screen.getByRole('button', { name: '随机生成' }));
     const value = (screen.getByLabelText('前缀') as HTMLInputElement).value;
     expect(value).toMatch(/^[a-z][a-z2-9]{7}$/);
-    await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(value, 'example.com'));
+    await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(value, 'example.com', undefined));
     client.clear();
   });
 
@@ -552,17 +552,56 @@ describe('随机后缀模式', () => {
   /** 等后端分配返回、各行换成指定的域名 */
   const waitRows = (domains: string[]) => waitFor(() => expect(rowDomains()).toEqual(domains));
 
-  it('只有一个可见域名时没有模式选项，行尾直接显示域名', () => {
+  it('单域用户也能选择 Claude，默认固定后缀，行尾直接显示域名', () => {
     const { client } = renderDialog(['only.test']);
-    expect(screen.queryByRole('radiogroup', { name: '随机后缀模式' })).toBeNull();
+    expect(screen.getByRole('radiogroup', { name: '随机后缀模式' })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: '固定后缀' })).toHaveAttribute('aria-checked', 'true');
+    selectMode('Claude 0 封号');
+    expect(screen.getByRole('radio', { name: 'Claude 0 封号' })).toHaveAttribute('aria-checked', 'true');
     expect(screen.queryByRole('combobox')).toBeNull();
     expect(screen.getByText('only.test')).toBeInTheDocument();
     client.clear();
   });
 
+  it('单域有封号时，Claude 可用性查询带策略并拦截认领提交', async () => {
+    mocks.availableOf.mockImplementation(async (_localPart, _domain, strategy) =>
+      strategy === 'claude' ? { available: false, reason: 'claude_suspended' } : { available: true });
+    const { client } = renderDialog(['only.test']);
+    try {
+      randomize();
+      await screen.findByText(/可以认领$/);
+      const localPart = prefixes()[0];
+      selectMode('Claude 0 封号');
+      expect(await screen.findByText('该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领')).toBeInTheDocument();
+      expect(mocks.availability).toHaveBeenLastCalledWith(localPart, 'only.test', 'claude');
+      expect(screen.getByRole('button', { name: '认领' })).toBeDisabled();
+      fireEvent.submit(screen.getByLabelText('前缀').closest('form')!);
+      expect(mocks.claim).not.toHaveBeenCalled();
+      expect(mocks.batchClaim).not.toHaveBeenCalled();
+    } finally {
+      mocks.availableOf.mockImplementation(async () => ({ available: true }));
+      client.clear();
+    }
+  });
+
+  it('单域无封号时，Claude 查询和实际认领都带策略', async () => {
+    const onOpenChange = vi.fn();
+    const { client } = renderDialog(['only.test'], onOpenChange);
+    randomize();
+    await screen.findByText(/可以认领$/);
+    const localPart = prefixes()[0];
+    selectMode('Claude 0 封号');
+    await waitFor(() => expect(mocks.availability).toHaveBeenLastCalledWith(localPart, 'only.test', 'claude'));
+    await screen.findByText(`${localPart}@only.test 可以认领`);
+    fireEvent.click(screen.getByRole('button', { name: '认领' }));
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(mocks.claim).toHaveBeenCalledExactlyOnceWith({ localPart, domain: 'only.test', strategy: 'claude' });
+    client.clear();
+  });
+
   it('有多个可见域名时出现三种模式，默认固定后缀', () => {
     const { client } = renderDialog(DOMAINS);
-    expect(screen.getAllByRole('radio').map((radio) => radio.textContent)).toEqual(['固定后缀', '均匀随机', 'Claude 低风险']);
+    expect(screen.getAllByRole('radio').map((radio) => radio.textContent)).toEqual(['固定后缀', '均匀随机', 'Claude 0 封号']);
     expect(screen.getByRole('radio', { name: '固定后缀' })).toHaveAttribute('aria-checked', 'true');
     expect(screen.getByText('都用当前选择的域名')).toBeInTheDocument();
     client.clear();
@@ -611,7 +650,7 @@ describe('随机后缀模式', () => {
     const values = prefixes();
     values.forEach((value) => expect(value).toMatch(RANDOM));
     expect(new Set(values).size).toBe(3);
-    await waitFor(() => expect(mocks.availableOf).toHaveBeenCalledWith(values[1], 'c.test'));
+    await waitFor(() => expect(mocks.availableOf).toHaveBeenCalledWith(values[1], 'c.test', undefined));
     expect(mocks.claim).not.toHaveBeenCalled();
     expect(mocks.batchClaim).not.toHaveBeenCalled();
     client.clear();
@@ -683,7 +722,7 @@ describe('随机后缀模式', () => {
     await pickDomainOfRow(2, 'c.test');
     expect(rowDomains()).toEqual(['a.test', 'c.test', 'c.test']);
     const typed = prefixes();
-    await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(typed[1], 'c.test'));
+    await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(typed[1], 'c.test', undefined));
     fireEvent.click(screen.getByRole('button', { name: '认领 3 个' }));
     await screen.findByText('已认领 3 个地址');
     expect(mocks.batchClaim).toHaveBeenCalledWith([
@@ -787,39 +826,147 @@ describe('随机后缀模式', () => {
   });
 
   it('关闭再打开后，模式恢复为固定后缀', async () => {
-    mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['b.test', 3], ['a.test', 0]]));
+    mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['b.test', 0]], { shortfall: 1, reason: 'daily_limit' }));
     const { client, view } = renderDialog(DOMAINS);
-    selectMode('Claude 低风险');
+    selectMode('Claude 0 封号');
     setCount('2');
     randomize();
-    expect(await screen.findByText('其中 1 个落在有封号记录的后缀')).toBeInTheDocument();
+    expect(await screen.findByText(/0 封号后缀今天的新增名额已用完/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '取消' }));
     expect(screen.getByRole('radio', { name: '固定后缀' })).toHaveAttribute('aria-checked', 'true');
-    expect(screen.queryByText('其中 1 个落在有封号记录的后缀')).toBeNull();
+    expect(screen.queryByText(/0 封号后缀今天的新增名额已用完/)).toBeNull();
     view.unmount();
     client.clear();
   });
 
-  describe('Claude 低风险', () => {
-    it('按个数向后端要 Claude 分配，有封号记录的后缀在行内标出并统计个数', async () => {
-      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0], ['b.test', 2], ['c.test', 0], ['b.test', 2]]));
+  describe('Claude 0 封号', () => {
+    it.each([1, 2])('已有 %i 行切 Claude 后重新检查 strategy，不复用普通模式可用缓存', async (count) => {
+      mocks.availableOf.mockImplementation(async (_localPart, _domain, strategy) =>
+        strategy === 'claude' ? { available: false, reason: 'claude_suspended' } : { available: true });
+      const { client } = renderDialog(DOMAINS, vi.fn(), { defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+      try {
+        setCount(String(count));
+        randomize();
+        await waitFor(() => expect(screen.getAllByText(/可以认领$/)).toHaveLength(count));
+        const drafts = prefixes().map((localPart) => ({ localPart, domain: 'a.test', strategy: 'claude' }));
+        selectMode('Claude 0 封号');
+        await waitFor(() => expect(screen.getAllByText('该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领')).toHaveLength(count));
+        if (count === 1) expect(mocks.availability).toHaveBeenCalledWith(drafts[0]!.localPart, 'a.test', 'claude');
+        else expect(mocks.batchAvailability).toHaveBeenCalledWith(drafts);
+        expect(screen.queryByText(/可以认领$/)).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: count === 1 ? '认领' : `认领 ${count} 个` })).toBeDisabled();
+        selectMode('固定后缀');
+        await waitFor(() => expect(screen.getAllByText(/可以认领$/)).toHaveLength(count));
+        expect(screen.queryByText(/不能在 Claude 0 封号模式下认领/)).not.toBeInTheDocument();
+      } finally {
+        mocks.availableOf.mockImplementation(async () => ({ available: true }));
+        client.clear();
+      }
+    });
+
+    it.each([1, 2])('%i 行手改为封号后缀后，可用性带 strategy 并阻止提交', async (count) => {
+      mocks.availableOf.mockImplementation(async (_localPart, domain, strategy) =>
+        strategy === 'claude' && domain === 'b.test' ? { available: false, reason: 'claude_suspended' } : { available: true });
+      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', Array.from({ length: count }, () => ['a.test', 0])));
       const { client } = renderDialog(DOMAINS);
-      selectMode('Claude 低风险');
-      expect(screen.getByText('排除高风险后缀，按 Claude 封号数、账号数从少到多分配，每个后缀每天限量')).toBeInTheDocument();
-      setCount('4');
+      try {
+        selectMode('Claude 0 封号');
+        setCount(String(count));
+        randomize();
+        await waitFor(() => expect(screen.getAllByText(/可以认领$/)).toHaveLength(count));
+        fireEvent.click(screen.getByRole('combobox', { name: count === 1 ? '域名' : '域名 1' }));
+        fireEvent.click(within(await screen.findByRole('listbox')).getByRole('option', { name: 'b.test' }));
+        expect(await screen.findByText('该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领')).toBeInTheDocument();
+        expect(mocks.availability).toHaveBeenLastCalledWith(prefixes()[0], 'b.test', 'claude');
+        expect(screen.getByRole('button', { name: count === 1 ? '认领' : `认领 ${count} 个` })).toBeDisabled();
+        fireEvent.submit(screen.getByLabelText('随机生成个数').closest('form')!);
+        expect(mocks.claim).not.toHaveBeenCalled();
+        expect(mocks.batchClaim).not.toHaveBeenCalled();
+      } finally {
+        mocks.availableOf.mockImplementation(async () => ({ available: true }));
+        client.clear();
+      }
+    });
+
+    it.each([1, 2])('%i 行手改域名后实际提交仍带 strategy，让服务端拒绝检查后新增的封号', async (count) => {
+      const rejection = new ApiError('该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领', { code: 'forbidden', httpStatus: 403 });
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 0 封号');
+      setCount(String(count));
       randomize();
-      await waitRows(['a.test', 'b.test', 'c.test', 'b.test']);
-      expect(mocks.randomPlan).toHaveBeenCalledWith(4, 'claude');
-      const badges = screen.getAllByText('封 2');
-      expect(badges).toHaveLength(2);
-      expect(badges[0]).toHaveAttribute('title', '该后缀历史上有 2 个地址收到 Claude 封号信');
-      expect(screen.getByText('其中 2 个落在有封号记录的后缀')).toBeInTheDocument();
+      await waitFor(() => expect(screen.getAllByText(/可以认领$/)).toHaveLength(count));
+      fireEvent.click(screen.getByRole('combobox', { name: count === 1 ? '域名' : '域名 1' }));
+      fireEvent.click(within(await screen.findByRole('listbox')).getByRole('option', { name: 'c.test' }));
+      await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(prefixes()[0], 'c.test', 'claude'));
+      const expected = prefixes().map((localPart, index) => ({ localPart, domain: rowDomains()[index], strategy: 'claude' }));
+      if (count === 1) mocks.claim.mockRejectedValueOnce(rejection);
+      else mocks.batchClaim.mockRejectedValueOnce(rejection);
+      fireEvent.click(screen.getByRole('button', { name: count === 1 ? '认领' : `认领 ${count} 个` }));
+      expect(await screen.findByRole('alert')).toHaveTextContent(rejection.message);
+      if (count === 1) expect(mocks.claim).toHaveBeenCalledExactlyOnceWith(expected[0]);
+      else expect(mocks.batchClaim).toHaveBeenCalledExactlyOnceWith(expected);
+      client.clear();
+    });
+
+    it('批量部分失败返回修改后，单项重试仍带 strategy', async () => {
+      mocks.claimOne.mockRejectedValueOnce(new ApiError('该地址已被占用', { code: 'address_taken', httpStatus: 409 }));
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 0 封号');
+      setCount('2');
+      randomize();
+      await waitFor(() => expect(screen.getAllByText(/可以认领$/)).toHaveLength(2));
+      const localPart = prefixes()[0];
+      fireEvent.click(screen.getByRole('button', { name: '认领 2 个' }));
+      await screen.findByText('已认领 1 个地址，还有 1 个未认领');
+      fireEvent.click(screen.getByRole('button', { name: '返回修改' }));
+      await waitFor(() => expect(mocks.availability).toHaveBeenCalledWith(localPart, 'a.test', 'claude'));
+      fireEvent.click(screen.getByRole('button', { name: '认领' }));
+      await waitFor(() => expect(mocks.claim).toHaveBeenCalledWith({ localPart, domain: 'a.test', strategy: 'claude' }));
+      client.clear();
+    });
+
+    it('规划途中切换模式后，旧规划不覆盖新列表或提前结束新规划', async () => {
+      let finishOld!: (value: ReturnType<typeof planOf>) => void;
+      let finishNew!: (value: ReturnType<typeof planOf>) => void;
+      mocks.randomPlan.mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve; }));
+      mocks.randomPlan.mockImplementationOnce(() => new Promise((resolve) => { finishNew = resolve; }));
+      const { client } = renderDialog(DOMAINS);
+      fireEvent.change(screen.getByLabelText('前缀'), { target: { value: 'previous' } });
+      selectMode('均匀随机');
+      setCount('2');
+      randomize();
+      selectMode('Claude 0 封号');
+      expect(screen.getByRole('radio', { name: 'Claude 0 封号' })).toHaveAttribute('aria-checked', 'true');
+      randomize();
+      await act(async () => finishOld(planOf('uniform', [['b.test', 0], ['b.test', 0]])));
+      expect(prefixes()).toEqual(['previous']);
+      expect(screen.getByRole('button', { name: /随机生成/ })).toBeDisabled();
+      await act(async () => finishNew(planOf('claude', [['c.test', 0], ['c.test', 0]])));
+      await waitRows(['c.test', 'c.test']);
+      expect(screen.getByRole('button', { name: '随机生成' })).toBeEnabled();
+      client.clear();
+    });
+
+    it('按个数向后端要 Claude 分配，批量可用性与实际提交均带 strategy', async () => {
+      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0], ['c.test', 0]]));
+      const { client } = renderDialog(DOMAINS);
+      selectMode('Claude 0 封号');
+      expect(screen.getByText(/有历史 Claude 封号记录的域名禁止认领/)).toHaveTextContent('不保证未来不会封号');
+      setCount('2');
+      randomize();
+      await waitRows(['a.test', 'c.test']);
+      expect(mocks.randomPlan).toHaveBeenCalledWith(2, 'claude');
+      const expected = prefixes().map((localPart, index) => ({ localPart, domain: rowDomains()[index], strategy: 'claude' }));
+      await waitFor(() => expect(mocks.batchAvailability).toHaveBeenCalledWith(expected));
+      fireEvent.click(screen.getByRole('button', { name: '认领 2 个' }));
+      await screen.findByText('已认领 2 个地址');
+      expect(mocks.batchClaim).toHaveBeenCalledExactlyOnceWith(expected);
       client.clear();
     });
 
     it('全部落在 0 封号后缀时不显示风险提示', async () => {
       const { client } = renderDialog(DOMAINS);
-      selectMode('Claude 低风险');
+      selectMode('Claude 0 封号');
       setCount('3');
       randomize();
       await waitRows(['a.test', 'b.test', 'c.test']);
@@ -831,7 +978,7 @@ describe('随机后缀模式', () => {
     it('额度不足只分到一部分时，按分到的个数生成并说明', async () => {
       mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0], ['c.test', 0]], { shortfall: 3, reason: 'quota' }));
       const { client } = renderDialog(DOMAINS);
-      selectMode('Claude 低风险');
+      selectMode('Claude 0 封号');
       setCount('5');
       randomize();
       await waitRows(['a.test', 'c.test']);
@@ -839,27 +986,27 @@ describe('随机后缀模式', () => {
       client.clear();
     });
 
-    it('低风险后缀今天的名额或每域名额用完时说明原因', async () => {
+    it('0 封号后缀今天的名额或每域名额用完时说明原因', async () => {
       mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0]], { shortfall: 2, reason: 'daily_limit' }));
       const { client } = renderDialog(DOMAINS);
-      selectMode('Claude 低风险');
+      selectMode('Claude 0 封号');
       setCount('3');
       randomize();
       await waitRows(['a.test']);
-      expect(screen.getByText('低风险后缀今天的新增名额已用完，只分配了 1 个，可稍后再试或手动选择域名')).toBeInTheDocument();
+      expect(screen.getByText('0 封号后缀今天的新增名额已用完，只分配了 1 个，可稍后再试')).toBeInTheDocument();
       mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [], { shortfall: 3, reason: 'domain_quota' }));
       randomize();
-      expect(await screen.findByText('可选后缀的每域名额已用完，可手动选择其他域名')).toBeInTheDocument();
+      expect(await screen.findByText('可选后缀的每域名额已用完；有历史封号记录的域名在此模式下禁止认领')).toBeInTheDocument();
       client.clear();
     });
 
-    it('没有可用的低风险后缀时保留现有的行，提示手动选择', async () => {
-      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [], { pool: DOMAINS, shortfall: 2, reason: 'no_candidates' }));
+    it('没有可分配的 0 封号后缀时保留现有行，并明确封号域在此模式禁止认领', async () => {
+      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [], { pool: [], shortfall: 2, reason: 'no_candidates' }));
       const { client } = renderDialog(DOMAINS);
-      selectMode('Claude 低风险');
+      selectMode('Claude 0 封号');
       setCount('2');
       randomize();
-      expect(await screen.findByText('没有可用于 Claude 的低风险后缀，可手动选择域名')).toBeInTheDocument();
+      expect(await screen.findByText('没有可分配的 Claude 0 封号后缀；有历史封号记录的域名在此模式下禁止认领')).toBeInTheDocument();
       expect(rowDomains()).toEqual(['a.test']);
       client.clear();
     });
@@ -867,7 +1014,7 @@ describe('随机后缀模式', () => {
     it('分配请求失败时显示原因，不改动现有的行', async () => {
       mocks.randomPlan.mockRejectedValueOnce(new ApiError('服务暂时不可用', { code: 'internal', httpStatus: 500 }));
       const { client } = renderDialog(DOMAINS);
-      selectMode('Claude 低风险');
+      selectMode('Claude 0 封号');
       setCount('3');
       randomize();
       expect(await screen.findByRole('alert')).toHaveTextContent('服务暂时不可用');
@@ -879,7 +1026,7 @@ describe('随机后缀模式', () => {
       let resolve: (value: ReturnType<typeof planOf>) => void = () => {};
       mocks.randomPlan.mockImplementationOnce(() => new Promise((done) => (resolve = done)));
       const { client } = renderDialog(DOMAINS);
-      selectMode('Claude 低风险');
+      selectMode('Claude 0 封号');
       setCount('2');
       randomize();
       // 加载中按钮名带上转圈的「加载中」
@@ -893,9 +1040,9 @@ describe('随机后缀模式', () => {
     });
 
     it('单个重新随机只换前缀、保留分配好的后缀，不再请求后端', async () => {
-      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0], ['c.test', 1]]));
+      mocks.randomPlan.mockResolvedValueOnce(planOf('claude', [['a.test', 0], ['c.test', 0]]));
       const { client } = renderDialog(DOMAINS);
-      selectMode('Claude 低风险');
+      selectMode('Claude 0 封号');
       setCount('2');
       randomize();
       await waitRows(['a.test', 'c.test']);
@@ -903,7 +1050,7 @@ describe('随机后缀模式', () => {
       for (let i = 0; i < 10; i++) fireEvent.click(screen.getByRole('button', { name: '重新随机第 2 个' }));
       await waitFor(() => expect(prefixes()[1]).not.toBe(second));
       expect(rowDomains()).toEqual(['a.test', 'c.test']);
-      expect(screen.getByText('封 1')).toBeInTheDocument();
+      await waitFor(() => expect(mocks.availableOf).toHaveBeenLastCalledWith(prefixes()[1], 'c.test', 'claude'));
       expect(mocks.randomPlan).toHaveBeenCalledTimes(1);
       client.clear();
     });
