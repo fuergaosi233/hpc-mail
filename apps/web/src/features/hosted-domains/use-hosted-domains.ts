@@ -1,5 +1,6 @@
 import { type QueryClient, queryOptions, useQuery } from '@tanstack/react-query';
 import type { HostedDnsRecord, HostedDomain, HostedDomainStatus } from '@hpc-mail/shared';
+import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { hostedDomainApi } from './hosted-domains-api';
 
@@ -61,7 +62,21 @@ export function useHostedDnsRecordsQuery(id: number) {
   return useQuery({
     queryKey: queryKeys.hostedDomains.dnsRecords(id),
     queryFn: () => hostedDomainApi.dnsRecords(id),
+    // 每次请求都计入解析限流并可能等待 Cloudflare 超时，失败后由用户手动重试
+    retry: false,
   });
+}
+
+/**
+ * 解析写操作失败后按错误码刷新：记录已不存在或冲突时列表过期；forbidden 多半是域名刚被暂停或权限变化，
+ * 连同域名详情一起刷新；internal 与超时时 Cloudflare 可能已经写入，结果不确定
+ */
+export function refreshAfterDnsWriteError(client: QueryClient, domainId: number, error: unknown): void {
+  if (!(error instanceof ApiError)) return;
+  if (error.code === 'forbidden') void client.invalidateQueries({ queryKey: queryKeys.hostedDomains.detail(domainId) });
+  if (['not_found', 'conflict', 'forbidden', 'internal', 'timeout'].includes(error.code)) {
+    void client.invalidateQueries({ queryKey: queryKeys.hostedDomains.dnsRecords(domainId) });
+  }
 }
 
 const byCodePoint = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);

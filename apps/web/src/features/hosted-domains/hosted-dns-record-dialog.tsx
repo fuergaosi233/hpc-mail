@@ -13,7 +13,6 @@ import {
   hostedDnsRecordInputSchema,
 } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
-import { queryKeys } from '@/api/query-keys';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
 import { FormField } from '@/components/ui/form-field';
@@ -23,7 +22,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { toast } from '@/components/ui/toast';
 import { HOSTED_DNS_TTL_OPTIONS, HOSTED_DNS_TYPE_HINTS, formatDnsTtl } from './hosted-dns-meta';
 import { hostedDomainApi } from './hosted-domains-api';
-import { storeDnsRecord } from './use-hosted-domains';
+import { refreshAfterDnsWriteError, storeDnsRecord } from './use-hosted-domains';
 
 type CaaTag = (typeof HOSTED_DNS_CAA_TAGS)[number];
 
@@ -159,10 +158,7 @@ export function HostedDnsRecordDialog({
     },
     onError: (error) => {
       setFormError(error instanceof ApiError ? error.message : '保存失败，请重试');
-      // 记录已被删除或与他处新增的记录冲突：列表已过期，重拉一次
-      if (error instanceof ApiError && (error.code === 'not_found' || error.code === 'conflict')) {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.hostedDomains.dnsRecords(domain.id) });
-      }
+      refreshAfterDnsWriteError(queryClient, domain.id, error);
     },
   });
 
