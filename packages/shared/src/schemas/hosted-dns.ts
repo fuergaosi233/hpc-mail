@@ -82,7 +82,14 @@ export function hostedDnsRelativeName(fqdn: string, domain: string): string {
   return value.endsWith(`.${domain}`) ? value.slice(0, -domain.length - 1) : value;
 }
 
-const isSpf = (content: string) => /^v=spf1(\s|$)/i.test(content.replace(/"/g, '').trim());
+/** TXT 的多段字符串在解析时直接拼接："v=sp" "f1 -all" 等同于 v=spf1 -all */
+function txtValue(content: string): string {
+  const value = content.trim();
+  if (!value.startsWith('"')) return value;
+  return [...value.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((match) => match[1]).join('');
+}
+
+const isSpf = (content: string) => /^v=spf1(\s|$)/i.test(txtValue(content).trim());
 
 /**
  * 邮箱收发占用的记录：返回只读原因，其他记录返回空串。

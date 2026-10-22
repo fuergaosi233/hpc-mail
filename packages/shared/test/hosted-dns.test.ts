@@ -29,6 +29,11 @@ describe('与邮箱冲突的记录', () => {
     expect(reason('MX', '@')).toContain('MX');
     expect(reason('TXT', '@', '"v=spf1 include:_spf.mx.cloudflare.net ~all"')).toContain('SPF');
     expect(reason('TXT', '@', 'V=SPF1 -all')).toContain('SPF');
+    // 多段字符串解析时直接拼接，拆开写也是 SPF
+    expect(reason('TXT', '@', '"v=sp" "f1 include:other.example ~all"')).toContain('SPF');
+    expect(reason('TXT', '@', ' "v=spf1" ')).toContain('SPF');
+    expect(reason('TXT', '@', '"v=spf10 x"')).toBe('');
+    expect(reason('TXT', '@', '"hello" "v=spf1"')).toBe('');
     expect(reason('TXT', '_dmarc', 'v=DMARC1; p=none')).toContain('DMARC');
     expect(reason('A', '_dmarc', '1.2.3.4')).toContain('DMARC');
     expect(reason('TXT', 'cf2024-1._domainkey', 'v=DKIM1')).toContain('DKIM');
