@@ -103,7 +103,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 
 ## 用户托管域名
 
-`GET /api/config` 的 `hostedDomainsEnabled` 为 true 时，任何登录用户都能把自己的域名托管到本站（JWT 专用，Key 无对应接口）。域名只用于邮箱：站点在站长的 Cloudflare 账户建 zone，用户在注册商把 NS 改成返回的两条，原有网站等 DNS 记录不会迁移。
+`GET /api/config` 的 `hostedDomainsEnabled` 为 true 时，任何登录用户都能把自己的域名托管到本站（JWT 专用，Key 无对应接口）。站点在站长的 Cloudflare 账户建 zone，用户在注册商把 NS 改成返回的两条。原 DNS 服务商的记录不会自动迁移，网站、域名验证等常用记录用下文的 [DNS 解析](#托管域名的-dns-解析) 接口补建，最好在改 NS 之前补好。
 
 | 路径（JWT `/api`） | 说明 |
 |---|---|
@@ -116,6 +116,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 | `DELETE /hosted-domains/:id/members/:userId` | 移除成员；成员传自己的 id 即退出共享。已认领的地址保留 |
 | `POST /hosted-domains/:id/transfer` | `{userId,expectedOwnerId,includeMailboxes}`；`includeMailboxes:true` 连同原所有者在该域的地址与全部历史一起过户。调用者过户后失去权限时返回 `domain:null` |
 | `DELETE /hosted-domains/:id` | 不可逆：立即拒收，随后永久删除该域全部邮件、释放全部地址并删除 zone。先在注册商把 NS 改回 `originalNameServers` |
+| `/hosted-domains/:id/dns-records…` | 所有者或管理员管理 DNS 解析，见 [托管域名的 DNS 解析](#托管域名的-dns-解析) |
 
 状态：`pending` 等待改 NS → NS 生效后系统自动开通收件与发信（`provisioning`）→ `active`。`error` 为开通或巡检未通过（自动重试），`moved` 为 NS 已不再指向本站，`suspended` 为管理员暂停（拒收、禁止发信与新认领），`deleting` 为删除中。定时任务约每 5 分钟推进一次。
 
@@ -123,4 +124,48 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 - 收件：已生效域名上**未认领地址的来信自动认领给域名所有者**，直接出现在所有者收件箱并按其个人偏好通知；域内地址达到 `hosted_domains.autoClaimLimit`（默认 1000）后，未认领新地址的来信拒收；暂停或删除中的域名拒收。释放托管域名下的地址且保留历史时，下一封来信会把该地址连同历史邮件自动认领给域名所有者；不想留给所有者就用 `deleteHistory=1` 释放。
 - 认领与发信：托管域名的地址不占全站每人认领上限；所有者不受保留前缀限制。从托管域名发信要求 `steps.sending` 为 ready，否则返回 400。
 - 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400；Cloudflare 限流 429。
+
+### 托管域名的 DNS 解析
+
+所有者与管理员直接读写该域名在站长 Cloudflare 账户中的 zone（JWT `/api`，Key 无对应接口）。只做 DNS 解析，A/AAAA/CNAME 一律以 `proxied:false` 写入，不开启 Cloudflare 代理。
+
+| 路径（JWT `/api`） | 说明 |
+|---|---|
+| `GET /hosted-domains/:id/dns-records` | 全部记录（含邮箱与只读记录），按 `name`（`@` 在最前）、`type`、`content` 排序 |
+| `POST /hosted-domains/:id/dns-records` | 新增 → 201，返回该记录 |
+| `PUT /hosted-domains/:id/dns-records/:recordId` | 修改，`type` 必须与原记录相同；`recordId` 为列表里的 32 位十六进制 `id` |
+| `DELETE /hosted-domains/:id/dns-records/:recordId` | 删除 → `{success:true}` |
+
+记录字段：`id,type,name,fqdn,content,ttl,priority,srv,caa,proxied,comment,kind,lockedReason,modifiedAt`。`name` 为相对名称（根域为 `@`）；`content` 是 Cloudflare 原值，TXT 可能带引号，SRV 为 `weight port target`，CAA 为 `flags tag "value"`；`ttl` 为 1 表示自动；`priority` 只有 MX 有值。
+
+`kind` 决定能否修改，不能修改时 `lockedReason` 给出原因：
+
+- `user`：可在本站修改、删除。在 Cloudflare 控制台建的根域 CNAME 等与邮箱冲突的现存记录也属于此类：可以删除，修改保存时返回 400 并说明冲突原因。
+- `mail`：邮箱收发占用，只读。包括根域 MX 与 SPF、`_dmarc`、`_domainkey` 下的 DKIM、`cf-bounce` 子域，以及 Cloudflare 邮件服务自动维护的记录。
+- `readonly`：本站不编辑的类型（如 NS）、不在支持范围内的 CAA（`flags` 不是 0/128 或 `tag` 不是 `issue|issuewild|iodef`）、已开启 Cloudflare 代理的记录，以及 Cloudflare 其他服务（如 Worker 自定义域名）自动维护的记录，只读。
+
+请求体按 `type` 区分，新增与修改相同：
+
+- `name`：相对名称（`@`、`www`、`_acme-challenge`、`*.dev`）或以本域名结尾的完整域名；通配符 `*` 只能在最前面。
+- `ttl`：1（自动）或 60–86400 秒；`comment` 可选，最多 100 字符，修改时传空串即清除。
+- A/AAAA/CNAME/TXT 用 `content`；MX 用 `content` 与 `priority`；SRV 用 `srv:{priority,weight,port,target}`，`name` 写成 `_服务._协议[.子域]`；CAA 用 `caa:{flags,tag,value}`，`flags` 为 0 或 128，`tag` 为 `issue|issuewild|iodef`。
+
+```bash
+# API="$BASE/api"，AUTH 为所有者或管理员 JWT；HPC_HOSTED_ID 来自 GET /hosted-domains
+hpc "/hosted-domains/$HPC_HOSTED_ID/dns-records" | jq '.data[] | {id,type,name,content,kind}'
+for HPC_DNS_RECORD in \
+  '{"type":"A","name":"www","ttl":1,"content":"203.0.113.10"}' \
+  '{"type":"TXT","name":"@","ttl":1,"content":"google-site-verification=abc"}' \
+  '{"type":"MX","name":"mail","ttl":3600,"content":"mx.example.net","priority":10}' \
+  '{"type":"SRV","name":"_minecraft._tcp.mc","ttl":1,"srv":{"priority":0,"weight":5,"port":25565,"target":"mc.example.net"}}'
+do
+  printf '%s' "$HPC_DNS_RECORD" |
+    hpc "/hosted-domains/$HPC_HOSTED_ID/dns-records" -X POST -H 'Content-Type: application/json' --data-binary @-
+done
+```
+
+- 受保护的记录：根域 MX、根域 SPF（`v=spf1` 开头的 TXT）、`_dmarc`、`_domainkey` 及其子域、`cf-bounce` 及其子域上的任何记录，以及根域 CNAME（与收件需要的 MX、TXT 不能共存，改用 A/AAAA）。新增或改成这些都会在写入 Cloudflare 之前返回 400；其他名称上的 SPF、MX（如 `mail` 子域）不受限制。
+- 权限与状态：所有者与管理员可用，成员 403，其他用户 404。等待改 NS（`pending`）时也能读写，便于先补好网站记录；`suspended` 时所有者只读，管理员仍可修改；`deleting` 或 zone 还在创建中返回 409。只要求本站配置了 Cloudflare 凭据，不受管理员托管开关影响；未配置时 403。
+- 上限与限流：每个域名最多 100 条非邮箱记录（只读记录也计入），达到后新增返回 403；四个接口共用每人每分钟 30 次（管理员同样计数）。所有域名共用站长的 Cloudflare Token，本功能全站合计每分钟最多 150 次 Cloudflare 调用：列表计 1 次，新增、修改、删除各计 2 次，只计能真正调用 Cloudflare 的请求（超出个人限额、无权访问、删除中或创建中的不计）。任一超出返回 429，稍后重试。
+- 常见错误：请求体不合法、修改类型、与邮箱冲突、Cloudflare 拒绝记录值返回 400，message 为具体原因；修改或删除 `mail`/`readonly` 记录返回 403，message 为 `lockedReason`；记录不存在或 `recordId` 格式不对返回 404；同名下已有相同或不能共存的记录返回 409；Cloudflare 中的 zone 已不可用返回 409，需联系管理员；Cloudflare 繁忙返回 429；超时、5xx 或响应读不出来返回 500「Cloudflare 没有返回明确结果，请刷新列表确认是否已生效」，写操作可能已经生效，先重新列出记录再决定是否重试。
 

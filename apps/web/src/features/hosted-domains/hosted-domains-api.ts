@@ -1,6 +1,8 @@
 import type {
   AdminHostedDomainsQuery,
   CreateHostedDomainRequest,
+  HostedDnsRecord,
+  HostedDnsRecordInput,
   HostedDomain,
   HostedDomainMember,
   HostedDomainsHealth,
@@ -33,6 +35,16 @@ export const hostedDomainApi = {
     api.delete<{ success: boolean }>(`/hosted-domains/${id}/members/${userId}`),
   transfer: (id: number, body: TransferHostedDomainRequest) =>
     api.post<HostedDomainTransferResult, TransferHostedDomainRequest>(`/hosted-domains/${id}/transfer`, body),
+  /** DNS 解析：读写都直连 Cloudflare，写操作给足时间 */
+  dnsRecords: (id: number) => api.get<HostedDnsRecord[]>(`/hosted-domains/${id}/dns-records`),
+  createDnsRecord: (id: number, body: HostedDnsRecordInput) =>
+    api.post<HostedDnsRecord, HostedDnsRecordInput>(`/hosted-domains/${id}/dns-records`, body, { timeoutMs: CHECK_TIMEOUT_MS }),
+  updateDnsRecord: (id: number, recordId: string, body: HostedDnsRecordInput) =>
+    api.put<HostedDnsRecord, HostedDnsRecordInput>(`/hosted-domains/${id}/dns-records/${recordId}`, body, {
+      timeoutMs: CHECK_TIMEOUT_MS,
+    }),
+  deleteDnsRecord: (id: number, recordId: string) =>
+    api.delete<{ success: boolean }>(`/hosted-domains/${id}/dns-records/${recordId}`),
 };
 
 export const adminHostedDomainApi = {

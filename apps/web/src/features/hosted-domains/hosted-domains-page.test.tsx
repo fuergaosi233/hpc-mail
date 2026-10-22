@@ -62,7 +62,7 @@ describe('我的域名列表', () => {
     const { client } = mount();
     expect(await screen.findByText('还没有托管域名')).toBeInTheDocument();
     expect(screen.getByText(/名称服务器（NS）改为本站分配的两条/)).toBeInTheDocument();
-    expect(screen.getByText(/该域名将只用于邮箱/)).toBeInTheDocument();
+    expect(screen.getByText(/添加后即可在域名详情里管理网站等常用 DNS 解析，建议在修改名称服务器前补好原有记录/)).toBeInTheDocument();
     const buttons = screen.getAllByRole('button', { name: '添加域名' });
     expect(buttons).toHaveLength(2);
     fireEvent.click(buttons[1]!);

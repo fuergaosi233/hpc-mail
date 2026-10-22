@@ -50,6 +50,26 @@ describe('OpenAPI routes and public contracts', () => {
     expect(rules.suspendedPercent!.deprecated).toBe(true);
   });
 
+  it('documents hosted-domain DNS records with string record ids and one input variant per supported type', () => {
+    const params = specs.api.paths['/hosted-domains/{id}/dns-records/{recordId}']!.parameters as unknown as Array<{ name: string; schema: Schema }>;
+    expect(params.find((param) => param.name === 'recordId')?.schema).toMatchObject({ type: 'string', pattern: '^[0-9a-f]{32}$' });
+    const input = specs.api.components.schemas.HostedDnsRecordInput!;
+    expect((input.oneOf as Schema[]).map((variant) => ((variant.properties as Record<string, Schema>).type as Schema).const))
+      .toEqual(['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'SRV', 'CAA']);
+    const [a, aaaa] = (input.oneOf as Schema[]).map((variant) => (variant.properties as Record<string, Schema>).content);
+    expect(a).toEqual({ type: 'string', format: 'ipv4' });
+    expect(aaaa).toEqual({ type: 'string', format: 'ipv6' });
+    const record = specs.api.components.schemas.HostedDnsRecord!.properties as Record<string, Schema>;
+    expect(record.kind).toMatchObject({ enum: ['user', 'mail', 'readonly'] });
+    // 响应原样返回 readonly CAA 的取值，请求体仍只接受表单支持的 flags 与 tag
+    const caaResponse = ((record.caa!.anyOf as Schema[])[0]!.properties as Record<string, Schema>);
+    expect(caaResponse.flags).toEqual({ type: 'integer', minimum: 0 });
+    expect(caaResponse.tag).toEqual({ type: 'string' });
+    const caaInput = (((input.oneOf as Schema[]).at(-1)!.properties as Record<string, Schema>).caa!.properties as Record<string, Schema>);
+    expect(caaInput.tag).toMatchObject({ enum: ['issue', 'issuewild', 'iodef'] });
+    expect(specs.v1.paths).not.toHaveProperty('/hosted-domains/{id}/dns-records');
+  });
+
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
     const mounted = [...new Set(app.routes.filter(route => methods.has(route.method.toLowerCase()) && !route.path.includes('*'))
       .map(route => `${route.method} ${route.path.replace(/\/$/, '').replace(/:([^/]+)/g, '{$1}')}`))].sort();
