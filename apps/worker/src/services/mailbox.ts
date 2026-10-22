@@ -735,13 +735,13 @@ const USABLE_HOSTED_SQL = HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${stat
 
 /**
  * 托管域名收件（?1 = 收件地址，?2 = 域名）：未认领的地址先认领给域名所有者，邮件随即出现在他的收件箱。
- * 只在域名已生效、且域内地址数低于 hosted_domains.autoClaimLimit 时认领，防止随机地址的来信无限建地址。
+ * 只在域名已生效时认领。hosted_domains.autoClaimLimit 默认 0 不限；管理员设了正数时，域内地址达到该数后不再认领。
  * 须排在 HOSTED_STATUS_SQL 与归属结算之前执行。
  */
 export const HOSTED_AUTO_CLAIM_SQL = `INSERT OR IGNORE INTO mailboxes (address, domain, user_id, display_name)
   SELECT ?1, ?2, user_id, '' FROM hosted_domains WHERE domain = ?2 AND status IN (${USABLE_HOSTED_SQL})
-    AND (SELECT COUNT(*) FROM mailboxes WHERE domain = ?2) < COALESCE(
-      (SELECT json_extract(value, '$.autoClaimLimit') FROM settings WHERE key = 'hosted_domains'), 1000)`;
+    AND (SELECT lim = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE domain = ?2) < lim
+      FROM (SELECT COALESCE((SELECT json_extract(value, '$.autoClaimLimit') FROM settings WHERE key = 'hosted_domains'), 0) AS lim))`;
 
 /** 收件域名的托管状态与该地址是否已有主人（?1 = 收件地址，?2 = 域名）；非托管域名无结果 */
 export const HOSTED_STATUS_SQL = `SELECT status, EXISTS (SELECT 1 FROM mailboxes WHERE address = ?1) AS claimed

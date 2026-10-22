@@ -123,7 +123,7 @@ async function fixture(hosted: Partial<{ maxPerUser: number; maxPendingPerUser: 
     domains: { list: [{ domain: `${prefix}-system.test`, public: true, perUserLimit: 0 }] },
     mailbox_policy: { perUserLimit: 1, reservedLocalParts: ['admin', 'postmaster'] },
     code_extract: { enabled: false, aiEnabled: false }, quota: { dailyOutbound: 0, dailyRecipients: 0 },
-    hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 1000, ...hosted },
+    hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 0, ...hosted },
   });
   async function actor(suffix: string, role: 'admin' | 'user' = 'user') {
     const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: 'test', authVersionMigrated: true }).returning().get())!;
@@ -411,6 +411,33 @@ describe('托管域名的异常与上限', () => {
     expect(await db.select().from(mailboxes).where(eq(mailboxes.address, `c@${domain}`)).get()).toBeUndefined();
     expect((await receive(`a@${domain}`, `${f.prefix}-l4`)).stored?.notifyOwnerIds).toEqual([owner.id]);
     await data<Mailbox>(await call('POST', '/mailboxes', owner.jwt, { localPart: 'manual', domain }), 201);
+  });
+
+  it('自动认领默认不限：没有保存过该设置或设为 0 时，新地址的来信一律认领给所有者', async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture({ autoClaimLimit: 0 });
+    const owner = await f.actor('owner');
+    const domain = f.domain();
+    await activeDomain(cf, owner, domain);
+    for (const local of ['u1', 'u2', 'u3']) {
+      const { rejected, stored } = await receive(`${local}@${domain}`, `${f.prefix}-${local}`);
+      expect(rejected).toEqual([]);
+      expect(stored?.notifyOwnerIds).toEqual([owner.id]);
+    }
+    // 线上从未保存过 hosted_domains 设置：收件 SQL 直读设置表，缺省按 0（不限）处理。
+    // 先把域内地址堆到旧默认上限 1000 以上，确认缺省值不再拦截新地址
+    await env.db.prepare("DELETE FROM settings WHERE key = 'hosted_domains'").run();
+    await env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+      INSERT INTO mailboxes (address, domain, user_id, display_name) SELECT 'bulk' || i || '@' || ?1, ?1, ?2, '' FROM n`)
+      .bind(domain, owner.id).run();
+    for (const local of ['u4', 'u5']) {
+      const { rejected, stored } = await receive(`${local}@${domain}`, `${f.prefix}-${local}`);
+      expect(rejected).toEqual([]);
+      expect(stored?.notifyOwnerIds).toEqual([owner.id]);
+    }
+    const claimed = await db.select().from(mailboxes).where(eq(mailboxes.domain, domain)).all();
+    expect(claimed).toHaveLength(1005);
+    expect(claimed.every((row) => row.userId === owner.id)).toBe(true);
   });
 
   it('Cloudflare 一次超时不清空已就绪的发信状态；确定的错误才判为未就绪', async () => {
