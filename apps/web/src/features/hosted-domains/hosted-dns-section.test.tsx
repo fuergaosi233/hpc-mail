@@ -415,13 +415,23 @@ describe('托管域名 DNS 解析', () => {
     client.clear();
   });
 
-  it('删除结果不确定（Cloudflare 无响应）：刷新解析列表', async () => {
-    mocks.deleteDnsRecord.mockRejectedValue(new ApiError('Cloudflare 暂时没有响应，请稍后重试', { code: 'internal', httpStatus: 500 }));
+  it.each([
+    ['Cloudflare 无响应', new ApiError('Cloudflare 暂时没有响应，请稍后重试', { code: 'internal', httpStatus: 500 }), 2],
+    ['响应断开', new ApiError('网络连接失败，请检查网络后重试', { code: 'network' }), 2],
+    ['边缘返回 HTML', new ApiError('服务器返回了无法识别的响应', { code: 'malformed', httpStatus: 502 }), 2],
+    ['请求超时', new ApiError('请求超时，请稍后重试', { code: 'timeout' }), 2],
+    ['确定被拒绝（限流）', new ApiError('解析操作过于频繁，请稍后再试', { code: 'rate_limited', httpStatus: 429 }), 1],
+    ['确定被拒绝（校验）', new ApiError('Cloudflare 校验未通过：bad', { code: 'validation_failed', httpStatus: 400 }), 1],
+  ])('删除失败（%s）：结果不确定时刷新解析列表，确定被拒绝时不刷新', async (_case, error, listCalls) => {
+    mocks.deleteDnsRecord.mockRejectedValue(error);
     const client = mount();
     fireEvent.click(await screen.findByRole('button', { name: '删除 A 记录 @' }));
     fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: '删除' }));
-    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Cloudflare 暂时没有响应，请稍后重试' })));
-    await waitFor(() => expect(mocks.dnsRecords).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({ title: error.message })));
+    await waitFor(() => expect(mocks.dnsRecords).toHaveBeenCalledTimes(listCalls));
+    // 留出刷新请求发出的时间，确认被拒绝时确实没有多拉
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mocks.dnsRecords).toHaveBeenCalledTimes(listCalls);
     expect(mocks.get).toHaveBeenCalledTimes(1);
     client.clear();
   });
