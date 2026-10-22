@@ -102,10 +102,17 @@ else
 fi
 zero_domain=$(jq -r '[.data[] | select(.suspended == 0)][0].domain // empty' <<< "$claude_stats")
 if [ -n "$zero_domain" ]; then
-  curl -fsS --get "$BASE_URL/api/mailboxes/availability" -H "Authorization: Bearer $TOKEN" \
-    --data-urlencode "localPart=$claude_probe" --data-urlencode "domain=$zero_domain" --data-urlencode 'strategy=claude' |
+  zero_availability=$(curl -fsS --get "$BASE_URL/api/mailboxes/availability" -H "Authorization: Bearer $TOKEN" \
+    --data-urlencode "localPart=$claude_probe" --data-urlencode "domain=$zero_domain" --data-urlencode 'strategy=claude')
+  if jq -e '.data.available == false and .data.reason == "claude_suspended"' <<< "$zero_availability" >/dev/null; then
+    # 初次统计之后可能刚补录了首条封号；只有最新事实能证实这次拒绝时才通过。
+    fresh_claude_stats=$(curl -fsS "$BASE_URL/api/admin/settings/domain-claude-stats" -H "Authorization: Bearer $TOKEN")
+    jq --arg domain "$zero_domain" -e '.data | any(.[]; .domain == $domain and .suspended > 0 and .risk == "suspended")' \
+      <<< "$fresh_claude_stats" >/dev/null || fail "Claude 零封号域名被拒绝，但最新统计没有对应封号事实"
+  else
     jq -e '.data | .available == true or (.available == false and (.reason == "taken" or .reason == "quota" or .reason == "domain_limit"))' \
-      >/dev/null || fail "Claude 零封号域名可用性未遵循普通权限配额"
+      <<< "$zero_availability" >/dev/null || fail "Claude 零封号域名可用性未遵循普通权限配额"
+  fi
 else
   printf '%s\n' '    （没有零封号域名，跳过零封号域名可用性检查）'
 fi
