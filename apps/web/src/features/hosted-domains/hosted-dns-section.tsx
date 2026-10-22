@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ChevronDown, Lock, Pencil, Plus, Trash2 } from 'lucide-react';
-import { useState } from 'react';
+import { useLayoutEffect, useState } from 'react';
 import { type HostedDnsRecord, type HostedDomain, MAX_HOSTED_DNS_RECORDS } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
@@ -26,6 +26,42 @@ interface RecordActions {
 }
 
 const recordLabel = (record: HostedDnsRecord) => `${record.type} 记录 ${record.name}`;
+
+/** 小屏卡片里的记录值：默认最多 3 行，被截断时点按内容展开/收起全文 */
+function ExpandableContent({ text }: { text: string }) {
+  // 回调 ref：截断前后元素会在 span 与 button 之间切换，需要对新元素重新测量
+  const [node, setNode] = useState<HTMLSpanElement | null>(null);
+  const [clamped, setClamped] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  useLayoutEffect(() => {
+    if (!node || expanded) return;
+    const measure = () => setClamped(node.scrollHeight > node.clientHeight + 1);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [node, text, expanded]);
+
+  const body = (
+    <span ref={setNode} className={cn('block whitespace-normal break-all', !expanded && 'line-clamp-3')}>
+      {text}
+    </span>
+  );
+  if (!clamped && !expanded) return body;
+  return (
+    <button
+      type="button"
+      aria-expanded={expanded}
+      onClick={() => setExpanded(!expanded)}
+      className="block w-full rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-focus"
+    >
+      {body}
+      <span className="text-xs text-accent">{expanded ? '收起' : '展开全文'}</span>
+    </button>
+  );
+}
 
 function LockedReason({ record }: { record: HostedDnsRecord }) {
   if (!record.lockedReason) return null;
@@ -72,18 +108,17 @@ function RecordList({
             <CardListItem
               key={record.id}
               title={
-                <>
-                  <Badge tone={record.kind === 'user' ? 'accent' : 'neutral'}>{record.type}</Badge>
-                  <span title={record.fqdn} className="truncate">
+                <span className="flex min-w-0 items-start gap-2">
+                  <Badge tone={record.kind === 'user' ? 'accent' : 'neutral'} className="mt-0.5 shrink-0">
+                    {record.type}
+                  </Badge>
+                  {/* 手机上没有悬停提示：名称折行完整显示 */}
+                  <span title={record.fqdn} className="min-w-0 break-all">
                     {record.name}
                   </span>
-                </>
-              }
-              subtitle={
-                <span title={record.content} className="line-clamp-3 whitespace-normal break-all">
-                  {record.content}
                 </span>
               }
+              subtitle={<ExpandableContent text={record.content} />}
               meta={
                 <>
                   <span>TTL {formatDnsTtl(record.ttl)}</span>
@@ -161,7 +196,7 @@ function RecordList({
 }
 
 /** 邮箱收发占用的记录：默认折叠，展开后只读 */
-function MailRecordsGroup({ records, actions, mobile }: { records: HostedDnsRecord[]; actions?: RecordActions; mobile: boolean }) {
+function MailRecordsGroup({ records, mobile }: { records: HostedDnsRecord[]; mobile: boolean }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="flex flex-col gap-2">
@@ -178,7 +213,7 @@ function MailRecordsGroup({ records, actions, mobile }: { records: HostedDnsReco
       </button>
       {open && (
         <div id="hosted-dns-mail-records">
-          <RecordList records={records} label="邮箱记录" actions={actions} mobile={mobile} />
+          <RecordList records={records} label="邮箱记录" mobile={mobile} />
         </div>
       )}
     </div>
@@ -297,7 +332,7 @@ export function HostedDnsSection({ domain }: { domain: HostedDomain }) {
             已添加 {otherRecords.length} / {MAX_HOSTED_DNS_RECORDS} 条
             {full && '，已达上限，删除不用的记录后才能继续添加'}
           </p>
-          {mailRecords.length > 0 && <MailRecordsGroup records={mailRecords} actions={actions} mobile={mobile} />}
+          {mailRecords.length > 0 && <MailRecordsGroup records={mailRecords} mobile={mobile} />}
         </>
       )}
 

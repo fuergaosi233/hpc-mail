@@ -80,7 +80,7 @@ export function HostedDomainsPage() {
         <EmptyState
           icon={Earth}
           title="还没有托管域名"
-          description="添加一个你自己的域名（如 example.com），按提示到域名注册商把名称服务器（NS）改为本站分配的两条。系统检测到生效后自动开通收件和发信，之后就能在该域名下认领地址，也可以共享给其他用户使用。生效后还可以在域名详情里管理网站等常用 DNS 解析。"
+          description="添加一个你自己的域名（如 example.com），按提示到域名注册商把名称服务器（NS）改为本站分配的两条。系统检测到生效后自动开通收件和发信，之后就能在该域名下认领地址，也可以共享给其他用户使用。添加后即可在域名详情里管理网站等常用 DNS 解析，建议在修改名称服务器前补好原有记录。"
           action={addButton}
           className="rounded-lg border border-line bg-surface"
         />
