@@ -145,8 +145,8 @@ const base = {
 /** 新增与修改共用；修改时 type 必须与原记录一致 */
 export const hostedDnsRecordInputSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('A'), ...base, content: z.string().trim().pipe(z.ipv4(IPV4_MESSAGE)) }),
-  // zod 的 IPv6 校验基于 URL 解析，会忽略中间的制表符与换行，先限定字符集
-  z.object({ type: z.literal('AAAA'), ...base, content: z.string().trim().regex(/^[0-9a-f:.]+$/i, IPV6_MESSAGE).pipe(z.ipv6(IPV6_MESSAGE)) }),
+  // zod 的 IPv6 校验基于 URL 解析，会忽略中间的制表符与换行，先限定字符集（不用 i 标志：JSON Schema 的 pattern 不带标志）
+  z.object({ type: z.literal('AAAA'), ...base, content: z.string().trim().regex(/^[0-9A-Fa-f:.]+$/, IPV6_MESSAGE).pipe(z.ipv6(IPV6_MESSAGE)) }),
   z.object({ type: z.literal('CNAME'), ...base, content: hostnameSchema }),
   z.object({ type: z.literal('TXT'), ...base, content: z.string().trim().min(1, '请填写记录值').max(2048, '记录值最多 2048 个字符') }),
   z.object({ type: z.literal('MX'), ...base, content: hostnameSchema, priority: z.number().int().min(0).max(65535) }),

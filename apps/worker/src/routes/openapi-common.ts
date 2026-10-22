@@ -204,8 +204,12 @@ export const schemas: Record<string, Schema> = {
   HostedDnsRecordInput: (() => {
     const schema = fromZod(hostedDnsRecordInputSchema);
     for (const variant of schema.oneOf as Schema[]) {
-      (variant.properties as Record<string, Schema>).ttl = { type: 'integer',
+      const properties = variant.properties as Record<string, Schema>;
+      properties.ttl = { type: 'integer',
         anyOf: [{ const: HOSTED_DNS_TTL_AUTO }, { minimum: 60, maximum: 86400 }], description: '1 means automatic.' };
+      // 服务端先去掉首尾空白再校验 IP，zod 的 pipe 在输入侧只剩 string，这里补回格式
+      const type = (properties.type as Schema).const;
+      if (type === 'A' || type === 'AAAA') properties.content = { type: 'string', format: type === 'A' ? 'ipv4' : 'ipv6' };
     }
     schema.description = 'Selected by type. name is relative (@ for the root, www, _dmarc, *.dev) or a full name ending with the domain. ttl is 1 (automatic) or 60–86400 seconds. A/AAAA/CNAME/TXT use content, MX uses content and priority, SRV uses srv, CAA uses caa. comment is optional (empty clears it on update).';
     return schema;

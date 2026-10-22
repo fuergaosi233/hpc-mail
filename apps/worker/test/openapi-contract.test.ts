@@ -56,6 +56,9 @@ describe('OpenAPI routes and public contracts', () => {
     const input = specs.api.components.schemas.HostedDnsRecordInput!;
     expect((input.oneOf as Schema[]).map((variant) => ((variant.properties as Record<string, Schema>).type as Schema).const))
       .toEqual(['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'SRV', 'CAA']);
+    const [a, aaaa] = (input.oneOf as Schema[]).map((variant) => (variant.properties as Record<string, Schema>).content);
+    expect(a).toEqual({ type: 'string', format: 'ipv4' });
+    expect(aaaa).toEqual({ type: 'string', format: 'ipv6' });
     const record = specs.api.components.schemas.HostedDnsRecord!.properties as Record<string, Schema>;
     expect(record.kind).toMatchObject({ enum: ['user', 'mail', 'readonly'] });
     // 响应原样返回 readonly CAA 的取值，请求体仍只接受表单支持的 flags 与 tag

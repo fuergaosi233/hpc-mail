@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 import {
   hostedDnsConflictReason, hostedDnsFqdn, hostedDnsMailReason, hostedDnsRecordInputSchema, hostedDnsRelativeName, isHostedDnsName,
 } from '../src/index.js';
@@ -73,6 +74,9 @@ describe('托管域名 DNS 记录请求', () => {
       .toEqual({ type: 'A', name: 'www', ttl: 1, content: '203.0.113.10', comment: '' });
     expect(hostedDnsRecordInputSchema.parse({ type: 'A', name: 'www', ttl: 1, content: ' 203.0.113.10\n' })).toMatchObject({ content: '203.0.113.10' });
     expect(hostedDnsRecordInputSchema.parse({ type: 'AAAA', name: 'www', ttl: 1, content: '2001:DB8::1 ' })).toMatchObject({ content: '2001:DB8::1' });
+    // 字符集正则不带 i 标志也接受大写，导出的 JSON Schema pattern 与服务端一致
+    const exported = z.toJSONSchema(hostedDnsRecordInputSchema, { io: 'input' }) as { oneOf: { properties: { content?: { pattern?: string } } }[] };
+    expect(new RegExp(exported.oneOf[1]!.properties.content!.pattern!).test('2001:DB8::1')).toBe(true);
     expect(hostedDnsRecordInputSchema.parse({ type: 'CNAME', name: 'blog', ttl: 300, content: 'Target.Example.NET.' }))
       .toMatchObject({ content: 'target.example.net' });
     expect(hostedDnsRecordInputSchema.parse({ type: 'MX', name: 'mail', ttl: 1, content: 'mx.example.net', priority: 10 }))
