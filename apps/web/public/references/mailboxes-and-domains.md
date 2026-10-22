@@ -142,7 +142,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 
 - `user`：可在本站修改、删除。
 - `mail`：邮箱收发占用，只读。包括根域 MX 与 SPF、`_dmarc`、`_domainkey` 下的 DKIM、`cf-bounce` 子域，以及 Cloudflare 邮件服务自动维护的记录。
-- `readonly`：本站不编辑的类型（如 NS），或已开启 Cloudflare 代理的记录，只读。
+- `readonly`：本站不编辑的类型（如 NS）、不在支持范围内的 CAA（`flags` 不是 0/128 或 `tag` 不是 `issue|issuewild|iodef`）、在 Cloudflare 控制台建的根域 CNAME 等与邮箱冲突的记录、已开启 Cloudflare 代理的记录，以及 Cloudflare 其他服务（如 Worker 自定义域名）自动维护的记录，只读。
 
 请求体按 `type` 区分，新增与修改相同：
 
@@ -166,6 +166,6 @@ done
 
 - 受保护的记录：根域 MX、根域 SPF（`v=spf1` 开头的 TXT）、`_dmarc`、`_domainkey` 及其子域、`cf-bounce` 及其子域上的任何记录，以及根域 CNAME（与收件需要的 MX、TXT 不能共存，改用 A/AAAA）。新增或改成这些都会在写入 Cloudflare 之前返回 400；其他名称上的 SPF、MX（如 `mail` 子域）不受限制。
 - 权限与状态：所有者与管理员可用，成员 403，其他用户 404。等待改 NS（`pending`）时也能读写，便于先补好网站记录；`suspended` 时所有者只读，管理员仍可修改；`deleting` 或 zone 还在创建中返回 409。只要求本站配置了 Cloudflare 凭据，不受管理员托管开关影响；未配置时 403。
-- 上限与限流：每个域名最多 100 条非邮箱记录（只读记录也计入），达到后新增返回 403；四个接口共用每人每分钟 30 次（管理员同样计数）；所有域名共用站长的 Cloudflare 额度，全站合计每分钟 60 次（超出个人限额的请求不计入）。任一超出返回 429，稍后重试。
-- 常见错误：请求体不合法、修改类型、与邮箱冲突、Cloudflare 拒绝记录值返回 400，message 为具体原因；修改或删除 `mail`/`readonly` 记录返回 403，message 为 `lockedReason`；记录不存在或 `recordId` 格式不对返回 404；同名下已有相同或不能共存的记录返回 409；Cloudflare 中的 zone 已不可用返回 409，需联系管理员；Cloudflare 繁忙返回 429，超时或 5xx 返回 500，均可稍后重试。
+- 上限与限流：每个域名最多 100 条非邮箱记录（只读记录也计入），达到后新增返回 403；四个接口共用每人每分钟 30 次（管理员同样计数）。所有域名共用站长的 Cloudflare Token，本功能全站合计每分钟最多 150 次 Cloudflare 调用：列表计 1 次，新增、修改、删除各计 2 次，只计能真正调用 Cloudflare 的请求（超出个人限额、无权访问、删除中或创建中的不计）。任一超出返回 429，稍后重试。
+- 常见错误：请求体不合法、修改类型、与邮箱冲突、Cloudflare 拒绝记录值返回 400，message 为具体原因；修改或删除 `mail`/`readonly` 记录返回 403，message 为 `lockedReason`；记录不存在或 `recordId` 格式不对返回 404；同名下已有相同或不能共存的记录返回 409；Cloudflare 中的 zone 已不可用返回 409，需联系管理员；Cloudflare 繁忙返回 429；超时、5xx 或响应读不出来返回 500「Cloudflare 没有返回明确结果，请刷新列表确认是否已生效」，写操作可能已经生效，先重新列出记录再决定是否重试。
 

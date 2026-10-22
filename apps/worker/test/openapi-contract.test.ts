@@ -56,7 +56,14 @@ describe('OpenAPI routes and public contracts', () => {
     const input = specs.api.components.schemas.HostedDnsRecordInput!;
     expect((input.oneOf as Schema[]).map((variant) => ((variant.properties as Record<string, Schema>).type as Schema).const))
       .toEqual(['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'SRV', 'CAA']);
-    expect((specs.api.components.schemas.HostedDnsRecord!.properties as Record<string, Schema>).kind).toMatchObject({ enum: ['user', 'mail', 'readonly'] });
+    const record = specs.api.components.schemas.HostedDnsRecord!.properties as Record<string, Schema>;
+    expect(record.kind).toMatchObject({ enum: ['user', 'mail', 'readonly'] });
+    // 响应原样返回 readonly CAA 的取值，请求体仍只接受表单支持的 flags 与 tag
+    const caaResponse = ((record.caa!.anyOf as Schema[])[0]!.properties as Record<string, Schema>);
+    expect(caaResponse.flags).toEqual({ type: 'integer', minimum: 0 });
+    expect(caaResponse.tag).toEqual({ type: 'string' });
+    const caaInput = (((input.oneOf as Schema[]).at(-1)!.properties as Record<string, Schema>).caa!.properties as Record<string, Schema>);
+    expect(caaInput.tag).toMatchObject({ enum: ['issue', 'issuewild', 'iodef'] });
     expect(specs.v1.paths).not.toHaveProperty('/hosted-domains/{id}/dns-records');
   });
 
