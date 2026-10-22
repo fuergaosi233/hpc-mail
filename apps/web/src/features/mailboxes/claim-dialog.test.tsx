@@ -552,11 +552,50 @@ describe('随机后缀模式', () => {
   /** 等后端分配返回、各行换成指定的域名 */
   const waitRows = (domains: string[]) => waitFor(() => expect(rowDomains()).toEqual(domains));
 
-  it('只有一个可见域名时没有模式选项，行尾直接显示域名', () => {
+  it('单域用户也能选择 Claude，默认固定后缀，行尾直接显示域名', () => {
     const { client } = renderDialog(['only.test']);
-    expect(screen.queryByRole('radiogroup', { name: '随机后缀模式' })).toBeNull();
+    expect(screen.getByRole('radiogroup', { name: '随机后缀模式' })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: '固定后缀' })).toHaveAttribute('aria-checked', 'true');
+    selectMode('Claude 0 封号');
+    expect(screen.getByRole('radio', { name: 'Claude 0 封号' })).toHaveAttribute('aria-checked', 'true');
     expect(screen.queryByRole('combobox')).toBeNull();
     expect(screen.getByText('only.test')).toBeInTheDocument();
+    client.clear();
+  });
+
+  it('单域有封号时，Claude 可用性查询带策略并拦截认领提交', async () => {
+    mocks.availableOf.mockImplementation(async (_localPart, _domain, strategy) =>
+      strategy === 'claude' ? { available: false, reason: 'claude_suspended' } : { available: true });
+    const { client } = renderDialog(['only.test']);
+    try {
+      randomize();
+      await screen.findByText(/可以认领$/);
+      const localPart = prefixes()[0];
+      selectMode('Claude 0 封号');
+      expect(await screen.findByText('该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领')).toBeInTheDocument();
+      expect(mocks.availability).toHaveBeenLastCalledWith(localPart, 'only.test', 'claude');
+      expect(screen.getByRole('button', { name: '认领' })).toBeDisabled();
+      fireEvent.submit(screen.getByLabelText('前缀').closest('form')!);
+      expect(mocks.claim).not.toHaveBeenCalled();
+      expect(mocks.batchClaim).not.toHaveBeenCalled();
+    } finally {
+      mocks.availableOf.mockImplementation(async () => ({ available: true }));
+      client.clear();
+    }
+  });
+
+  it('单域无封号时，Claude 查询和实际认领都带策略', async () => {
+    const onOpenChange = vi.fn();
+    const { client } = renderDialog(['only.test'], onOpenChange);
+    randomize();
+    await screen.findByText(/可以认领$/);
+    const localPart = prefixes()[0];
+    selectMode('Claude 0 封号');
+    await waitFor(() => expect(mocks.availability).toHaveBeenLastCalledWith(localPart, 'only.test', 'claude'));
+    await screen.findByText(`${localPart}@only.test 可以认领`);
+    fireEvent.click(screen.getByRole('button', { name: '认领' }));
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(mocks.claim).toHaveBeenCalledExactlyOnceWith({ localPart, domain: 'only.test', strategy: 'claude' });
     client.clear();
   });
 

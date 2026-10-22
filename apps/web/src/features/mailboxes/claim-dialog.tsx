@@ -536,7 +536,7 @@ export function ClaimDialog({ open, onOpenChange, domains, initialDomain }: Clai
                   </div>
                 </div>
 
-                {domains.length > 1 && (
+                {domains.length > 0 && (
                   <div className="flex flex-col gap-1">
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-ink-secondary">
                       <span className="whitespace-nowrap">随机后缀</span>
