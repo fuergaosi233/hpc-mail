@@ -74,6 +74,16 @@ describe('loginRequestSchema', () => {
 });
 
 describe('claimMailboxRequestSchema', () => {
+  it('单项与批量接受可选策略且拒绝未知策略', () => {
+    const item = { localPart: 'zero', domain: 'hpc.email' };
+    for (const strategy of ['uniform', 'claude']) {
+      expect(claimMailboxRequestSchema.parse({ ...item, strategy })).toEqual({ ...item, strategy });
+      expect(batchMailboxRequestSchema.parse({ items: [{ ...item, strategy }] }).items[0]!.strategy).toBe(strategy);
+    }
+    expect(claimMailboxRequestSchema.safeParse({ ...item, strategy: 'unknown' }).success).toBe(false);
+    expect(batchMailboxRequestSchema.safeParse({ items: [{ ...item, strategy: 'unknown' }] }).success).toBe(false);
+    expect(SETTING_SCHEMAS.claim_random.parse({ paidSuspendedLimit: 0, suspendedPercent: 0 })).toMatchObject({ paidSuspendedLimit: 0, suspendedPercent: 0 });
+  });
   it('接受并归一化', () => {
     const r = claimMailboxRequestSchema.parse({ localPart: ' Test.User+tag ', domain: 'HPC.email' });
     expect(r).toEqual({ localPart: 'test.user+tag', domain: 'hpc.email' });
