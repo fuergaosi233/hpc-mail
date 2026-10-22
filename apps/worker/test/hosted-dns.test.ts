@@ -6,6 +6,7 @@ import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { adminAuditLogs, hostedDomainMembers, hostedDomains, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
+import { HOSTED_DNS_SITE_RATE_SCOPE, MAX_HOSTED_DNS_SITE_REQUESTS_PER_MINUTE } from '../src/services/hosted-dns.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
@@ -90,6 +91,7 @@ function fakeCloudflare() {
     if (failure && failure.method === method) {
       const { status, code } = failure;
       failure = null;
+      if (status === 0) throw new TypeError('Network connection lost.');
       return status >= 500 ? new Response('upstream error', { status }) : fail(status, code, `injected ${code}`);
     }
     const match = path.match(/^\/zones\/([^/]+)\/dns_records(?:\/([^/]+))?$/);
@@ -140,6 +142,8 @@ let sequence = 0;
 async function fixture(cf: ReturnType<typeof fakeCloudflare>) {
   const prefix = `dns${++sequence}`;
   await updateSettings(env, { hosted_domains: HOSTED_SETTINGS });
+  // 全站计数在同一文件的用例之间共享，每个用例从零开始
+  await env.db.prepare('DELETE FROM rate_counters WHERE scope = ?').bind(HOSTED_DNS_SITE_RATE_SCOPE).run();
   async function actor(suffix: string, role: 'admin' | 'user' = 'user') {
     const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: 'test', authVersionMigrated: true }).returning().get())!;
     const sid = await createSession(env, user.id);
@@ -335,6 +339,12 @@ describe('新增与冲突', () => {
     const [www] = cf.add(site.zoneId, record({ type: 'TXT', name: `www.${site.domain}`, content: 'hello' }));
     const renamed = { type: 'TXT', name: '_dmarc', ttl: 1, content: 'v=DMARC1; p=none' };
     expect((await errorOf(await call('PUT', `${path}/${www!.id}`, owner.jwt, renamed), 400)).message).toContain('DMARC');
+    // 根域普通 TXT 改成 SPF（含分段与 RFC 1035 转义写法）同样拒绝
+    const [verify] = cf.add(site.zoneId, record({ type: 'TXT', name: site.domain, content: '"google-site-verification=abc"' }));
+    for (const content of ['v=spf1 include:other.example -all', '"v=sp" "f1 -all"', '\\118=spf1 -all']) {
+      const error = await errorOf(await call('PUT', `${path}/${verify!.id}`, owner.jwt, { type: 'TXT', name: '@', ttl: 1, content }), 400);
+      expect(error, content).toMatchObject({ code: 'validation_failed', message: expect.stringContaining('SPF') });
+    }
     expect(cf.writes()).toEqual([]);
     expect(await audits(site.domain)).toEqual([]);
   });
@@ -508,6 +518,27 @@ describe('上限与限流', () => {
     const admin = await f.actor('admin', 'admin');
     await data(await call('GET', path, admin.jwt));
   }, 30_000);
+
+  it(`全站每分钟最多 ${MAX_HOSTED_DNS_SITE_REQUESTS_PER_MINUTE} 次，超出个人限额的请求不占全站额度`, async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture(cf);
+    const [first, second, third] = [await f.actor('first'), await f.actor('second'), await f.actor('third', 'admin')];
+    const sites = [await f.hosted(first, 'first'), await f.hosted(second, 'second')];
+    const list = (site: { id: number }) => `/hosted-domains/${site.id}/dns-records`;
+    const left = 60_000 - (Date.now() % 60_000);
+    if (left < 10_000) await new Promise((resolve) => setTimeout(resolve, left + 50));
+    for (let i = 0; i < MAX_HOSTED_DNS_REQUESTS_PER_MINUTE; i++) await data(await call('GET', list(sites[0]!), first.jwt));
+    // 第一个用户被个人限流的请求不计入全站
+    for (let i = 0; i < 5; i++) expect((await errorOf(await call('GET', list(sites[0]!), first.jwt), 429)).message).toBe('解析操作过于频繁，请稍后再试');
+    for (let i = 0; i < MAX_HOSTED_DNS_SITE_REQUESTS_PER_MINUTE - MAX_HOSTED_DNS_REQUESTS_PER_MINUTE; i++) {
+      await data(await call('GET', list(sites[1]!), second.jwt));
+    }
+    const calls = cf.calls.length;
+    expect(await errorOf(await call('GET', list(sites[1]!), third.jwt), 429)).toEqual({ code: 'rate_limited', message: '当前解析操作较多，请稍后再试' });
+    expect(await errorOf(await call('POST', list(sites[0]!), third.jwt, { type: 'A', name: 'www', ttl: 1, content: '203.0.113.1' }), 429))
+      .toMatchObject({ message: '当前解析操作较多，请稍后再试' });
+    expect(cf.calls).toHaveLength(calls);
+  }, 30_000);
 });
 
 describe('Cloudflare 错误映射', () => {
@@ -531,6 +562,23 @@ describe('Cloudflare 错误映射', () => {
     cf.failNext('GET', 429, 10000);
     expect(await errorOf(await call('GET', path, owner.jwt), 429))
       .toEqual({ code: 'rate_limited', message: 'Cloudflare 接口繁忙，请稍后再试' });
+    // fetch 抛错（超时或断网）即 status 0
+    cf.failNext('GET', 0);
+    expect(await errorOf(await call('GET', path, owner.jwt), 500))
+      .toEqual({ code: 'internal', message: 'Cloudflare 暂时没有响应，请稍后重试' });
+    cf.failNext('POST', 0);
+    expect((await errorOf(await call('POST', path, owner.jwt, input), 500)).message).toBe('Cloudflare 暂时没有响应，请稍后重试');
+
+    // 别的 zone 的记录 id：Cloudflare 在本 zone 下返回 404/81044，两边都不写
+    const other = await f.hosted(owner, 'other');
+    const [foreign] = cf.add(other.zoneId, record({ type: 'A', name: `www.${other.domain}`, content: '203.0.113.5' }));
+    const writes = cf.writes().length;
+    expect(await errorOf(await call('PUT', `${path}/${foreign!.id}`, owner.jwt, { type: 'A', name: 'www', ttl: 1, content: '203.0.113.6' }), 404))
+      .toEqual({ code: 'not_found', message: '解析记录不存在' });
+    expect(await errorOf(await call('DELETE', `${path}/${foreign!.id}`, owner.jwt), 404))
+      .toEqual({ code: 'not_found', message: '解析记录不存在' });
+    expect(cf.writes()).toHaveLength(writes);
+    expect(cf.zones.get(other.zoneId)!.records.get(foreign!.id)).toMatchObject({ content: '203.0.113.5' });
 
     const created = await data<HostedDnsRecord>(await call('POST', path, owner.jwt, input), 201);
     cf.failNext('PATCH', 404, 81044);

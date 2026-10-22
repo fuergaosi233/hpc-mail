@@ -11,7 +11,7 @@ import {
   type CfDnsRecord, type CloudflareCredentials,
 } from './cloudflare.js';
 import { loadAccess, requireManage } from './hosted-domain.js';
-import { bumpCounter, minuteWindow } from './rate-counter.js';
+import { counterResult, counterStatement, minuteWindow } from './rate-counter.js';
 
 /**
  * 托管域名的 DNS 解析：直接读写站长 Cloudflare 账户里该域名的 zone，不在 D1 落记录。
@@ -22,6 +22,9 @@ type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
 
 /** 每位用户每分钟的解析请求计数（四个接口共用，管理员也计） */
 export const HOSTED_DNS_RATE_SCOPE = 'hosted_dns';
+/** 全站每分钟的解析请求计数：所有用户共用站长的 Cloudflare Token（1200 次/5 分钟），给定时开通任务留出余量 */
+export const HOSTED_DNS_SITE_RATE_SCOPE = 'hosted_dns_site';
+export const MAX_HOSTED_DNS_SITE_REQUESTS_PER_MINUTE = 60;
 const AUDIT_VALUE_MAX = 80;
 const SUPPORTED = new Set<string>(HOSTED_DNS_RECORD_TYPES);
 const CAA_TAGS = new Set<string>(HOSTED_DNS_CAA_TAGS);
@@ -33,16 +36,28 @@ interface DnsZone {
   domain: string;
 }
 
+/** 个人与全站计数合成一个 batch；已超出个人限额的请求不再占全站额度，单个用户刷不满全站 */
+async function countRequest(env: Env, viewer: Viewer): Promise<{ user: number; site: number }> {
+  const window = minuteWindow(1);
+  const subject = String(viewer.id);
+  const [user, site] = await env.db.batch([
+    counterStatement(env, HOSTED_DNS_RATE_SCOPE, subject, window),
+    counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window, 1, 0, {
+      sql: `(SELECT count FROM rate_counters WHERE scope = ? AND subject = ? AND "window" = ?) <= ?`,
+      params: [HOSTED_DNS_RATE_SCOPE, subject, window, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE],
+    }),
+  ]);
+  return { user: counterResult(user)?.count ?? 1, site: counterResult(site)?.count ?? 0 };
+}
+
 /** 凭据、限流、权限与域名状态；限流计数和读取域名并行，无权访问的请求同样计数 */
 async function openZone(env: Env, viewer: Viewer, id: number, write: boolean): Promise<DnsZone> {
   const creds = cloudflareCredentials(env);
   if (!creds) throw new AppError('forbidden', '本站未开启域名托管');
-  const [counter, loaded] = await Promise.allSettled([
-    bumpCounter(env, HOSTED_DNS_RATE_SCOPE, String(viewer.id), minuteWindow(1)),
-    loadAccess(env, viewer, id),
-  ]);
+  const [counter, loaded] = await Promise.allSettled([countRequest(env, viewer), loadAccess(env, viewer, id)]);
   if (counter.status === 'rejected') throw counter.reason;
-  if (counter.value.count > MAX_HOSTED_DNS_REQUESTS_PER_MINUTE) throw new AppError('rate_limited', '解析操作过于频繁，请稍后再试');
+  if (counter.value.user > MAX_HOSTED_DNS_REQUESTS_PER_MINUTE) throw new AppError('rate_limited', '解析操作过于频繁，请稍后再试');
+  if (counter.value.site > MAX_HOSTED_DNS_SITE_REQUESTS_PER_MINUTE) throw new AppError('rate_limited', '当前解析操作较多，请稍后再试');
   if (loaded.status === 'rejected') throw loaded.reason;
   const { row, access } = loaded.value;
   requireManage(access);
