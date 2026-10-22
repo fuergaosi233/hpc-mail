@@ -302,7 +302,7 @@ function NameServerSection({ domain }: { domain: HostedDomain }) {
             </div>
           )}
           <p className="text-[13px] text-ink-secondary">
-            修改名称服务器前，先在下方「DNS 解析」补上网站等原有记录，切换后这些服务不会中断。
+            修改名称服务器前，先在下方「DNS 解析」补上网站等原有记录，网站等记录切换时不中断（根域邮件由本站接管）。
           </p>
           <ol className="flex flex-col gap-4">
             <GuideStep n={1} title="登录域名注册商">

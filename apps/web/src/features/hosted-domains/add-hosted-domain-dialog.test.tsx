@@ -30,9 +30,12 @@ function mount() {
 describe('添加托管域名', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('说明原有 DNS 不会自动迁移、可在详情补解析与先关闭 DNSSEC', () => {
+  it('警告根域邮件被接管、原有 DNS 不会自动迁移、可在详情补解析与先关闭 DNSSEC', () => {
     const { client } = mount();
     expect(screen.queryByText(/只用于邮箱/)).toBeNull();
+    const takeover = screen.getByText(/接管该域名根域的邮件/).closest('li');
+    expect(takeover).toHaveTextContent('根域 MX、SPF、DMARC 和 DKIM 记录由系统维护');
+    expect(takeover).toHaveTextContent(/Google Workspace、腾讯企业邮.*切换后原邮箱会停止收信/);
     expect(screen.getByText(/不会自动迁移/)).toBeInTheDocument();
     expect(screen.getByText(/建议在修改名称服务器之前完成/)).toBeInTheDocument();
     expect(screen.getByText(/关闭 DNSSEC/)).toBeInTheDocument();

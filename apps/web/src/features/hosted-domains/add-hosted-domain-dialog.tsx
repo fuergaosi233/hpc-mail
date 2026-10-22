@@ -84,8 +84,12 @@ export function AddHostedDomainDialog({ open, onOpenChange }: { open: boolean; o
               </p>
               <ul className="mt-2 flex list-disc flex-col gap-1.5 pl-5 text-ink-secondary">
                 <li>
-                  名称服务器改为本站分配的值后，原有网站等 DNS 记录<b className="text-ink">不会自动迁移</b>。添加后可以在域名详情的「DNS
-                  解析」里补上常用记录，建议在修改名称服务器之前完成。
+                  本站会<b className="text-ink">接管该域名根域的邮件</b>，根域 MX、SPF、DMARC 和 DKIM 记录由系统维护。如果正在使用其他邮箱服务（如
+                  Google Workspace、腾讯企业邮），切换后原邮箱会停止收信。
+                </li>
+                <li>
+                  网站等其他 DNS 记录<b className="text-ink">不会自动迁移</b>，添加后可以在域名详情的「DNS
+                  解析」里补上，建议在修改名称服务器之前完成。
                 </li>
                 <li>修改名称服务器前，请先在注册商处<b className="text-ink">关闭 DNSSEC</b>，否则域名会解析失败。</li>
                 <li>提交后请尽快修改名称服务器，超过等待期限仍未生效会自动删除，截止时间见详情页。</li>
