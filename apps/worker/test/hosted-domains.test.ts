@@ -123,7 +123,7 @@ async function fixture(hosted: Partial<{ maxPerUser: number; maxPendingPerUser: 
     domains: { list: [{ domain: `${prefix}-system.test`, public: true, perUserLimit: 0 }] },
     mailbox_policy: { perUserLimit: 1, reservedLocalParts: ['admin', 'postmaster'] },
     code_extract: { enabled: false, aiEnabled: false }, quota: { dailyOutbound: 0, dailyRecipients: 0 },
-    hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 1000, ...hosted },
+    hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 0, ...hosted },
   });
   async function actor(suffix: string, role: 'admin' | 'user' = 'user') {
     const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: 'test', authVersionMigrated: true }).returning().get())!;
