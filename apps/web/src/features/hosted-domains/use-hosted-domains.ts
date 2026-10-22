@@ -1,5 +1,5 @@
 import { type QueryClient, queryOptions, useQuery } from '@tanstack/react-query';
-import type { HostedDomain, HostedDomainStatus } from '@hpc-mail/shared';
+import type { HostedDnsRecord, HostedDomain, HostedDomainStatus } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { hostedDomainApi } from './hosted-domains-api';
 
@@ -50,8 +50,43 @@ export function patchHostedDomain(client: QueryClient, id: number, patch: Partia
 export function forgetHostedDomain(client: QueryClient, id: number): void {
   client.removeQueries({ queryKey: queryKeys.hostedDomains.detail(id) });
   client.removeQueries({ queryKey: queryKeys.hostedDomains.members(id) });
+  client.removeQueries({ queryKey: queryKeys.hostedDomains.dnsRecords(id) });
   client.setQueryData<HostedDomain[]>(queryKeys.hostedDomains.list, (list) => list?.filter((item) => item.id !== id));
   void client.invalidateQueries({ queryKey: queryKeys.hostedDomains.list });
   void client.invalidateQueries({ queryKey: queryKeys.admin.hostedDomains });
   void client.invalidateQueries({ queryKey: queryKeys.domains });
+}
+
+export function useHostedDnsRecordsQuery(id: number) {
+  return useQuery({
+    queryKey: queryKeys.hostedDomains.dnsRecords(id),
+    queryFn: () => hostedDomainApi.dnsRecords(id),
+  });
+}
+
+const byCodePoint = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** 与服务端一致：按名称（@ 最前）、类型、内容排序 */
+function compareDnsRecords(a: HostedDnsRecord, b: HostedDnsRecord): number {
+  return (
+    Number(b.name === '@') - Number(a.name === '@') ||
+    byCodePoint(a.name, b.name) ||
+    byCodePoint(a.type, b.type) ||
+    byCodePoint(a.content, b.content)
+  );
+}
+
+/** 新增或修改成功：就地插入或替换并重新排序，不整体重拉 */
+export function storeDnsRecord(client: QueryClient, domainId: number, record: HostedDnsRecord): void {
+  client.setQueryData<HostedDnsRecord[]>(
+    queryKeys.hostedDomains.dnsRecords(domainId),
+    (list) => list && [...list.filter((item) => item.id !== record.id), record].sort(compareDnsRecords),
+  );
+}
+
+export function removeDnsRecord(client: QueryClient, domainId: number, recordId: string): void {
+  client.setQueryData<HostedDnsRecord[]>(
+    queryKeys.hostedDomains.dnsRecords(domainId),
+    (list) => list?.filter((item) => item.id !== recordId),
+  );
 }

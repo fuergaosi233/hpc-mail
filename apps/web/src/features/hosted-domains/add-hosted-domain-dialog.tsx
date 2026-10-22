@@ -84,8 +84,8 @@ export function AddHostedDomainDialog({ open, onOpenChange }: { open: boolean; o
               </p>
               <ul className="mt-2 flex list-disc flex-col gap-1.5 pl-5 text-ink-secondary">
                 <li>
-                  该域名将<b className="text-ink">只用于邮箱</b>。名称服务器改为本站分配的值后，原有网站、解析等其他 DNS
-                  记录不会迁移，会全部失效。
+                  名称服务器改为本站分配的值后，原有网站等 DNS 记录<b className="text-ink">不会自动迁移</b>。添加后可以在域名详情的「DNS
+                  解析」里补上常用记录，建议在修改名称服务器之前完成。
                 </li>
                 <li>修改名称服务器前，请先在注册商处<b className="text-ink">关闭 DNSSEC</b>，否则域名会解析失败。</li>
                 <li>提交后请尽快修改名称服务器，超过等待期限仍未生效会自动删除，截止时间见详情页。</li>

@@ -30,10 +30,11 @@ function mount() {
 describe('添加托管域名', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('说明只用于邮箱、原有 DNS 失效与先关闭 DNSSEC', () => {
+  it('说明原有 DNS 不会自动迁移、可在详情补解析与先关闭 DNSSEC', () => {
     const { client } = mount();
-    expect(screen.getByText(/只用于邮箱/)).toBeInTheDocument();
-    expect(screen.getByText(/原有网站、解析等其他 DNS/)).toBeInTheDocument();
+    expect(screen.queryByText(/只用于邮箱/)).toBeNull();
+    expect(screen.getByText(/不会自动迁移/)).toBeInTheDocument();
+    expect(screen.getByText(/建议在修改名称服务器之前完成/)).toBeInTheDocument();
     expect(screen.getByText(/关闭 DNSSEC/)).toBeInTheDocument();
     // 红字提醒：改 NS 后需要等待生效
     expect(screen.getByText(/修改名称服务器后不会立即生效/).closest('p')).toHaveClass('text-critical');

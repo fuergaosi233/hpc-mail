@@ -47,6 +47,7 @@ export const queryKeys = {
     list: ['hosted-domains', 'list'] as const,
     detail: (id: number) => ['hosted-domains', 'detail', id] as const,
     members: (id: number) => ['hosted-domains', 'members', id] as const,
+    dnsRecords: (id: number) => ['hosted-domains', 'dns-records', id] as const,
   },
 
   admin: {
