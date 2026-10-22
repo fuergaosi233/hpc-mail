@@ -207,29 +207,24 @@ describe('SettingsPage AI 翻译开关', () => {
 });
 
 describe('SettingsPage 随机认领规则', () => {
-  it('显示当前阈值，修改后随整页保存提交完整的 claim_random', async () => {
+  it('移除旧排除阈值，保留每日上限与未注册天数，保存兼容字段原值', async () => {
     const { client } = mount();
-    const limit = await screen.findByRole('spinbutton', { name: /付费被封排除阈值/ });
-    const days = screen.getByRole('spinbutton', { name: /未注册邮箱计入天数/ });
-    const percent = screen.getByRole('spinbutton', { name: /封号率排除阈值/ });
+    const days = await screen.findByRole('spinbutton', { name: /未注册邮箱计入天数/ });
     const daily = screen.getByRole('spinbutton', { name: /每个后缀每日新增上限/ });
-    expect(limit).toHaveValue(2);
+    expect(screen.queryByRole('spinbutton', { name: /付费被封排除阈值/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('spinbutton', { name: /封号率排除阈值/ })).not.toBeInTheDocument();
     expect(days).toHaveValue(7);
-    expect(percent).toHaveValue(50);
     expect(daily).toHaveValue(3);
-    expect(screen.getByText(/哪些域名参与随机请在「收件域名」页逐个设置/)).toBeInTheDocument();
+    expect(screen.getByText(/有历史封号记录的域名禁止认领/)).toHaveTextContent('不保证未来不会封号');
 
-    fireEvent.change(limit, { target: { value: '0' } });
     fireEvent.change(days, { target: { value: '120' } });
     // 超过上限按 90 天截断
     expect(days).toHaveValue(90);
-    fireEvent.change(percent, { target: { value: '150' } });
-    expect(percent).toHaveValue(100);
     fireEvent.change(daily, { target: { value: '0' } });
     fireEvent.click(screen.getByRole('button', { name: '保存更改' }));
     await waitFor(() =>
       expect(mocks.update).toHaveBeenCalledWith(
-        expect.objectContaining({ claim_random: { paidSuspendedLimit: 0, pendingDays: 90, suspendedPercent: 100, dailyLimit: 0 } }),
+        expect.objectContaining({ claim_random: { paidSuspendedLimit: 2, pendingDays: 90, suspendedPercent: 50, dailyLimit: 0 } }),
       ),
     );
     expect(mocks.update.mock.calls.at(-1)![0]).not.toHaveProperty('domains');

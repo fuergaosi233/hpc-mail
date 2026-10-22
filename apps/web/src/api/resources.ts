@@ -110,8 +110,8 @@ export const mailboxApi = {
     api.delete<{ success: boolean; deletedMessages: number }>(`/mailboxes/${id}`, undefined, {
       query: { deleteHistory: deleteHistory ? 1 : undefined },
     }),
-  availability: (localPart: string, domain: string) =>
-    api.get<MailboxAvailability>('/mailboxes/availability', { query: { localPart, domain } }),
+  availability: (localPart: string, domain: string, strategy?: ClaimMailboxRequest['strategy']) =>
+    api.get<MailboxAvailability>('/mailboxes/availability', { query: { localPart, domain, strategy } }),
   batchAvailability: (items: ClaimMailboxRequest[]) =>
     api.post<MailboxAvailability[], BatchMailboxRequest>('/mailboxes/availability/batch', { items }),
   batchClaim: (items: ClaimMailboxRequest[]) =>
