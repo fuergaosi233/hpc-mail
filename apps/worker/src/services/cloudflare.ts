@@ -34,7 +34,7 @@ interface CfEnvelope<T> {
   success: boolean;
   errors?: { code: number; message: string }[];
   result: T;
-  result_info?: { total_count?: number };
+  result_info?: { total_count?: number; page?: number; total_pages?: number };
 }
 
 async function cfFetch<T>(creds: CloudflareCredentials, method: string, path: string, body?: unknown): Promise<CfEnvelope<T>> {
@@ -235,4 +235,60 @@ export async function countZones(creds: CloudflareCredentials): Promise<{ total:
   };
   const [total, pending] = await Promise.all([count({}), count({ status: 'pending' })]);
   return { total, pending };
+}
+
+// ---------------------------------------------------------------------------
+// DNS 记录
+
+export interface CfDnsRecord {
+  id: string;
+  type: string;
+  /** 完整域名 */
+  name: string;
+  content: string;
+  priority?: number;
+  proxied?: boolean;
+  proxiable?: boolean;
+  ttl: number;
+  /** 邮件服务写入的记录带 read_only / email_routing 标记 */
+  meta?: { read_only?: boolean; email_routing?: boolean } & Record<string, unknown>;
+  comment?: string | null;
+  tags?: string[];
+  modified_on?: string;
+  /** SRV、CAA 等结构化记录的字段 */
+  data?: Record<string, unknown>;
+}
+
+const DNS_PAGE_SIZE = 100;
+/** 分页上限，防止 result_info 异常时死循环 */
+const DNS_MAX_PAGES = 20;
+
+export async function listDnsRecords(creds: CloudflareCredentials, zoneId: string): Promise<CfDnsRecord[]> {
+  const records: CfDnsRecord[] = [];
+  for (let page = 1; page <= DNS_MAX_PAGES; page++) {
+    const query = new URLSearchParams({ page: String(page), per_page: String(DNS_PAGE_SIZE) });
+    const res = await cfFetch<CfDnsRecord[]>(creds, 'GET', `/zones/${zoneId}/dns_records?${query}`);
+    records.push(...(res.result ?? []));
+    if (!res.result?.length || page >= (res.result_info?.total_pages ?? 1)) break;
+  }
+  return records;
+}
+
+export function getDnsRecord(creds: CloudflareCredentials, zoneId: string, recordId: string): Promise<CfDnsRecord> {
+  return cf<CfDnsRecord>(creds, 'GET', `/zones/${zoneId}/dns_records/${recordId}`);
+}
+
+export function createDnsRecord(creds: CloudflareCredentials, zoneId: string, body: Record<string, unknown>): Promise<CfDnsRecord> {
+  return cf<CfDnsRecord>(creds, 'POST', `/zones/${zoneId}/dns_records`, body);
+}
+
+/** PATCH 只改传入的字段 */
+export function updateDnsRecord(
+  creds: CloudflareCredentials, zoneId: string, recordId: string, body: Record<string, unknown>,
+): Promise<CfDnsRecord> {
+  return cf<CfDnsRecord>(creds, 'PATCH', `/zones/${zoneId}/dns_records/${recordId}`, body);
+}
+
+export async function deleteDnsRecord(creds: CloudflareCredentials, zoneId: string, recordId: string): Promise<void> {
+  await cf(creds, 'DELETE', `/zones/${zoneId}/dns_records/${recordId}`);
 }

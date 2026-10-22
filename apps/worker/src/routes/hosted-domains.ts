@@ -1,15 +1,23 @@
 import {
-  createHostedDomainRequestSchema, replaceHostedDomainMembersRequestSchema, transferHostedDomainRequestSchema,
+  createHostedDomainRequestSchema, hostedDnsRecordInputSchema, replaceHostedDomainMembersRequestSchema, transferHostedDomainRequestSchema,
   updateHostedDomainRequestSchema,
 } from '@hpc-mail/shared';
 import { Hono } from 'hono';
+import { AppError } from '../lib/errors.js';
 import { clientIp, execCtx, ok, parseBody, parseId } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
   checkHostedDomain, createHostedDomain, deleteHostedDomain, getHostedDomain, listHostedDomainMembers, listMyHostedDomains,
   removeHostedDomainMember, replaceHostedDomainMembers, transferHostedDomain, updateHostedDomain,
 } from '../services/hosted-domain.js';
+import { createHostedDnsRecord, deleteHostedDnsRecord, listHostedDnsRecords, updateHostedDnsRecord } from '../services/hosted-dns.js';
 import type { AppContext } from '../types.js';
+
+/** Cloudflare 记录 ID 为 32 位十六进制，格式不对按记录不存在处理 */
+function parseRecordId(value: string | undefined): string {
+  if (!value || !/^[0-9a-f]{32}$/.test(value)) throw new AppError('not_found', '解析记录不存在');
+  return value;
+}
 
 /** 托管域名（JWT）：所有者与管理员管理，成员只读并可退出共享；没有权限的域名一律 404 */
 const app = new Hono<AppContext>();
@@ -52,6 +60,27 @@ app.delete('/:id/members/:userId', async (c) => {
 app.post('/:id/transfer', async (c) => {
   const req = await parseBody(c, transferHostedDomainRequestSchema);
   return ok(c, await transferHostedDomain(c.env, c.get('user')!, parseId(c.req.param('id')), req, clientIp(c)));
+});
+
+// DNS 解析：所有者与管理员读写该域名 zone 的常用记录，邮箱占用的记录只读
+app.get('/:id/dns-records', async (c) => ok(c, await listHostedDnsRecords(c.env, c.get('user')!, parseId(c.req.param('id')))));
+
+app.post('/:id/dns-records', async (c) => {
+  const id = parseId(c.req.param('id'));
+  const req = await parseBody(c, hostedDnsRecordInputSchema);
+  return ok(c, await createHostedDnsRecord(c.env, c.get('user')!, id, req, clientIp(c)), 201);
+});
+
+app.put('/:id/dns-records/:recordId', async (c) => {
+  const id = parseId(c.req.param('id'));
+  const recordId = parseRecordId(c.req.param('recordId'));
+  const req = await parseBody(c, hostedDnsRecordInputSchema);
+  return ok(c, await updateHostedDnsRecord(c.env, c.get('user')!, id, recordId, req, clientIp(c)));
+});
+
+app.delete('/:id/dns-records/:recordId', async (c) => {
+  await deleteHostedDnsRecord(c.env, c.get('user')!, parseId(c.req.param('id')), parseRecordId(c.req.param('recordId')), clientIp(c));
+  return ok(c, { success: true });
 });
 
 export default app;

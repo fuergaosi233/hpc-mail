@@ -151,7 +151,7 @@ async function loadViews(env: Env, viewer: Viewer, where: SQL | undefined, limit
 }
 
 /** 读取域名并判定查看者身份；没有任何权限时按不存在处理，不暴露他人域名 */
-async function loadAccess(env: Env, viewer: Viewer, id: number): Promise<{ row: HostedRow; access: Exclude<Access, null> }> {
+export async function loadAccess(env: Env, viewer: Viewer, id: number): Promise<{ row: HostedRow; access: Exclude<Access, null> }> {
   const db = createDb(env);
   const found = await db.select({
     row: hostedDomains,
@@ -162,7 +162,7 @@ async function loadAccess(env: Env, viewer: Viewer, id: number): Promise<{ row: 
   return { row: found.row, access };
 }
 
-function requireManage(access: Exclude<Access, null>): void {
+export function requireManage(access: Exclude<Access, null>): void {
   if (access === 'member') throw new AppError('forbidden', '只有域名所有者或管理员可以执行此操作');
 }
 
