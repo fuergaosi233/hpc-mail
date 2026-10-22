@@ -82,14 +82,16 @@ export function hostedDnsRelativeName(fqdn: string, domain: string): string {
   return value.endsWith(`.${domain}`) ? value.slice(0, -domain.length - 1) : value;
 }
 
-/** TXT 的多段字符串在解析时直接拼接："v=sp" "f1 -all" 等同于 v=spf1 -all */
-function txtValue(content: string): string {
-  const value = content.trim();
-  if (!value.startsWith('"')) return value;
-  return [...value.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((match) => match[1]).join('');
+/**
+ * 保守判断 SPF：多段字符串解析时直接拼接（"v=sp" "f1 -all"），还可能有 RFC 1035 转义（\118 即 v），
+ * 所以解码转义、去掉引号与空白后以 v=spf1 开头的一律算作 SPF
+ */
+function isSpf(content: string): boolean {
+  const decoded = content
+    .replace(/\\(\d{3})/g, (_, code: string) => String.fromCharCode(Number(code)))
+    .replace(/\\(.)/g, '$1');
+  return decoded.replace(/["\s]/g, '').toLowerCase().startsWith('v=spf1');
 }
-
-const isSpf = (content: string) => /^v=spf1(\s|$)/i.test(txtValue(content).trim());
 
 /**
  * 邮箱收发占用的记录：返回只读原因，其他记录返回空串。
