@@ -509,10 +509,10 @@ export function SettingsPage() {
             />
             <NumberRow
               label="每域自动认领上限"
-              description="未认领地址的来信会自动认领给域名所有者；域内地址达到该数后不再自动认领，新地址的来信拒收，防止随机地址的垃圾邮件无限建地址。手动认领不受此限。"
+              description="未认领地址的来信会自动认领给域名所有者。0 表示不限（默认）；设为正数时，域内地址达到该数后不再自动认领，新地址的来信拒收，可用来防止随机地址的垃圾邮件无限建地址。手动认领始终不受限。"
               value={draft.hosted_domains.autoClaimLimit}
               onChange={(v) => patch((s) => void (s.hosted_domains.autoClaimLimit = v))}
-              min={1}
+              min={0}
               max={100000}
               suffix="个"
             />

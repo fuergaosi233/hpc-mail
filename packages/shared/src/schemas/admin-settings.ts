@@ -178,8 +178,8 @@ export const hostedDomainsSettingSchema = z.object({
   maxPendingTotal: z.number().int().min(1).max(1000),
   /** 等待 NS 生效的天数，到期自动删除 zone（Cloudflare Free 计划 28 天后也会删除） */
   pendingDays: z.number().int().min(1).max(28),
-  /** 未认领地址的来信自动认领给域名所有者，域内地址达到该数后不再自动认领、新地址来信拒收（手动认领不受限） */
-  autoClaimLimit: z.number().int().min(1).max(100000).default(1000),
+  /** 未认领地址的来信自动认领给域名所有者。0（默认）不限；设为正数时，域内地址达到该数后不再自动认领、新地址来信拒收（手动认领始终不受限） */
+  autoClaimLimit: z.number().int().min(0).max(100000).default(0),
 });
 
 // gmail_forward / feishu / notify_webhook 已从系统设置下放为「每用户的个人转发与通知偏好」
@@ -223,7 +223,7 @@ export const DEFAULT_SETTINGS: Settings = {
   ai_model: { baseUrl: '', apiKey: '', model: '' },
   translation: { enabled: false, dailyCharsPerUser: 200_000 },
   claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 50, dailyLimit: 3 },
-  hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 1000 },
+  hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 0 },
 };
 
 export const updateSettingsRequestSchema = z

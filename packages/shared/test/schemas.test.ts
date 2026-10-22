@@ -6,6 +6,7 @@ import {
   createApiKeyRequestSchema,
   createInviteRequestSchema,
   DEFAULT_SETTINGS,
+  hostedDomainsSettingSchema,
   feishuSettingSchema,
   listMessagesQuerySchema,
   loginRequestSchema,
@@ -250,5 +251,16 @@ describe('AI 模型与翻译契约', () => {
     expect(aiModelTestRequestSchema.parse({})).toEqual({});
     expect(aiModelTestRequestSchema.parse({ apiKey: ' ****** ' })).toEqual({ apiKey: '******' });
     expect(aiModelTestRequestSchema.safeParse({ baseUrl: 'http://x.example' }).success).toBe(false);
+  });
+});
+
+describe('托管域名设置', () => {
+  it('自动认领上限默认 0（不限），可设为 0–100000', () => {
+    const base = { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7 };
+    expect(hostedDomainsSettingSchema.parse(base).autoClaimLimit).toBe(0);
+    expect(DEFAULT_SETTINGS.hosted_domains.autoClaimLimit).toBe(0);
+    expect(hostedDomainsSettingSchema.parse({ ...base, autoClaimLimit: 0 }).autoClaimLimit).toBe(0);
+    expect(hostedDomainsSettingSchema.parse({ ...base, autoClaimLimit: 500 }).autoClaimLimit).toBe(500);
+    for (const bad of [-1, 100001, 1.5]) expect(hostedDomainsSettingSchema.safeParse({ ...base, autoClaimLimit: bad }).success).toBe(false);
   });
 });
