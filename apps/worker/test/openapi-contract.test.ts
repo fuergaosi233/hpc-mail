@@ -50,6 +50,16 @@ describe('OpenAPI routes and public contracts', () => {
     expect(rules.suspendedPercent!.deprecated).toBe(true);
   });
 
+  it('documents hosted-domain DNS records with string record ids and one input variant per supported type', () => {
+    const params = specs.api.paths['/hosted-domains/{id}/dns-records/{recordId}']!.parameters as unknown as Array<{ name: string; schema: Schema }>;
+    expect(params.find((param) => param.name === 'recordId')?.schema).toMatchObject({ type: 'string', pattern: '^[0-9a-f]{32}$' });
+    const input = specs.api.components.schemas.HostedDnsRecordInput!;
+    expect((input.oneOf as Schema[]).map((variant) => ((variant.properties as Record<string, Schema>).type as Schema).const))
+      .toEqual(['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'SRV', 'CAA']);
+    expect((specs.api.components.schemas.HostedDnsRecord!.properties as Record<string, Schema>).kind).toMatchObject({ enum: ['user', 'mail', 'readonly'] });
+    expect(specs.v1.paths).not.toHaveProperty('/hosted-domains/{id}/dns-records');
+  });
+
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
     const mounted = [...new Set(app.routes.filter(route => methods.has(route.method.toLowerCase()) && !route.path.includes('*'))
       .map(route => `${route.method} ${route.path.replace(/\/$/, '').replace(/:([^/]+)/g, '{$1}')}`))].sort();

@@ -8,7 +8,7 @@ import {
   createInviteRequestSchema, replaceMailboxSharesRequestSchema, batchShareMailboxesRequestSchema, updateSettingsRequestSchema,
   updateNotifyPrefsRequestSchema, userNotifyPrefsSchema, translateMessageRequestSchema, aiModelTestRequestSchema,
   HOSTED_DOMAIN_STATUSES, createHostedDomainRequestSchema, updateHostedDomainRequestSchema, replaceHostedDomainMembersRequestSchema,
-  transferHostedDomainRequestSchema,
+  transferHostedDomainRequestSchema, HOSTED_DNS_CAA_TAGS, HOSTED_DNS_TTL_AUTO, hostedDnsRecordInputSchema,
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
 } from '@hpc-mail/shared';
 
@@ -23,6 +23,7 @@ export const date: Schema = { type: 'string', format: 'date-time' };
 export const domainName: Schema = { type: 'string', minLength: 1, maxLength: 253,
   pattern: '^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$',
   description: 'Normalized lowercase DNS name. Each label is 1–63 characters and cannot start/end with a hyphen.' };
+export const dnsRecordId: Schema = { type: 'string', pattern: '^[0-9a-f]{32}$', description: 'Cloudflare DNS record id: 32 lowercase hex characters.' };
 export const ref = (name: string): Schema => ({ $ref: `#/components/schemas/${name}` });
 export const array = (items: Schema): Schema => ({ type: 'array', items });
 export const nullable = (schema: Schema): Schema => ({ anyOf: [schema, { type: 'null' }] });
@@ -182,6 +183,32 @@ export const schemas: Record<string, Schema> = {
     movedMailboxes: { ...int, description: 'Mailboxes of the previous owner moved with the domain when includeMailboxes was true.' } }),
   HostedDomainsHealth: object({ enabled: bool, configured: { ...bool, description: 'Worker secrets cf_api_token and cf_account_id are set.' },
     tokenValid: nullable(bool), error: str, accountZones: nullable(int), accountPendingZones: nullable(int) }),
+  HostedDnsRecord: object({
+    id: dnsRecordId,
+    type: { ...str, description: 'Cloudflare record type; readonly records may use types outside the editable A/AAAA/CNAME/TXT/MX/SRV/CAA.' },
+    name: { ...str, description: 'Relative name: @ for the root, otherwise the name without the domain suffix, e.g. www, _acme-challenge, *.dev.' },
+    fqdn: str,
+    content: { ...str, description: 'Value as returned by Cloudflare. TXT may be quoted; SRV is "weight port target"; CAA is flags tag "value".' },
+    ttl: { ...positiveId, description: '1 means automatic.' },
+    priority: { ...nullable(int), description: 'MX preference; null for other types.' },
+    srv: nullable(object({ priority: int, weight: int, port: int, target: str })),
+    caa: nullable(object({ flags: { type: 'integer', enum: [0, 128] }, tag: { type: 'string', enum: HOSTED_DNS_CAA_TAGS }, value: str })),
+    proxied: { ...bool, description: 'Cloudflare proxy. This site never enables it; proxied records are readonly.' },
+    comment: str,
+    kind: { type: 'string', enum: ['user', 'mail', 'readonly'],
+      description: 'user: editable here. mail: used by receiving or sending (root MX and SPF, _dmarc, DKIM under _domainkey, cf-bounce, or marked by Cloudflare Email); never editable. readonly: a type this site does not edit, or proxied.' },
+    lockedReason: { ...str, description: 'Why a mail or readonly record cannot be changed; empty for user records.' },
+    modifiedAt: nullable(date),
+  }),
+  HostedDnsRecordInput: (() => {
+    const schema = fromZod(hostedDnsRecordInputSchema);
+    for (const variant of schema.oneOf as Schema[]) {
+      (variant.properties as Record<string, Schema>).ttl = { type: 'integer',
+        anyOf: [{ const: HOSTED_DNS_TTL_AUTO }, { minimum: 60, maximum: 86400 }], description: '1 means automatic.' };
+    }
+    schema.description = 'Selected by type. name is relative (@ for the root, www, _dmarc, *.dev) or a full name ending with the domain. ttl is 1 (automatic) or 60–86400 seconds. A/AAAA/CNAME/TXT use content, MX uses content and priority, SRV uses srv, CAA uses caa. comment is optional (empty clears it on update).';
+    return schema;
+  })(),
   CreateHostedDomainRequest: fromZod(createHostedDomainRequestSchema), UpdateHostedDomainRequest: fromZod(updateHostedDomainRequestSchema),
   ReplaceHostedDomainMembersRequest: fromZod(replaceHostedDomainMembersRequestSchema), TransferHostedDomainRequest: fromZod(transferHostedDomainRequestSchema),
   TranslateMessageRequest: (() => {
@@ -261,7 +288,8 @@ export function describePaths(paths: Paths, namespace = ''): Paths {
   return Object.fromEntries(Object.entries(paths).map(([path, methods]) => [path, {
     ...methods,
     ...(Array.from(path.matchAll(/\{([^}]+)\}/g)).length ? { parameters: Array.from(path.matchAll(/\{([^}]+)\}/g), match => ({
-      name: match[1], in: 'path', required: true, schema: match[1] === 'token' ? { type: 'string', minLength: 1 } : positiveId,
+      name: match[1], in: 'path', required: true,
+      schema: match[1] === 'token' ? { type: 'string', minLength: 1 } : match[1] === 'recordId' ? dnsRecordId : positiveId,
     })) } : {}),
     ...Object.fromEntries(Object.entries(methods).map(([method, value]) => [method, {
       ...value, operationId: `${namespace}${method}_${path.replace(/[^a-zA-Z0-9]+/g, '_')}`,
