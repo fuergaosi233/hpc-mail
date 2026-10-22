@@ -22,9 +22,16 @@ type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
 
 /** 每位用户每分钟的解析请求计数（四个接口共用，管理员也计） */
 export const HOSTED_DNS_RATE_SCOPE = 'hosted_dns';
-/** 全站每分钟的解析请求计数：所有用户共用站长的 Cloudflare Token（1200 次/5 分钟），给定时开通任务留出余量 */
+/**
+ * 全站每分钟由解析功能发出的 Cloudflare 调用数。所有托管域名共用站长的 Token（全局 1200 次/5 分钟），
+ * 这里只限制本功能占用的份额（150 次/分钟，即 5 分钟 750 次），给定时开通、立即检测和控制台留出余量；
+ * 只有能走到 Cloudflare 的请求才计入，按各接口实际的调用次数加权。
+ */
 export const HOSTED_DNS_SITE_RATE_SCOPE = 'hosted_dns_site';
-export const MAX_HOSTED_DNS_SITE_REQUESTS_PER_MINUTE = 60;
+export const MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE = 150;
+/** 每种操作的 Cloudflare 调用次数：列表 1；新增先列表再 POST；修改、删除先 GET 再写入 */
+const CF_CALLS = { list: 1, create: 2, update: 2, delete: 2 } as const;
+type DnsOperation = keyof typeof CF_CALLS;
 const AUDIT_VALUE_MAX = 80;
 const SUPPORTED = new Set<string>(HOSTED_DNS_RECORD_TYPES);
 const CAA_TAGS = new Set<string>(HOSTED_DNS_CAA_TAGS);
@@ -36,28 +43,37 @@ interface DnsZone {
   domain: string;
 }
 
-/** 个人与全站计数合成一个 batch；已超出个人限额的请求不再占全站额度，单个用户刷不满全站 */
-async function countRequest(env: Env, viewer: Viewer): Promise<{ user: number; site: number }> {
+/**
+ * 个人计数按请求数，全站计数按 Cloudflare 调用次数，合成一个 batch。全站计数由守卫条件把关，
+ * 只计能走到 Cloudflare 的请求：个人未超限，域名存在、zone 已建好、不在删除中，调用者是所有者或管理员，
+ * 暂停的域名只有管理员能写；无关用户、成员与其他被拒绝的请求占不了全站额度。
+ */
+async function countRequest(env: Env, viewer: Viewer, id: number, op: DnsOperation): Promise<{ user: number; site: number }> {
   const window = minuteWindow(1);
   const subject = String(viewer.id);
+  const admin = viewer.role === 'admin' ? 1 : 0;
   const [user, site] = await env.db.batch([
     counterStatement(env, HOSTED_DNS_RATE_SCOPE, subject, window),
-    counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window, 1, 0, {
-      sql: `(SELECT count FROM rate_counters WHERE scope = ? AND subject = ? AND "window" = ?) <= ?`,
-      params: [HOSTED_DNS_RATE_SCOPE, subject, window, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE],
+    counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window, CF_CALLS[op], 0, {
+      sql: `(SELECT count FROM rate_counters WHERE scope = ? AND subject = ? AND "window" = ?) <= ?
+        AND EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND zone_id IS NOT NULL AND status <> 'deleting'
+          AND (user_id = ? OR ? = 1) AND (? = 0 OR ? = 1 OR status <> 'suspended'))`,
+      params: [HOSTED_DNS_RATE_SCOPE, subject, window, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE,
+        id, viewer.id, admin, op === 'list' ? 0 : 1, admin],
     }),
   ]);
   return { user: counterResult(user)?.count ?? 1, site: counterResult(site)?.count ?? 0 };
 }
 
-/** 凭据、限流、权限与域名状态；限流计数和读取域名并行，无权访问的请求同样计数 */
-async function openZone(env: Env, viewer: Viewer, id: number, write: boolean): Promise<DnsZone> {
+/** 凭据、限流、权限与域名状态；限流计数和读取域名并行，无权访问的请求同样计入个人限额 */
+async function openZone(env: Env, viewer: Viewer, id: number, op: DnsOperation): Promise<DnsZone> {
   const creds = cloudflareCredentials(env);
   if (!creds) throw new AppError('forbidden', '本站未开启域名托管');
-  const [counter, loaded] = await Promise.allSettled([countRequest(env, viewer), loadAccess(env, viewer, id)]);
+  const write = op !== 'list';
+  const [counter, loaded] = await Promise.allSettled([countRequest(env, viewer, id, op), loadAccess(env, viewer, id)]);
   if (counter.status === 'rejected') throw counter.reason;
   if (counter.value.user > MAX_HOSTED_DNS_REQUESTS_PER_MINUTE) throw new AppError('rate_limited', '解析操作过于频繁，请稍后再试');
-  if (counter.value.site > MAX_HOSTED_DNS_SITE_REQUESTS_PER_MINUTE) throw new AppError('rate_limited', '当前解析操作较多，请稍后再试');
+  if (counter.value.site > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) throw new AppError('rate_limited', '当前解析操作较多，请稍后再试');
   if (loaded.status === 'rejected') throw loaded.reason;
   const { row, access } = loaded.value;
   requireManage(access);
@@ -69,11 +85,12 @@ async function openZone(env: Env, viewer: Viewer, id: number, write: boolean): P
 
 function dnsError(error: unknown): AppError {
   if (error instanceof AppError) return error;
-  if (!(error instanceof CloudflareApiError) || error.status === 0 || error.status >= 500) {
-    return new AppError('internal', 'Cloudflare 暂时没有响应，请稍后重试');
+  // 超时、5xx，以及 2xx 但响应体读不出来（写入可能已生效）：结果都不确定
+  if (!(error instanceof CloudflareApiError) || error.status === 0 || error.status >= 500 || error.status < 400) {
+    return new AppError('internal', 'Cloudflare 没有返回明确结果，请刷新列表确认是否已生效');
   }
   if (error.status === 429) return new AppError('rate_limited', 'Cloudflare 接口繁忙，请稍后再试');
-  if (error.has(81053, 81054, 81057, 81058)) return new AppError('conflict', '已存在冲突的记录：同名下已有相同或不能共存的记录');
+  if (error.has(81053, 81054, 81056, 81057, 81058)) return new AppError('conflict', '已存在冲突的记录：同名下已有相同或不能共存的记录');
   // 不存在的 zone 返回 403/9109 或 404/7003；凭据失效同样只能由站长处理
   if (error.has(9109, 7003) || error.status === 401 || error.status === 403) {
     return new AppError('conflict', 'Cloudflare 中的域名已不可用，请联系管理员');
@@ -94,8 +111,13 @@ function classify(record: CfDnsRecord, fqdn: string, domain: string): { kind: Ho
   const type = record.type.toUpperCase();
   const mail = hostedDnsMailReason({ type, fqdn, content: record.content ?? '' }, domain);
   if (mail) return { kind: 'mail', lockedReason: mail };
-  if (record.meta?.read_only || record.meta?.email_routing) return { kind: 'mail', lockedReason: '由 Cloudflare 邮件服务自动维护' };
+  if (record.meta?.email_routing) return { kind: 'mail', lockedReason: '由 Cloudflare 邮件服务自动维护' };
+  // 只有 read_only 的记录来自 Worker 自定义域名等其他服务
+  if (record.meta?.read_only) return { kind: 'readonly', lockedReason: '由 Cloudflare 其他服务自动维护' };
   if (!SUPPORTED.has(type)) return { kind: 'readonly', lockedReason: `本站暂不支持编辑 ${type} 记录` };
+  // 在控制台建的根域 CNAME 等：本站保存时会被冲突校验拒绝，只读展示
+  const conflict = hostedDnsConflictReason({ type, fqdn, content: record.content ?? '' }, domain);
+  if (conflict) return { kind: 'readonly', lockedReason: conflict };
   // 表单只支持这几种 tag 与 flags，其他 CAA 记录无法回填编辑
   if (type === 'CAA' && !(CAA_TAGS.has(String(record.data?.tag)) && CAA_FLAGS.has(Number(record.data?.flags)))) {
     return { kind: 'readonly', lockedReason: '本站暂不支持编辑该 CAA 记录' };
@@ -180,7 +202,7 @@ function shown(record: HostedDnsRecord): string {
 }
 
 export async function listHostedDnsRecords(env: Env, viewer: Viewer, id: number): Promise<HostedDnsRecord[]> {
-  const zone = await openZone(env, viewer, id, false);
+  const zone = await openZone(env, viewer, id, 'list');
   const records = await cfCall(() => listDnsRecords(zone.creds, zone.zoneId));
   return records.map((record) => toRecord(record, zone.domain)).sort(byName);
 }
@@ -188,7 +210,7 @@ export async function listHostedDnsRecords(env: Env, viewer: Viewer, id: number)
 export async function createHostedDnsRecord(
   env: Env, viewer: Viewer, id: number, input: HostedDnsRecordParsed, ip = '',
 ): Promise<HostedDnsRecord> {
-  const zone = await openZone(env, viewer, id, true);
+  const zone = await openZone(env, viewer, id, 'create');
   const fqdn = checkInput(input, zone.domain);
   const existing = await cfCall(() => listDnsRecords(zone.creds, zone.zoneId));
   const used = existing.filter((record) => toRecord(record, zone.domain).kind !== 'mail').length;
@@ -201,11 +223,12 @@ export async function createHostedDnsRecord(
 export async function updateHostedDnsRecord(
   env: Env, viewer: Viewer, id: number, recordId: string, input: HostedDnsRecordParsed, ip = '',
 ): Promise<HostedDnsRecord> {
-  const zone = await openZone(env, viewer, id, true);
-  const fqdn = checkInput(input, zone.domain);
+  const zone = await openZone(env, viewer, id, 'update');
+  // 先确认记录存在且可编辑（404/403），再校验类型与新内容（400）
   const before = toRecord(await cfCall(() => getDnsRecord(zone.creds, zone.zoneId, recordId)), zone.domain);
   requireEditable(before);
   if (before.type !== input.type) throw new AppError('validation_failed', '不能修改记录类型，请删除后重新添加');
+  const fqdn = checkInput(input, zone.domain);
   const after = toRecord(await cfCall(() => updateDnsRecord(zone.creds, zone.zoneId, recordId, cfBody(input, fqdn, false))), zone.domain);
   const name = before.name === after.name ? after.name : `${before.name}→${after.name}`;
   await logAdminAction(env, viewer, 'hosted_domain.dns', zone.domain, `修改 ${after.type} ${name}：${shown(before)} → ${shown(after)}`, ip);
@@ -213,7 +236,7 @@ export async function updateHostedDnsRecord(
 }
 
 export async function deleteHostedDnsRecord(env: Env, viewer: Viewer, id: number, recordId: string, ip = ''): Promise<void> {
-  const zone = await openZone(env, viewer, id, true);
+  const zone = await openZone(env, viewer, id, 'delete');
   const record = toRecord(await cfCall(() => getDnsRecord(zone.creds, zone.zoneId, recordId)), zone.domain);
   requireEditable(record);
   await cfCall(() => deleteDnsRecord(zone.creds, zone.zoneId, recordId));
