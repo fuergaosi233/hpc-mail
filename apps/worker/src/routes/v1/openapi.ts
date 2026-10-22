@@ -1,5 +1,5 @@
 import {
-  array, bool, changed, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, operation,
+  array, bool, changed, claimStrategy, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, operation,
   positiveId, query, ref, scopeQuery, specInfo, specificationOperation, str, uploadPaths, usedSchemas, type Paths,
 } from '../openapi-common.js';
 
@@ -15,13 +15,13 @@ export function buildOpenApiSpec(origin: string) {
     '/mailboxes': {
       get: operation('List owned mailboxes', array(ref('Mailbox')), { scope: 'mailbox.read', parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator-only, explicit all=1 lists every owner. Default lists caller-owned mailboxes.')] }),
       post: operation('Claim a mailbox in an existing configured domain', ref('Mailbox'), { request: 'ClaimMailboxRequest', scope: 'mailbox.write', status: 201,
-        description: 'Use a domain returned by GET /domains. Does not register a domain or provision DNS. Ordinary users obey system reserved-prefix restrictions and their effective public or dedicated domain/total/per-domain quotas. Dedicated policies replace public limits. Claiming inherits all historical mail at this address. A concurrent domain or user permission change returns 409. Existing owned mailboxes remain usable after permissions tighten.' }),
+        description: 'Use a domain returned by GET /domains. Does not register a domain or provision DNS. Ordinary users obey system reserved-prefix restrictions and their effective public or dedicated domain/total/per-domain quotas. Dedicated policies replace public limits. Claiming inherits all historical mail at this address. A concurrent domain or user permission change returns 409. Existing owned mailboxes remain usable after permissions tighten. Optional strategy=claude rejects any domain with a historical Claude suspension with 403 forbidden, including for administrators and hosted domains; checked atomically at insertion. Omitted or uniform preserves ordinary claims.' }),
     },
     '/mailboxes/shared': { get: operation('List inboxes shared with the caller', array(ref('SharedMailbox')), { scope: 'mailbox.read',
       description: 'Read-only inbound access. Shares do not grant send/delete/forward-notification rights. The read state of shared mail belongs to the owner: readers cannot change it, and it is excluded from their unread count and unread=1 list filter. Stars are personal.' }) },
     '/mailboxes/availability': { get: operation('Check address availability', ref('MailboxAvailability'), { scope: 'mailbox.read', parameters: [
-      query('localPart', { type: 'string', minLength: 1, maxLength: 64 }, undefined, true), query('domain', str, 'Use a visible configured domain.', true)],
-      description: 'Advisory and not a reservation. Uses the same rules as claiming; when available=false, reason is taken, reserved, quota, domain_limit or domain_unavailable. A subsequent claim still re-checks everything, including concurrent ownership.' }) },
+      query('localPart', { type: 'string', minLength: 1, maxLength: 64 }, undefined, true), query('domain', str, 'Use a visible configured domain.', true), query('strategy', claimStrategy)],
+      description: 'Advisory and not a reservation. Uses the same rules as claiming; when available=false, reason is taken, reserved, quota, domain_limit, domain_unavailable or claude_suspended. A subsequent claim still re-checks everything, including concurrent ownership.' }) },
     '/mailboxes/{id}': {
       put: operation('Update mailbox display name', ref('Mailbox'), { scope: 'mailbox.write', request: 'UpdateMailboxRequest' }),
       delete: operation('Release a mailbox', object({ success: bool, deletedMessages: int }), { scope: 'mailbox.write', parameters: [query('deleteHistory', { type: 'string', enum: ['1', 'true', '0', 'false'] })],

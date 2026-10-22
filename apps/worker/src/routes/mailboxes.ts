@@ -71,7 +71,7 @@ app.post('/availability/batch', async (c) => {
   return ok(c, await checkAvailabilityBatch(c.env, { userId: user.id, role: user.role }, req.items));
 });
 
-/** 随机后缀分配（不认领）：uniform 等概率；claude 按后缀封号数、再按账号数均衡 */
+/** 随机后缀分配（不认领）：uniform 等概率；claude 只在零封号域名中按账号负载均衡 */
 app.get('/random-plan', async (c) => {
   const req = parseQuery(c, claimPlanQuerySchema);
   const user = c.get('user')!;
@@ -81,7 +81,7 @@ app.get('/random-plan', async (c) => {
 app.get('/availability', async (c) => {
   const req = parseQuery(c, claimMailboxRequestSchema);
   const user = c.get('user')!;
-  return ok(c, await checkAvailability(c.env, { userId: user.id, role: user.role }, req.localPart, req.domain));
+  return ok(c, await checkAvailability(c.env, { userId: user.id, role: user.role }, req.localPart, req.domain, req.strategy));
 });
 
 app.post('/', async (c) => {

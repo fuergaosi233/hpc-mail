@@ -7,8 +7,6 @@ import { mergeSettingRows } from './setting.js';
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** 未注册邮箱按认领天数分桶读取，窗口上限与 claim_random.pendingDays 的上限一致 */
 const PENDING_MAX_DAYS = 90;
-/** 按封号率排除至少需要的封号数：只有 1 个封号时样本太小，交给全军覆没规则判断 */
-const RATE_MIN_SUSPENDED = 2;
 
 interface DomainCounts {
   accounts: number;
@@ -54,18 +52,9 @@ function domainCountsFrom(stats: D1Result | undefined, pending: D1Result | undef
   return counts;
 }
 
-type RiskRules = Pick<Settings['claim_random'], 'paidSuspendedLimit' | 'suspendedPercent'>;
-
-/**
- * wiped：账号全被封或付费号全被封；paid_suspended：付费被封达到阈值；suspended_rate：封号至少 2 个且封号率达到阈值。
- * 阈值为 0 表示不按该条排除。封号记录不随时间衰减：后缀出现封号后，之后注册的号被封的比例明显更高。
- */
-export function domainRisk(counts: DomainCounts, rules: RiskRules): DomainClaudeStats['risk'] {
-  if ((counts.accounts > 0 && counts.accounts === counts.suspended) || (counts.paid > 0 && counts.paid === counts.paidSuspended)) return 'wiped';
-  if (rules.paidSuspendedLimit > 0 && counts.paidSuspended >= rules.paidSuspendedLimit) return 'paid_suspended';
-  if (rules.suspendedPercent > 0 && counts.suspended >= RATE_MIN_SUSPENDED
-    && counts.suspended * 100 >= rules.suspendedPercent * counts.accounts) return 'suspended_rate';
-  return null;
+/** 任意历史封号均排除，不受账号数、付费状态或已弃用阈值影响。 */
+export function domainRisk(counts: Pick<DomainCounts, 'suspended'>): DomainClaudeStats['risk'] {
+  return counts.suspended > 0 ? 'suspended' : null;
 }
 
 export interface PlanCandidate {
@@ -84,20 +73,14 @@ function randomIndex(n: number): number {
 }
 
 /**
- * Claude 低风险分配：逐个分配，每次取（封号数, 负载）最小的后缀，平局随机；分到后负载 +1。
- * 效果是先用封号最少的后缀，并把这些后缀的负载拉平，单个后缀上的账号尽量少。
- * 每域额度用完才轮到封号更多的后缀。dailyLimit 大于 0 时，近 24 小时新增达到上限的后缀当天不再分配；
- * 封号最少的这一档都满了就停，不因每日上限挪到封号更多的后缀：同一后缀一天内集中注册多个号，
- * 历史上多次当天就被成批封掉，宁可少分。
+ * Claude 0 封号分配：只取没有封号记录的后缀，逐个选择负载最小的后缀，平局随机。
+ * 每分到一个就累计负载与近 24 小时新增；每日上限或每域额度用完就停，不能溢出到有封号的后缀。
  */
 export function allocateLowRisk(candidates: PlanCandidate[], count: number, dailyLimit = 0, random = randomIndex): ClaimPlanItem[] {
-  const pool = candidates.map((candidate) => ({ ...candidate }));
+  const pool = candidates.filter((candidate) => candidate.suspended === 0).map((candidate) => ({ ...candidate }));
   const items: ClaimPlanItem[] = [];
   while (items.length < count) {
-    const open = pool.filter((candidate) => candidate.remaining > 0);
-    if (open.length === 0) break;
-    const best = Math.min(...open.map((candidate) => candidate.suspended));
-    const safest = open.filter((candidate) => candidate.suspended === best && (dailyLimit === 0 || candidate.recent < dailyLimit));
+    const safest = pool.filter((candidate) => candidate.remaining > 0 && (dailyLimit === 0 || candidate.recent < dailyLimit));
     if (safest.length === 0) break;
     const lightest = Math.min(...safest.map((candidate) => candidate.load));
     const ties = safest.filter((candidate) => candidate.load === lightest);
@@ -164,7 +147,7 @@ export async function planRandomDomains(
       };
     });
   const eligible = strategy === 'claude'
-    ? candidates.filter(({ domain }) => domainRisk(counts.get(domain) ?? EMPTY_COUNTS, rules) === null)
+    ? candidates.filter(({ domain }) => domainRisk(counts.get(domain) ?? EMPTY_COUNTS) === null)
     : candidates;
   const dailyLimit = strategy === 'claude' ? rules.dailyLimit : 0;
   const totalRemaining = policy.perUserLimit > 0 ? Math.max(0, policy.perUserLimit - owned.total) : Infinity;
@@ -174,7 +157,7 @@ export async function planRandomDomains(
   return {
     strategy,
     items,
-    pool: candidates.filter((candidate) => candidate.remaining > 0).map((candidate) => candidate.domain),
+    pool: eligible.filter((candidate) => candidate.remaining > 0).map((candidate) => candidate.domain),
     shortfall,
     reason: shortfall === 0 ? null : shortfallReason(eligible, items, target, count),
   };
@@ -186,7 +169,7 @@ function shortfallReason(eligible: PlanCandidate[], items: ClaimPlanItem[], targ
   if (items.length === target && target < count) return 'quota';
   const allocated = new Map<string, number>();
   for (const item of items) allocated.set(item.domain, (allocated.get(item.domain) ?? 0) + 1);
-  // 分配停在没有可分的后缀：还有剩余每域额度，说明是封号最少的那一档都到了每日上限
+  // 分配停在没有可分的后缀：还有剩余每域额度，说明零封号候选都到了每日上限
   return eligible.some((candidate) => candidate.remaining > (allocated.get(candidate.domain) ?? 0)) ? 'daily_limit' : 'domain_quota';
 }
 
@@ -200,6 +183,6 @@ export async function getDomainClaudeStats(env: Env): Promise<DomainClaudeStats[
   const counts = domainCountsFrom(statsResult, pendingResult, settings.claim_random.pendingDays);
   return settings.domains.list.map(({ domain }) => {
     const domainCounts = counts.get(domain) ?? EMPTY_COUNTS;
-    return { domain, ...domainCounts, risk: domainRisk(domainCounts, settings.claim_random) };
+    return { domain, ...domainCounts, risk: domainRisk(domainCounts) };
   });
 }

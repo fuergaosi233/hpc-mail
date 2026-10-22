@@ -34,6 +34,10 @@ export function fromZod(schema: { toJSONSchema(params: { io: 'input' | 'output';
   const { $schema: _dialect, ...result } = schema.toJSONSchema({ io, unrepresentable: 'any' }) as Schema;
   return result;
 }
+export const claimStrategy: Schema = { type: 'string', enum: ['uniform', 'claude'],
+  description: 'Optional. Omitted or uniform uses ordinary claim rules. claude rejects any domain with a historical Claude suspension, including for administrators and hosted domains; writes recheck atomically and return 403 forbidden: 该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领. Historical observations do not guarantee future safety.' };
+const claimRequest = fromZod(claimMailboxRequestSchema);
+(claimRequest.properties as Record<string, Schema>).strategy = claimStrategy;
 const send = fromZod(internalSendMailSchema);
 const sendProperties = send.properties as Record<string, Schema>;
 sendProperties.from = { ...sendProperties.from, oneOf: [
@@ -54,7 +58,7 @@ const domains = fromZod(SETTING_SCHEMAS.domains, 'output');
 const domainEntry = ((domains.properties as Record<string, Schema>).list!.items) as Schema;
 (domainEntry.properties as Record<string, Schema>).domain = domainName;
 (domainEntry.properties as Record<string, Schema>).random = { ...bool,
-  description: 'Whether random suffix generation in the claim dialog (uniform and Claude low-risk) may pick this domain. Omitted means true; false keeps it available for manual selection only.' };
+  description: 'Whether random suffix generation in the claim dialog (uniform and Claude zero-suspension) may pick this domain. Omitted means true; false keeps it available for manual selection only.' };
 const settingsUpdate = fromZod(updateSettingsRequestSchema);
 (settingsUpdate.properties as Record<string, Schema>).domains = object({ list: { ...array({ anyOf: [domainName, domainEntry] }), maxItems: 64, 'x-unique-normalized-domain': true }, revision: int }, ['revision']);
 settingsUpdate.description = 'Partial settings update. A domains replacement requires expectedDomainsRevision from the latest GET; stale revisions return 409. Adding a domain does not configure DNS or Cloudflare Email Routing. Removing a domain only removes new-claim availability, and preserves existing mailbox routing. At least one setting key is required.';
@@ -65,7 +69,11 @@ for (const schema of [settingsResponse, settingsUpdate]) {
   properties.ai_model!.description = 'The single OpenAI-compatible Chat Completions model used by every AI feature: message translation and the inbound verification-code fallback. Configured means baseUrl, apiKey and model are all nonempty; baseUrl must be https and excludes /chat/completions. When translation is enabled, segments a user chooses to translate are sent to it; when code_extract.aiEnabled is on, the subject and first 6000 body characters of inbound mail that the regex could not resolve and that mentions a code-related keyword are sent to it. Unconfigured: translation is unavailable and code extraction uses regex only.';
   const aiFields = properties.ai_model!.properties as Record<string, Schema>;
   aiFields.apiKey = { ...aiFields.apiKey, description: 'Write-only provider key. Responses return ****** when a key is stored (empty string when none). Submitting ****** keeps the stored key; an empty string clears it.' };
-  properties.claim_random!.description = 'Rules for the Claude low-risk random suffix strategy. Domains where every Claude account, or every paid account, was suspended are always excluded. paidSuspendedLimit also excludes domains with at least that many suspended paid accounts (0 disables this rule). suspendedPercent excludes domains with at least 2 suspended accounts whose suspended share of accounts reaches that percentage (0 disables). pendingDays counts mailboxes claimed within that many days that have not yet received Claude mail as load (0 disables). dailyLimit stops allocating a domain for the day once its new additions in the last 24 hours (Claude accounts first seen plus newly claimed mailboxes without Claude mail) reach that number; when every domain in the least-suspended tier has reached it, allocation stops instead of moving to domains with more suspensions (0 disables). Which domains take part in random generation is set per domain with domains.list[].random.';
+  properties.claim_random!.description = 'Rules for the Claude zero-suspension random suffix strategy. Any historical suspension excludes a domain. paidSuspendedLimit and suspendedPercent are deprecated compatibility fields and never change eligibility, including when zero. pendingDays counts recently claimed mailboxes without Claude mail as load (0 disables). dailyLimit caps additions in the last 24 hours (Claude accounts first seen plus new claims without Claude mail), including this plan (0 disables); full zero-suspension domains never spill over to suspended domains. domains.list[].random controls participation.';
+  const claimFields = properties.claim_random!.properties as Record<string, Schema>;
+  for (const name of ['paidSuspendedLimit', 'suspendedPercent']) {
+    claimFields[name] = { ...claimFields[name], deprecated: true, description: 'Compatibility only; ignored for eligibility. Any historical Claude suspension always excludes the domain.' };
+  }
   properties.translation!.description = 'AI translation switch and quota. Enabling requires a configured ai_model (checked against the merged result when both are submitted). dailyCharsPerUser limits characters sent per user per UTC day, administrators included; 0 is unlimited.';
 }
 const notifyPrefs = fromZod(userNotifyPrefsSchema, 'output');
@@ -115,19 +123,19 @@ export const schemas: Record<string, Schema> = {
     strategy: { type: 'string', enum: ['uniform', 'claude'] },
     items: { ...array(object({ domain: str, suspended: { ...int, description: 'Addresses on this domain that received a Claude suspension email, judged from historical official mail.' } })),
       description: 'Allocated domains in allocation order; at most count items. Prefixes are chosen by the client.' },
-    pool: { ...array(str), description: 'Domains the caller can claim that take part in random generation and still have quota.' },
+    pool: { ...array(str), description: 'Domains the caller can claim that take part in random generation, still have quota, and satisfy this strategy. claude excludes every domain with a historical suspension.' },
     shortfall: { ...int, description: 'count minus items length.' },
     reason: nullable({ type: 'string', enum: ['quota', 'domain_quota', 'daily_limit', 'no_candidates'],
-      description: 'quota: the per-user total claim limit ran out; domain_quota: per-domain limits of the eligible domains ran out; daily_limit (claude only): every domain in the least-suspended tier with quota left reached claim_random.dailyLimit for the last 24 hours; no_candidates: no eligible domain.' }) }),
+      description: 'quota: the per-user total claim limit ran out; domain_quota: per-domain limits of the eligible domains ran out; daily_limit (claude only): every zero-suspension domain with quota left reached claim_random.dailyLimit for the last 24 hours; no_candidates: no eligible domain.' }) }),
   DomainClaudeStats: object({ domain: str,
     accounts: { ...int, description: 'Addresses that received a Claude welcome, receipt, subscription confirmation, suspension or Claude product email from official senders.' },
     suspended: int, paid: int, paidSuspended: int,
     pending: { ...int, description: 'Mailboxes claimed within claim_random.pendingDays that have not received Claude mail.' },
-    recent: { ...int, description: 'New in the last 24 hours: Claude accounts first seen plus newly claimed mailboxes without Claude mail. The Claude low-risk strategy stops allocating the domain once this reaches claim_random.dailyLimit.' },
-    risk: nullable({ type: 'string', enum: ['wiped', 'paid_suspended', 'suspended_rate'], description: 'wiped: every account or every paid account was suspended; paid_suspended: suspended paid accounts reached claim_random.paidSuspendedLimit; suspended_rate: at least 2 suspended accounts and the suspended share reached claim_random.suspendedPercent. All are excluded from the Claude low-risk strategy.' }) }),
+    recent: { ...int, description: 'New in the last 24 hours: Claude accounts first seen plus newly claimed mailboxes without Claude mail. The Claude zero-suspension strategy stops allocating the domain once this reaches claim_random.dailyLimit.' },
+    risk: nullable({ type: 'string', enum: ['suspended', 'wiped', 'paid_suspended', 'suspended_rate'], description: 'suspended: any historical suspension exists, so the domain is excluded from the Claude zero-suspension strategy. Legacy enum values are retained for compatibility; new responses use suspended or null. Historical observations do not guarantee future safety.' }) }),
   MailboxAvailability: object({ address: str, available: bool,
-    reason: { type: 'string', enum: ['taken', 'reserved', 'quota', 'domain_limit', 'domain_unavailable'],
-      description: 'Present only when available=false. taken: already claimed; reserved: system-reserved prefix; quota: caller reached the per-user claim limit; domain_limit: caller reached this domain’s per-user limit; domain_unavailable: domain not configured or not allowed by the caller’s public/dedicated policy. Same rules and order as claiming.' } }, ['reason']),
+    reason: { type: 'string', enum: ['taken', 'reserved', 'quota', 'domain_limit', 'domain_unavailable', 'claude_suspended'],
+      description: 'Present only when available=false. taken: already claimed; reserved: system-reserved prefix; quota: caller reached the per-user claim limit; domain_limit: caller reached this domain’s per-user limit; domain_unavailable: domain not configured or not allowed by the caller’s public/dedicated policy. claude_suspended: strategy=claude and any historical suspension on this domain, including for administrators and hosted domains. Same rules and order as claiming.' } }, ['reason']),
   SessionUser: user,
   LoginResponse: object({ token: { ...str, description: 'Bearer JWT session token; store securely and never include it in published logs.' }, user: ref('SessionUser') }),
   AdminUser: object({ ...adminUserProperties, status: { type: 'string', enum: ['active', 'disabled'] },
@@ -194,7 +202,7 @@ export const schemas: Record<string, Schema> = {
   })(),
   AiModelTestResult: object({ ok: { const: true, type: 'boolean' }, latencyMs: int, sample: { ...str, description: 'Simplified Chinese translation of the fixed English sample.' } }),
   SendMailRequest: send,
-  ClaimMailboxRequest: fromZod(claimMailboxRequestSchema), BatchMailboxRequest: fromZod(batchMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
+  ClaimMailboxRequest: claimRequest, BatchMailboxRequest: fromZod(batchMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
   TransferMailboxRequest: fromZod(transferMailboxRequestSchema),
   MarkReadRequest: fromZod(markReadRequestSchema), MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
   MarkAllReadRequest: (() => {

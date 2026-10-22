@@ -6,7 +6,9 @@ import {
 } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
-import { mailboxes, messages, users } from '../src/db/schema.js';
+import { claudeAddressFacts, hostedDomains, mailboxes, messages, users } from '../src/db/schema.js';
+import { createApiKey } from '../src/services/api-key.js';
+import { planRandomDomains } from '../src/services/claim-plan.js';
 import type { AppError } from '../src/lib/errors.js';
 import { signToken } from '../src/lib/jwt.js';
 import { checkAvailability, checkAvailabilityBatch, claimMailbox, claimMailboxes } from '../src/services/mailbox.js';
@@ -452,6 +454,139 @@ describe('批量认领中断', () => {
     await waitOnExecutionContext(ctx);
     expect(response.status).toBe(500);
     expect(await ownedBy(f.user.id)).toEqual([]);
+  });
+});
+
+describe('Claude 0 封号认领', () => {
+  const denied = { code: 'forbidden', message: '该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领' };
+  const suspend = async (domain: string) => {
+    await db.insert(claudeAddressFacts).values({ address: `old-suspended@${domain}`, domain, suspended: true, paid: false,
+      firstSeenAt: new Date(0) }).onConflictDoNothing();
+  };
+  async function zeroFixture() {
+    const f = await fixture();
+    const safe = `${f.prefix}-safe.test`;
+    const unsafe = `${f.prefix}-unsafe.test`;
+    await updateSettings(env, { domains: { list: [safe, unsafe].map((domain) => ({ domain, public: true, perUserLimit: 0 })) },
+      claim_random: { paidSuspendedLimit: 0, suspendedPercent: 0, pendingDays: 7, dailyLimit: 0 } });
+    return { ...f, safe, unsafe };
+  }
+
+  it('单项与批量 API 可用性/认领均拒绝封号域，零封号域通过；缺省和 uniform 保持普通认领', async () => {
+    const f = await zeroFixture();
+    await suspend(f.unsafe);
+    const safe = { ...f.item('safe', f.safe), strategy: 'claude' as const };
+    const unsafe = { ...f.item('unsafe', f.unsafe), strategy: 'claude' as const };
+    const checks = await data<MailboxAvailability[]>(await request('/mailboxes/availability/batch', f.user.jwt, 'POST', { items: [safe, unsafe] }));
+    expect(checks.map(({ available, reason }) => ({ available, reason }))).toEqual([
+      { available: true, reason: undefined }, { available: false, reason: 'claude_suspended' },
+    ]);
+    for (const actor of [f.user, f.admin]) {
+      expect(await data<MailboxAvailability>(await request(`/mailboxes/availability?${new URLSearchParams(unsafe)}`, actor.jwt)))
+        .toMatchObject({ available: false, reason: 'claude_suspended' });
+      const response = await request('/mailboxes', actor.jwt, 'POST', unsafe);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: denied });
+    }
+    const later = { ...f.item('later', f.safe), strategy: 'claude' as const };
+    const batch = await data<BatchClaimMailboxResult>(await request('/mailboxes/batch', f.user.jwt, 'POST', { items: [safe, unsafe, later] }));
+    expect(batch.claimed.map((box) => box.address)).toEqual([`${safe.localPart}@${safe.domain}`]);
+    expect(batch).toMatchObject({ taken: [], notAttempted: [unsafe, later], stoppedBy: denied });
+    for (const strategy of [undefined, 'uniform'] as const) {
+      const item = { ...f.item(`ordinary-${strategy}`, f.unsafe), ...(strategy ? { strategy } : {}) };
+      expect(await data<MailboxAvailability>(await request(`/mailboxes/availability?${new URLSearchParams(item)}`, f.user.jwt)))
+        .toMatchObject({ available: true });
+      await data<Mailbox>(await request('/mailboxes', f.user.jwt, 'POST', item), 201);
+    }
+  });
+
+  it('v1 API Key 的可用性与实际认领保留 strategy，非法策略在所有请求入口拒绝', async () => {
+    const f = await zeroFixture();
+    await suspend(f.unsafe);
+    const key = await createApiKey(env, f.user.id, { name: 'zero', scopes: ['mailbox.read', 'mailbox.write'], rateLimit: 120, allowedIps: [] });
+    const unsafe = { ...f.item('api-key', f.unsafe), strategy: 'claude' };
+    const apiRequest = async (prefix: string, token: string, path: string, method = 'GET', body?: unknown) => {
+      const ctx = createExecutionContext();
+      const response = await app.request(`${prefix}${path}`, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        ...(body ? { body: JSON.stringify(body) } : {}) }, env, ctx);
+      await waitOnExecutionContext(ctx);
+      return response;
+    };
+    expect(await data<MailboxAvailability>(await apiRequest('/v1', key.key, `/mailboxes/availability?${new URLSearchParams(unsafe)}`)))
+      .toMatchObject({ available: false, reason: 'claude_suspended' });
+    const rejected = await apiRequest('/v1', key.key, '/mailboxes', 'POST', unsafe);
+    expect(rejected.status).toBe(403);
+    expect(await rejected.json()).toMatchObject({ error: denied });
+    await data<Mailbox>(await apiRequest('/v1', key.key, '/mailboxes', 'POST', { ...unsafe, domain: f.safe }), 201);
+    for (const [prefix, token] of [['/api', f.user.jwt], ['/v1', key.key]] as const) {
+      const invalid = { ...unsafe, strategy: 'unknown' };
+      expect((await apiRequest(prefix, token, `/mailboxes/availability?${new URLSearchParams(invalid)}`)).status).toBe(400);
+      expect((await apiRequest(prefix, token, '/mailboxes', 'POST', invalid)).status).toBe(400);
+    }
+    for (const path of ['/mailboxes/batch', '/mailboxes/availability/batch']) {
+      expect((await request(path, f.user.jwt, 'POST', { items: [{ ...unsafe, strategy: 'unknown' }] })).status).toBe(400);
+    }
+  });
+
+  it.each(['user', 'admin'] as const)('托管域名的 %s 在单项和批量认领中也受零封号约束', async (role) => {
+    const f = await zeroFixture();
+    const domain = `${f.prefix}-hosted.test`;
+    await db.insert(hostedDomains).values({ domain, userId: f.user.id, status: 'active' });
+    await suspend(domain);
+    const actor = role === 'admin' ? f.admin : f.user;
+    const item = { ...f.item('hosted', domain), strategy: 'claude' as const };
+    expect(await checkAvailability(env, { userId: actor.id, role }, item.localPart, domain, item.strategy))
+      .toMatchObject({ available: false, reason: 'claude_suspended' });
+    await expect(claimMailbox(env, actor.id, role, item)).rejects.toMatchObject(denied);
+    expect(await claimMailboxes(env, actor.id, role, [item])).toMatchObject({ claimed: [], notAttempted: [item], stoppedBy: denied });
+    expect((await claimMailbox(env, actor.id, role, { ...item, strategy: 'uniform' })).domain).toBe(domain);
+  });
+
+  it.each([false, true])('规划/可用性后新增封号，单项 INSERT 原子拒绝并返回准确错误（hosted=%s）', async (hosted) => {
+    const f = await zeroFixture();
+    const domain = hosted ? `${f.prefix}-hosted-race.test` : f.safe;
+    if (hosted) await db.insert(hostedDomains).values({ domain, userId: f.user.id, status: 'active' });
+    else expect((await planRandomDomains(env, { userId: f.admin.id, role: 'admin' }, 5, 'claude')).pool).toContain(domain);
+    const item = { ...f.item('single-race', domain), strategy: 'claude' as const };
+    expect(await checkAvailability(env, { userId: f.admin.id, role: 'admin' }, item.localPart, domain, item.strategy)).toMatchObject({ available: true });
+    let injected = false;
+    const racing = counting(async (sql) => {
+      if (!injected && sql.includes('INSERT INTO mailboxes')) { injected = true; await suspend(domain); }
+    });
+    await expect(claimMailbox(racing.env, f.admin.id, 'admin', item)).rejects.toMatchObject(denied);
+    expect(injected).toBe(true);
+    expect(await ownedBy(f.admin.id)).toEqual([]);
+  });
+
+  it.each([false, true])('批量事务复核新封号，保留成功前缀且停止后续（hosted=%s）', async (hosted) => {
+    const f = await zeroFixture();
+    const domain = hosted ? `${f.prefix}-hosted-batch.test` : f.unsafe;
+    if (hosted) await db.insert(hostedDomains).values({ domain, userId: f.user.id, status: 'active' });
+    const items = [f.item('before', f.safe), f.item('blocked', domain), f.item('after', f.safe)]
+      .map((item) => ({ ...item, strategy: 'claude' as const }));
+    let injected = false;
+    const racing = counting(undefined, async (sqls) => {
+      if (!injected && sqls.some((sql) => sql.includes('INSERT INTO mailboxes'))) { injected = true; await suspend(domain); }
+    });
+    const result = await claimMailboxes(racing.env, f.admin.id, 'admin', items);
+    expect(injected).toBe(true);
+    expect(result).toMatchObject({ taken: [], notAttempted: items.slice(1), stoppedBy: denied });
+    expect(result.claimed.map((box) => box.address)).toEqual([`${items[0]!.localPart}@${f.safe}`]);
+    expect(await ownedBy(f.admin.id)).toEqual(result.claimed.map((box) => box.address));
+  });
+
+  it('Claude 策略读取仍只需一个 batch，写入保持两次往返', async () => {
+    const f = await zeroFixture();
+    const items = [f.item('one', f.safe), f.item('two', f.safe)].map((item) => ({ ...item, strategy: 'claude' as const }));
+    const read = counting();
+    expect(await checkAvailabilityBatch(read.env, { userId: f.user.id, role: 'user' }, items)).toHaveLength(2);
+    expect(read.trips()).toBe(1);
+    const single = counting();
+    await claimMailbox(single.env, f.user.id, 'user', items[0]!);
+    expect(single.trips()).toBe(2);
+    const batch = counting();
+    expect((await claimMailboxes(batch.env, f.user.id, 'user', items)).claimed).toHaveLength(1);
+    expect(batch.trips()).toBe(2);
   });
 });
 

@@ -10,15 +10,17 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD 在 JWT
 | `GET /mailboxes` | 自己认领的数组 | 同左，`mailbox.read` |
 | `GET /mailboxes?all=1` | 管理员全站数组；普通用户不能请求全站范围 | 同左，`mailbox.read` 加管理员角色 |
 | `GET /mailboxes/shared` | 分享给自己的只读管理员邮箱数组 | 同左，`mailbox.read` |
-| `GET /mailboxes/availability?localPart=…&domain=…` | `{address,available,reason?}` | 同左，`mailbox.read` |
-| `POST /mailboxes/availability/batch` | `{items:[{localPart,domain}...]}`（1–999 个）→ 按请求顺序的 availability 数组 | 无，JWT 专用 |
+| `GET /mailboxes/availability?localPart=…&domain=…&strategy=claude` | `{address,available,reason?}` | 同左，`mailbox.read` |
+| `POST /mailboxes/availability/batch` | `{items:[{localPart,domain,strategy?}...]}`（1–999 个）→ 按请求顺序的 availability 数组 | 无，JWT 专用 |
 | `GET /mailboxes/random-plan?count=…&strategy=uniform\|claude` | 只分配随机后缀、不认领：`{strategy,items:[{domain,suspended}],pool,shortfall,reason}`，见下文 | 无，JWT 专用 |
-| `POST /mailboxes` | `{localPart,domain}` → 201 邮箱 | 同左，`mailbox.write` |
-| `POST /mailboxes/batch` | `{items:[{localPart,domain}...]}`（1–999 个）→ `{claimed,taken,notAttempted,stoppedBy}`，见下文 | 无，JWT 专用；Key 逐个调用 `POST /mailboxes` |
+| `POST /mailboxes` | `{localPart,domain,strategy?}` → 201 邮箱 | 同左，`mailbox.write` |
+| `POST /mailboxes/batch` | `{items:[{localPart,domain,strategy?}...]}`（1–999 个）→ `{claimed,taken,notAttempted,stoppedBy}`，见下文 | 无，JWT 专用；Key 逐个调用 `POST /mailboxes` |
 | `PUT /mailboxes/:id` | `{displayName}` → 邮箱 | 同左，`mailbox.write` |
 | `DELETE /mailboxes/:id` | `{success:true,deletedMessages}` | 同左，`mailbox.write` |
 
 邮箱字段 `id,address,domain,userId,displayName,messageCount,createdAt`；管理员全站列表还有 `ownerUsername`。共享视图字段为 `mailboxId,address,domain,displayName,ownerUsername`，其 mailboxId 不是自己的发件权限。`messageCount` 包括地址下历史与软删除记录，不应作为是否删除历史的唯一依据。
+
+`strategy` 为可选的 `uniform|claude`，单项认领请求体、单项可用性 query 和两种批量请求的每个 item 均接受。缺省或 `uniform` 保持普通认领；`claude` 是「Claude 0 封号」：域名只要存在任意历史封号事实就拒绝，包括管理员与托管域名，且不受旧付费/比例阈值影响。实际写入会在 INSERT/批量事务内复核，规划或检查之后新出现的封号也会拒绝，错误为 `forbidden`，message 为“该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领”。手动改后缀、单个重新随机及最终提交都须保留 `strategy=claude`。
 
 可认领域名必须来自当前身份的 `/domains`，而不是公开 `/api/config` 或猜测 `@hpc.email`。普通用户默认只可认领公开域；管理员配置了用户专属权限时，仅可认领专属名单中的系统域名（可包含非公开域名），总数和单域名额度也使用专属配置。管理员可认领所有配置域。完整地址全局唯一，两个域名中的相同 localPart 是不同邮箱。域名/前缀归一化为小写；前缀 1–64 字符、小写字母或数字首尾，中间可含 `. _ + -`；域名须为合法 DNS 标签的 ASCII 形式，顶级域当前只接受至少两个字母。国际化中间标签可转 punycode 后校验，但 punycode 顶级域目前不支持，不能承诺任意 IDN 可配置。
 
@@ -35,6 +37,7 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 | reason | 含义 | 对应认领错误 |
 |---|---|---|
 | `domain_unavailable` | 域名不在系统配置中，或不在当前用户公共/专属权限允许范围 | 400 / 403 |
+| `claude_suspended` | Claude 模式下域名存在任意历史封号记录 | 403 `forbidden` |
 | `reserved` | 系统保留前缀（仅普通用户） | 403 |
 | `quota` | 当前用户已达总认领上限 | 403 |
 | `domain_limit` | 当前用户已达该域名的每人上限 | 403 |
@@ -42,7 +45,7 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 
 批量认领按请求顺序逐个执行，规则与单个认领相同：已被占用的地址进 `taken` 并继续下一个；其他错误（额度用尽、域名或权限配置变化等）立即停止，已认领的保留在 `claimed`，触发停止的那一项及其后各项进 `notAttempted`，`stoppedBy` 给出 `{code,message}`。HTTP 200 不代表全部认领成功，要以 `claimed` 为准。
 
-`random-plan` 的 `count` 必须为 1–999 的整数。它为批量认领分配后缀，前缀由调用方自己生成，然后照常走可用性检查与批量认领。候选是当前用户可认领、且 `domains.list[].random` 不为 false 的域名，按每域与总认领额度裁剪；`pool` 是这些仍有额度的候选，单个地址重新随机时从中选。`strategy=uniform` 在候选里等概率选；`strategy=claude` 按后缀的 Claude 账号统计分配：排除全军覆没（账号全被封，或付费号全被封）、付费被封达到 `claim_random.paidSuspendedLimit`、以及至少 2 个封号且封号率达到 `suspendedPercent` 的后缀，先用封号最少的后缀，再把「已有 Claude 账号 + 近 `pendingDays` 天认领还没收到 Claude 来信的邮箱 + 本批已分配」拉平；近 24 小时新增（新注册的 Claude 账号 + 新认领的未注册邮箱 + 本批已分配）达到 `dailyLimit` 的后缀当天不再分配；封号最少的那一档后缀都满了就停止，不会因此挪到封号更多的后缀（每域额度用完时才轮到下一档）。`items[].suspended` 是该后缀收到过封号信的地址数，大于 0 时应提示用户。分不满时 `shortfall` 大于 0，`reason` 为 `quota`（用户总额度不足）、`domain_quota`（可选后缀的每域额度用完）、`daily_limit`（可选后缀近 24 小时新增都已达上限，稍后再试或手动选域名）或 `no_candidates`（没有可用后缀）。统计依据官方来信的发件人和主题，未校验 DKIM，只能说「根据历史来信判定」。
+`random-plan` 的 `count` 必须为 1–999 的整数。它只分配后缀，前缀由调用方生成，然后携带相同策略做可用性检查与认领。候选是当前用户可认领且 `domains.list[].random` 不为 false 的域名，按每域与总认领额度裁剪；`pool` 是仍有额度且符合当前策略的候选，供单个地址重新随机。`strategy=uniform` 在候选中等概率选；`strategy=claude` 从 `items` 和 `pool` 一律剔除有任何封号记录的域名，仅在零封号域中把「已有 Claude 账号 + 近 `pendingDays` 天认领还没收到 Claude 来信的邮箱 + 本批已分配」负载拉平。近 24 小时新增（新注册的 Claude 账号 + 新认领的未注册邮箱 + 本批已分配）达到 `dailyLimit` 时停止向该域分配；每日上限或每域额度用完均不会溢出到有封号的域名。`items[].suspended` 是历史封号地址数，Claude 模式下恒为 0。分不满时 `shortfall` 大于 0，`reason` 为 `quota`（用户总额度不足）、`domain_quota`（零封号候选每域额度用完）、`daily_limit`（零封号候选近 24 小时新增都已达上限）或 `no_candidates`（没有符合策略的候选）。零封号指历史已观测记录，不保证未来不会封号；统计依据官方来信的发件人和主题，未校验 DKIM。删除邮件不会清除历史封号事实。
 
 按 `reason` 决定换前缀、换域名或告知用户额度已满，不要对 quota/domain_quota/daily_limit/domain_limit 反复换前缀重试。检查与认领之间状态仍可能变化，认领可能 403、409 `address_taken` 或域名/用户权限配置冲突。普通用户受系统保留前缀、公共或专属配置中的用户总认领上限和每域认领上限；管理员豁免，0 表示该限额不限。并发冲突刷新域名/邮箱状态后按任务要求重试，不能忽略错误声称认领成功。
 
@@ -77,7 +80,7 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 
 ## 域名新增、关闭公开和删除
 
-管理员 JWT `GET /api/admin/settings` 的 `domains` 是 `{list:[{domain,public,perUserLimit,random?}],revision?}`。最多 64 域，不重复；`public` 默认 false；`perUserLimit` 0–10000，仅普通用户生效；`random` 缺省视为 true，false 时该域不参与认领弹窗的随机后缀（均匀随机与 Claude 低风险两种模式），只能手动选择。管理员可用 `GET /api/admin/settings/domain-claude-stats` 按域名列表顺序查看每域 `accounts,suspended,paid,paidSuspended,pending,recent,risk`（`recent` 是近 24 小时新增；`risk` 为 `wiped`、`paid_suspended` 或 `suspended_rate` 的域会被 Claude 低风险模式排除），统计约每 5 分钟刷新，邮件删除后仍保留。没有单独域名 DELETE/POST，增删/改公开性都通过**替换 domains.list** 完成：
+管理员 JWT `GET /api/admin/settings` 的 `domains` 是 `{list:[{domain,public,perUserLimit,random?}],revision?}`。最多 64 域，不重复；`public` 默认 false；`perUserLimit` 0–10000，仅普通用户生效；`random` 缺省视为 true，false 时该域不参与认领弹窗的随机后缀（均匀随机与 Claude 0 封号两种模式），只能手动选择。管理员可用 `GET /api/admin/settings/domain-claude-stats` 按域名列表顺序查看每域 `accounts,suspended,paid,paidSuspended,pending,recent,risk`（`recent` 是近 24 小时新增；`risk` 在有任何历史封号时为 `suspended`，否则为 null；旧枚举仅为兼容保留，有封号域均被 Claude 0 封号模式排除），统计约每 5 分钟刷新，邮件删除后仍保留。没有单独域名 DELETE/POST，增删/改公开性都通过**替换 domains.list** 完成：
 
 ```bash
 # API="$BASE/api"、AUTH 为管理员 JWT；HPC_NEW_DOMAIN 已按任务确认

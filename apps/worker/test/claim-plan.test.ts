@@ -22,7 +22,7 @@ const candidate = (domain: string, suspended: number, load: number, remaining = 
 const first = () => 0;
 
 describe('分配算法', () => {
-  it('Claude 低风险：先用封号最少的后缀，并把负载拉平；平局交给随机源', () => {
+  it('Claude 0 封号：只用无封号后缀，并把负载拉平；平局交给随机源', () => {
     const items = allocateLowRisk([candidate('a', 0, 0), candidate('b', 0, 1), candidate('c', 0, 2), candidate('risky', 1, 0)], 6, 0, first);
     expect(tally(items)).toEqual({ a: 3, b: 2, c: 1 });
     expect(items.every((item) => item.suspended === 0)).toBe(true);
@@ -30,19 +30,19 @@ describe('分配算法', () => {
     expect(items.slice(0, 2).map((item) => item.domain)).toEqual(['a', 'a']);
   });
 
-  it('0 封号后缀额度用完才分到有封号记录的后缀，并带上封号数', () => {
+  it('0 封号后缀额度用完就停，不能溢出到有封号记录的后缀', () => {
     const items = allocateLowRisk([candidate('safe', 0, 5, 2), candidate('one', 1, 0), candidate('two', 2, 0)], 4, 0, first);
     expect(items).toEqual([
-      { domain: 'safe', suspended: 0 }, { domain: 'safe', suspended: 0 }, { domain: 'one', suspended: 1 }, { domain: 'one', suspended: 1 },
+      { domain: 'safe', suspended: 0 }, { domain: 'safe', suspended: 0 },
     ]);
   });
 
-  it('每日上限：近 24 小时新增达到上限的后缀当天不再分配，本批分到的也计入；封号最少的一档都满了就停', () => {
+  it('每日上限：近 24 小时新增达到上限的后缀当天不再分配，本批分到的也计入；零封号后缀都满了就停', () => {
     const items = allocateLowRisk([candidate('a', 0, 0, Infinity, 2), candidate('b', 0, 5), candidate('one', 1, 0)], 6, 3, first);
     expect(tally(items)).toEqual({ a: 1, b: 3 });
-    // 每日上限不会把分配挪到封号更多的后缀；每域额度用完才轮到下一档
+    // 每日上限与每域额度都不能使分配溢出到有封号的后缀
     expect(allocateLowRisk([candidate('safe', 0, 0, Infinity, 3), candidate('one', 1, 0)], 2, 3, first)).toEqual([]);
-    expect(tally(allocateLowRisk([candidate('safe', 0, 0, 0), candidate('one', 1, 0)], 2, 3, first))).toEqual({ one: 2 });
+    expect(allocateLowRisk([candidate('safe', 0, 0, 0), candidate('one', 1, 0)], 2, 3, first)).toEqual([]);
     // 0 表示不限
     expect(tally(allocateLowRisk([candidate('a', 0, 0, Infinity, 9)], 2, 0, first))).toEqual({ a: 2 });
   });
@@ -52,25 +52,18 @@ describe('分配算法', () => {
     expect(tally(items)).toEqual({ a: 1, c: 2 });
   });
 
-  it('全军覆没、付费被封阈值与封号率阈值', () => {
-    const base = { accounts: 0, suspended: 0, paid: 0, paidSuspended: 0, pending: 0, recent: 0 };
-    const rules = { paidSuspendedLimit: 2, suspendedPercent: 50 };
-    const off = { paidSuspendedLimit: 0, suspendedPercent: 0 };
-    expect(domainRisk(base, rules)).toBeNull();
-    expect(domainRisk({ ...base, accounts: 3, suspended: 3 }, off)).toBe('wiped');
-    expect(domainRisk({ ...base, accounts: 5, suspended: 4, paid: 2, paidSuspended: 2 }, off)).toBe('wiped');
-    expect(domainRisk({ ...base, accounts: 5, suspended: 4, paid: 3, paidSuspended: 2 }, rules)).toBe('paid_suspended');
-    // 关掉付费阈值后 4/5 仍按封号率排除；两条都关才放行
-    expect(domainRisk({ ...base, accounts: 5, suspended: 4, paid: 3, paidSuspended: 2 }, { ...rules, paidSuspendedLimit: 0 })).toBe('suspended_rate');
-    expect(domainRisk({ ...base, accounts: 5, suspended: 4, paid: 3, paidSuspended: 2 }, off)).toBeNull();
-    // 恰好达到阈值排除，低于阈值放行；只有 1 个封号时样本太小，不按封号率排除
-    expect(domainRisk({ ...base, accounts: 22, suspended: 11, paid: 4, paidSuspended: 1 }, rules)).toBe('suspended_rate');
-    expect(domainRisk({ ...base, accounts: 10, suspended: 4, paid: 3 }, rules)).toBeNull();
-    expect(domainRisk({ ...base, accounts: 2, suspended: 1 }, rules)).toBeNull();
+  it('任意封号记录都标为 suspended，账号总数和付费状态不改变结果', () => {
+    const base = { accounts: 10000, suspended: 0, paid: 0, paidSuspended: 0, pending: 0, recent: 0 };
+    expect(domainRisk(base)).toBeNull();
+    for (const counts of [
+      { ...base, suspended: 1 },
+      { ...base, suspended: 10000 },
+      { ...base, suspended: 1, paid: 1000, paidSuspended: 1 },
+    ]) expect(domainRisk(counts)).toBe('suspended');
   });
 });
 
-/** 默认关掉封号率与每日上限，各自的用例单独打开 */
+/** 默认不设每日上限；旧封号阈值仅用于配置兼容回归 */
 async function fixture(entries: Omit<DomainEntry, 'domain'>[], claimRandom = { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 0, dailyLimit: 0 }, perUserLimit = 0) {
   const prefix = `plan${++sequence}`;
   const domains = entries.map((_, index) => `${prefix}-d${index}.test`);
@@ -111,7 +104,7 @@ async function plan(token: string, count: number, strategy: string, status = 200
 }
 
 describe('GET /api/mailboxes/random-plan', () => {
-  it('均匀与低风险模式均接受 999，1000 被拒绝', async () => {
+  it('均匀与零封号模式均接受 999，1000 被拒绝', async () => {
     const f = await fixture([{ public: true, random: true, perUserLimit: 0 }]);
     for (const strategy of ['uniform', 'claude']) {
       const response = await request(`/mailboxes/random-plan?count=999&strategy=${strategy}`, f.user.jwt);
@@ -122,7 +115,7 @@ describe('GET /api/mailboxes/random-plan', () => {
       expect((await request(`/mailboxes/random-plan?count=1000&strategy=${strategy}`, f.user.jwt)).status).toBe(400);
     }
   });
-  it('Claude 低风险：排除全军覆没与付费被封达阈值，按封号数再按账号数均衡', async () => {
+  it('Claude 0 封号：排除所有封号域名，在零封号域中按账号数均衡', async () => {
     const f = await fixture(Array.from({ length: 5 }, () => ({ public: false, perUserLimit: 0 })));
     await f.facts(0, 1);                                   // d0：1 个账号，无封号
     await f.facts(1, 2, { suspended: true });             // d1：全军覆没
@@ -135,18 +128,16 @@ describe('GET /api/mailboxes/random-plan', () => {
     expect(result).toMatchObject({ strategy: 'claude', shortfall: 0, reason: null });
     // 只用 0 封号的 d0（负载 1）与 d4（负载 0），分完负载都是 2
     expect(tally(result.items)).toEqual({ [f.domains[0]!]: 1, [f.domains[4]!]: 2 });
-    expect(result.pool.sort()).toEqual([...f.domains].sort());
-    // 0 封号后缀额度不限时，有封号记录的后缀一个都不分
+    expect(result.pool.sort()).toEqual([f.domains[0], f.domains[4]].sort());
+    // 有封号记录的后缀一个都不分
     expect((await plan(f.admin.jwt, 20, 'claude')).items.every((item) => item.suspended === 0)).toBe(true);
 
-    // 只留 d2 参与随机：阈值为 2 时被排除，阈值为 0 时可分配并带上封号数
+    // 只留 d2 参与随机：旧阈值为 2 或 0 都排除
     const onlyD2 = f.domains.map((domain, index) => ({ domain, public: false, perUserLimit: 0, random: index === 2 }));
     await updateSettings(env, { domains: { list: onlyD2 } });
     expect(await plan(f.admin.jwt, 2, 'claude')).toMatchObject({ items: [], shortfall: 2, reason: 'no_candidates' });
     await updateSettings(env, { claim_random: { paidSuspendedLimit: 0, pendingDays: 7, suspendedPercent: 0, dailyLimit: 0 } });
-    expect((await plan(f.admin.jwt, 2, 'claude')).items).toEqual([
-      { domain: f.domains[2], suspended: 2 }, { domain: f.domains[2], suspended: 2 },
-    ]);
+    expect(await plan(f.admin.jwt, 2, 'claude')).toMatchObject({ items: [], pool: [], shortfall: 2, reason: 'no_candidates' });
   });
 
   it('不参与随机的域名两种模式都不出现，全军覆没只在 Claude 模式排除', async () => {
@@ -154,7 +145,7 @@ describe('GET /api/mailboxes/random-plan', () => {
     await f.facts(2, 1, { suspended: true });
     for (const strategy of ['uniform', 'claude']) {
       const result = await plan(f.user.jwt, 10, strategy);
-      expect(result.pool.sort()).toEqual([f.domains[0], f.domains[2]].sort());
+      expect(result.pool.sort()).toEqual((strategy === 'claude' ? [f.domains[0]] : [f.domains[0], f.domains[2]]).sort());
       expect(result.items.map((item) => item.domain)).not.toContain(f.domains[1]);
     }
     expect(new Set((await plan(f.user.jwt, 10, 'claude')).items.map((item) => item.domain))).toEqual(new Set([f.domains[0]]));
@@ -190,21 +181,17 @@ describe('GET /api/mailboxes/random-plan', () => {
     expect(tally(items)).toEqual({ [f.domains[0]!]: 2, [f.domains[1]!]: 2 });
   });
 
-  it('封号率达到阈值的后缀在 Claude 模式排除', async () => {
-    const f = await fixture([{ public: false, perUserLimit: 0 }, { public: false, perUserLimit: 0 }],
-      { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 50, dailyLimit: 0 });
-    await f.facts(0, 2, { suspended: true });
-    await f.facts(0, 2);                       // d0：2/4，恰好 50%
-    await f.facts(1, 1, { suspended: true });
-    await f.facts(1, 1);                       // d1：1/2，只有 1 个封号，不按封号率排除
-    const onlyD0 = f.domains.map((domain, index) => ({ domain, public: false, perUserLimit: 0, random: index === 0 }));
-    expect(new Set((await plan(f.admin.jwt, 4, 'claude')).items.map((item) => item.domain))).toEqual(new Set([f.domains[1]]));
-    await updateSettings(env, { domains: { list: onlyD0 } });
-    expect(await plan(f.admin.jwt, 2, 'claude')).toMatchObject({ items: [], shortfall: 2, reason: 'no_candidates' });
-    await updateSettings(env, { claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 0, dailyLimit: 0 } });
-    expect((await plan(f.admin.jwt, 2, 'claude')).items).toEqual([
-      { domain: f.domains[0], suspended: 2 }, { domain: f.domains[0], suspended: 2 },
-    ]);
+  it('只有 1 条陈旧封号且大量账号、paid=0、旧阈值=0，items 与 pool 仍排除', async () => {
+    const f = await fixture([{ public: true, perUserLimit: 0 }, { public: true, perUserLimit: 0 }],
+      { paidSuspendedLimit: 0, pendingDays: 0, suspendedPercent: 0, dailyLimit: 0 });
+    await f.facts(0, 100);
+    await f.facts(0, 1, { suspended: true, firstSeenAt: new Date(Date.now() - 365 * DAY) });
+    const result = await plan(f.user.jwt, 5, 'claude');
+    expect(result.pool).toEqual([f.domains[1]]);
+    expect(tally(result.items)).toEqual({ [f.domains[1]!]: 5 });
+    await updateSettings(env, { domains: { list: [{ domain: f.domains[0]!, public: true, perUserLimit: 0 }] } });
+    expect(await plan(f.user.jwt, 2, 'claude')).toMatchObject({ items: [], pool: [], shortfall: 2, reason: 'no_candidates' });
+    expect((await plan(f.user.jwt, 2, 'uniform')).items).toHaveLength(2);
   });
 
   it('每日上限：近 24 小时新增（新注册的账号 + 新认领的未注册邮箱）达到上限的后缀当天不再分配', async () => {
@@ -217,7 +204,7 @@ describe('GET /api/mailboxes/random-plan', () => {
     await f.facts(1, 5, { firstSeenAt: twoDaysAgo });                    // d1：老账号与前天认领的邮箱不算新增
     await db.insert(mailboxes).values({ userId: other.id, domain: f.domains[1]!, address: `old@${f.domains[1]}`, createdAt: twoDaysAgo });
     await f.facts(2, 1, { suspended: true, firstSeenAt: twoDaysAgo });
-    await f.facts(2, 3, { firstSeenAt: twoDaysAgo });                    // d2：1 个封号，未被排除
+    await f.facts(2, 3, { firstSeenAt: twoDaysAgo });                    // d2：1 个封号，始终排除
     const result = await plan(f.admin.jwt, 10, 'claude');
     // d0 已满；0 封号的 d1 分到上限后停止，不挪到有封号的 d2
     expect(tally(result.items)).toEqual({ [f.domains[1]!]: 3 });
@@ -268,10 +255,10 @@ describe('GET /api/admin/settings/domain-claude-stats', () => {
     const stats = (await response.json() as { data: DomainClaudeStats[] }).data;
     expect(response.status).toBe(200);
     expect(stats).toEqual([
-      { domain: f.domains[0], accounts: 2, suspended: 2, paid: 0, paidSuspended: 0, pending: 0, recent: 2, risk: 'wiped' },
-      { domain: f.domains[1], accounts: 5, suspended: 2, paid: 5, paidSuspended: 2, pending: 0, recent: 0, risk: 'paid_suspended' },
+      { domain: f.domains[0], accounts: 2, suspended: 2, paid: 0, paidSuspended: 0, pending: 0, recent: 2, risk: 'suspended' },
+      { domain: f.domains[1], accounts: 5, suspended: 2, paid: 5, paidSuspended: 2, pending: 0, recent: 0, risk: 'suspended' },
       { domain: f.domains[2], accounts: 0, suspended: 0, paid: 0, paidSuspended: 0, pending: 1, recent: 1, risk: null },
-      { domain: f.domains[3], accounts: 3, suspended: 2, paid: 0, paidSuspended: 0, pending: 0, recent: 0, risk: 'suspended_rate' },
+      { domain: f.domains[3], accounts: 3, suspended: 2, paid: 0, paidSuspended: 0, pending: 0, recent: 0, risk: 'suspended' },
     ]);
     expect((await request('/admin/settings/domain-claude-stats', f.user.jwt)).status).toBe(403);
   });

@@ -92,7 +92,7 @@ count 1–50 默认 1；maxUses 1–1000 默认 1；expiresAt 可选 ISO 8601 �
 | `security` | `{require2fa}`；强制尚未绑定的 JWT 用户完成 2FA 后使用业务接口 |
 | `domains` | `{list:[{domain,public,perUserLimit,random?}],revision?}`；`random:false` 的域不参与随机后缀；更新必须顶层 `expectedDomainsRevision`，见域名参考 |
 | `mailbox_policy` | `{perUserLimit,reservedLocalParts}`；总认领上限 0–10000，0 不限；保留前缀最多 200 项，每项 ≤64 字符；普通用户生效，admin 豁免 |
-| `claim_random` | `{paidSuspendedLimit,pendingDays,suspendedPercent,dailyLimit}`；Claude 低风险随机后缀规则。全军覆没的后缀始终排除；付费被封数达到 paidSuspendedLimit（0–1000，默认 2）、或至少 2 个封号且封号率达到 suspendedPercent（0–100，默认 50）的后缀也被排除，0 表示不按该条排除；pendingDays（0–90，默认 7，0 不计）天内认领、还没收到 Claude 来信的邮箱计入后缀负载；近 24 小时新增达到 dailyLimit（0–1000，默认 3，0 不限）的后缀当天不再分配。更新时提交完整对象，缺省字段按默认值处理 |
+| `claim_random` | `{paidSuspendedLimit,pendingDays,suspendedPercent,dailyLimit}`；Claude 0 封号随机后缀规则。任意历史封号记录都排除，不受账号数或付费状态影响；paidSuspendedLimit（0–1000，默认 2）和 suspendedPercent（0–100，默认 50）已弃用，仅兼容解析与存储，设为 0 也不能放行封号域名；pendingDays（0–90，默认 7，0 不计）天内认领、还没收到 Claude 来信的邮箱计入后缀负载；近 24 小时新增达到 dailyLimit（0–1000，默认 3，0 不限）的后缀当天不再分配。更新时提交完整对象，缺省字段按默认值处理 |
 | `quota` | `{dailyOutbound,dailyRecipients}`；普通用户每日外发邮件数 0–100000、唯一收件地址数 0–1000000，跨 Key/JWT 共用；0 不限，admin 豁免 |
 | `retention` | `{unclaimedDays,allMessagesDays}`；0–3650 天，0 关闭该项定时清理 |
 | `ai_model` | `{baseUrl,apiKey,model}`；全站唯一的 AI 模型（OpenAI 兼容 Chat Completions），翻译与验证码 AI 兜底共用；三项都非空才算已配置。baseUrl 为 https 根地址，不含 `/chat/completions`；apiKey 只写，回显为 `******`，提交 `******` 保留原值、空串清除 |
