@@ -1,0 +1,5 @@
+{
+  "data": {
+    "anytoken-mail.server": "anytoken.email:53 {\n  errors\n  cache 30\n  forward . tls://1.1.1.1 tls://1.0.0.1 {\n    tls_servername cloudflare-dns.com\n  }\n}\n"
+  }
+}

@@ -10,13 +10,15 @@ export default {
     const timestamp = String(Date.now());
     const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.RELAY_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
     const signature = hex(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${timestamp}\n${message.from}\n${message.to}\n${digest}`)));
-    const response = await fetch(endpoint, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(25000), body: raw, headers: {
+    // Workers supports manual/follow redirects only. Never follow a redirect
+    // while carrying the signed envelope and raw message to the backend.
+    const response = await fetch(endpoint, { method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(25000), body: raw, headers: {
       'Content-Type': 'message/rfc822', 'X-HPC-Timestamp': timestamp, 'X-HPC-Signature': signature,
       'X-HPC-Content-SHA256': digest,
       'X-HPC-From': encodeURIComponent(message.from), 'X-HPC-To': encodeURIComponent(message.to),
     } });
     if (response.status === 422) { message.setReject('Recipient unavailable'); return; }
-    if (response.status !== 200) throw new Error('Mailbox storage temporarily unavailable');
+    if (response.status !== 200) throw new Error(`Mailbox storage temporarily unavailable (HTTP ${response.status})`);
   },
   async fetch() { return Response.json({ service: 'HPC Mail incoming relay' }); },
 };

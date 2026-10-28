@@ -13,7 +13,7 @@ spec:
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
-  name: hpc-mail-http01
+  name: hpc-mail-dns01
   namespace: hpc-mail
 spec:
   acme:
@@ -22,9 +22,11 @@ spec:
     privateKeySecretRef:
       name: hpc-mail-acme-account
     solvers:
-      - http01:
-          ingress:
-            ingressClassName: nginx-aliyun
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: hpc-mail-cloudflare-dns
+              key: api-token
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -58,9 +60,9 @@ spec:
             - secretRef: {name: hpc-mail}
           env:
             - {name: BUILD_SHA, value: k3s-pg-20261028-v6}
-            - {name: SITE_ORIGIN, value: 'https://mail.multi-agent.wiki'}
-            - {name: SMTP_HOSTNAME, value: mx.multi-agent.wiki}
-            - {name: MAIL_DOMAINS, value: 'multi-agent.wiki,0xolivia.xyz,astergate.cc,seed-diffusion.com'}
+            - {name: SITE_ORIGIN, value: 'https://anytoken.email'}
+            - {name: SMTP_HOSTNAME, value: mx.anytoken.email}
+            - {name: MAIL_DOMAINS, value: 'anytoken.email,multi-agent.wiki,0xolivia.xyz,astergate.cc,seed-diffusion.com,gamesgadget.com,freetrips.net'}
           ports:
             - {name: http, containerPort: 8080}
             - {name: smtp, containerPort: 2525}
@@ -112,16 +114,37 @@ metadata:
   name: hpc-mail
   namespace: hpc-mail
   annotations:
-    cert-manager.io/issuer: hpc-mail-http01
+    cert-manager.io/issuer: hpc-mail-dns01
     nginx.ingress.kubernetes.io/force-ssl-redirect: 'true'
     nginx.ingress.kubernetes.io/proxy-body-size: 40m
     nginx.ingress.kubernetes.io/proxy-read-timeout: '75'
 spec:
   ingressClassName: nginx-aliyun
   tls:
-    - hosts: [mail.multi-agent.wiki, mx.multi-agent.wiki]
+    - hosts: [anytoken.email, www.anytoken.email, mx.anytoken.email, mail.multi-agent.wiki, mx.multi-agent.wiki]
       secretName: hpc-mail-tls
   rules:
+    - host: anytoken.email
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: hpc-mail, port: {name: http}}
+    - host: www.anytoken.email
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: hpc-mail, port: {name: http}}
+    - host: mx.anytoken.email
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: hpc-mail, port: {name: http}}
     - host: mail.multi-agent.wiki
       http:
         paths:

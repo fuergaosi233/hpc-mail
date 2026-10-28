@@ -6,23 +6,26 @@ The PostgreSQL adapter preserves the application's prepared-statement and transa
 
 ## Current deployment
 
-- Web: `https://mail.multi-agent.wiki`
+- Web: `https://anytoken.email` (the previous `mail.multi-agent.wiki` ingress is retained).
 - Namespace: `hpc-mail`
 - Application and object volume: `pve-bigbox-ubuntu-3`
 - PostgreSQL: existing `postgres.open-lark.svc.cluster.local` service, dedicated `hpc_mail` database and non-superuser role, application pool maximum 4 connections, role connection limit 8.
-- Initial administrator: `holegots`; registration is closed. Passwords and connection credentials are Kubernetes Secrets and private local deployment files, never source files.
+- Administrator: `holegots`. Registration requires an invitation. Only `anytoken.email` is public, with 10 addresses per ordinary user on that domain (50 globally); the friend account has an unlimited private policy for `freetrips.net` and `anytoken.email`. Credentials remain in Kubernetes Secrets and private deployment files.
 - Initial mailboxes: `holegots@multi-agent.wiki`, `holegots@0xolivia.xyz`, `holegots@astergate.cc`, `holegots@seed-diffusion.com`.
-- HTTPS: namespace-scoped HTTP-01 issuer `hpc-mail-http01`. SMTP reloads renewed certificates from the Secret volume automatically.
+- HTTPS: namespace-scoped DNS-01 issuer `hpc-mail-dns01`, using the `hpc-mail-cloudflare-dns` Secret. Renewal is automatic. SMTP reloads renewed certificates from the Secret volume automatically.
+- CoreDNS has a domain-only `anytoken-mail.server` custom entry resolving `anytoken.email` through Cloudflare DNS over TLS, avoiding the upstream negative responses observed during registration. Merge `coredns-anytoken.patch.json` into the existing shared ConfigMap; preserve all other entries.
 
 Creating a mailbox in the application does not activate public mail delivery. DNS and an incoming transport must be verified separately.
 
 ## Incoming transports
 
-The standalone SMTP server accepts configured recipient domains only and never acts as an unauthenticated external relay. The Tencent edge forwards TCP/25 to the application over the cluster network. Internal SMTP has been verified; public delivery remains unverified in the current deployment.
+The standalone SMTP server accepts configured recipient domains only and never acts as an unauthenticated external relay. The Tencent edge forwards TCP/25 to the application over the cluster network. Internal SMTP has been verified; public receipt uses Cloudflare Email Routing and the signed HTTPS transport below.
 
 `apps/worker/ingress` is a small alternative Cloudflare Email Worker. It forwards incoming raw messages to `/internal/email` over HTTPS. Both sides use a separate `INBOUND_RELAY_SECRET` / `RELAY_SECRET`: HMAC authenticates the timestamp, envelope and content digest before the body is read. The backend enforces a five-minute window and 32 MiB limit, verifies the actual digest, rejects unknown domains and acknowledges only after the original ingestion pipeline stores the message. Storage errors cause SMTP retry, and the existing ingestion key deduplicates retries.
 
-Publishing this Worker and enabling Email Routing require Cloudflare Workers and Email Routing write access. The available DNS token cannot publish it. Its source and dry-run are ready; it is not currently deployed. After deployment, configure `RELAY_SECRET`, enable Email Routing only for the four unused mail domains above and point their catch-all rules to `hpc-mail-ingress-20261028`. Existing mail routes on the other six zones must remain untouched. Remove the deployment-created pilot MX before enabling Cloudflare's managed MX records.
+The Worker `hpc-mail-ingress-20261028` is published with `BACKEND_URL=https://anytoken.email` and a separately installed `RELAY_SECRET`. Catch-all rules for only `anytoken.email`, `freetrips.net` and `gamesgadget.com` point to it. Cloudflare manages their MX/SPF/DKIM records. Existing named rules and website records are preserved. Other candidate domains are configured privately in the app but have not been activated for public mail delivery. Workers requires `redirect: 'manual'`; redirect responses are rejected rather than forwarding signed email elsewhere.
+
+The ordinary account `friend01` owns `astor.wu@freetrips.net` and `friend@anytoken.email`. The former `friend@freetrips.net` was released at the owner's request. Its credentials remain in private deployment files. Real Cloudflare MX delivery to `astor.wu@freetrips.net`, `holegots@gamesgadget.com` and `friend@anytoken.email` has been confirmed in the intended users' inboxes.
 
 External sending and forwarding from the Node runtime require `SMTP_RELAY_URL`. Site-internal delivery works without an external relay. No paid plan has been enabled.
 
