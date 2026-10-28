@@ -300,8 +300,9 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
   }
   await logAdminAction(env, viewer, 'hosted_domain.create', domain, `zone ${zone.id}，NS ${(zone.name_servers ?? []).join(' / ')}`, ip);
   // catch-all 与发信接入不一定要求 zone 已激活，先尝试；Email Routing 要等 NS 生效后由定时任务补齐
+  const pendingView = ctx ? await getHostedDomain(env, viewer, id) : undefined;
   await runDetached(ctx, '托管域名预配置', () => preconfigure(env, creds, id));
-  return getHostedDomain(env, viewer, id);
+  return pendingView ?? getHostedDomain(env, viewer, id);
 }
 
 // ---------------------------------------------------------------------------
@@ -597,7 +598,7 @@ export async function listHostedDomainMembers(env: Env, viewer: Viewer, id: numb
   }).from(hostedDomainMembers)
     .innerJoin(users, eq(users.id, hostedDomainMembers.userId))
     .where(eq(hostedDomainMembers.domainId, id))
-    .orderBy(hostedDomainMembers.createdAt).all();
+    .orderBy(hostedDomainMembers.createdAt, hostedDomainMembers.userId).all();
   return rows.map((member) => ({
     userId: member.userId, username: member.username, status: member.status,
     grantedAt: member.grantedAt.toISOString(), mailboxCount: Number(member.mailboxCount),

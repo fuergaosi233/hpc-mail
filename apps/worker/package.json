@@ -12,19 +12,33 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate:local": "wrangler d1 migrations apply hpc-cloud-mail-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply hpc-cloud-mail-db --remote",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "build:node": "node server/build.mjs",
+    "start:node": "node server-dist/server.mjs",
+    "test:postgres": "vitest run --config vitest.postgres.config.ts",
+    "typecheck:node": "tsc -p tsconfig.server.json"
   },
   "dependencies": {
+    "@hono/node-server": "^2.1.5",
     "@hpc-mail/shared": "workspace:*",
     "drizzle-orm": "^0.45.2",
     "hono": "^4.13.13",
     "mimetext": "^3.0.28",
-    "postal-mime": "^2.7.5"
+    "nodemailer": "^10.2.1",
+    "pg": "^8.23.1",
+    "postal-mime": "^2.7.5",
+    "smtp-server": "^3.21.1"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.4",
     "@cloudflare/workers-types": "^5.20260714.1",
+    "@types/node": "^26.6.5",
+    "@types/nodemailer": "^8.0.2",
+    "@types/pg": "^8.23.1",
+    "@types/smtp-server": "^3.5.13",
     "drizzle-kit": "^0.31.10",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "vitest": "^4.1.10",
     "wrangler": "^4.110.0"

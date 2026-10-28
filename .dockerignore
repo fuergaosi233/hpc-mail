@@ -1,0 +1,6 @@
+*
+!apps
+!apps/worker
+!apps/worker/server-dist
+!apps/worker/server-dist/**
+!Dockerfile.k3s

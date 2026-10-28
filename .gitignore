@@ -8,3 +8,6 @@ dist/
 coverage/
 .turbo/
 *.tsbuildinfo
+# Generated Node deployment bundle
+apps/worker/server-dist/
+.deployment/

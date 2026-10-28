@@ -16,7 +16,7 @@ export function hexToBytes(hex: string): Uint8Array {
 export async function sha256Hex(input: string | Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest(
     'SHA-256',
-    typeof input === 'string' ? encoder.encode(input) : input,
+    typeof input === 'string' ? encoder.encode(input) : new Uint8Array(input),
   );
   return bytesToHex(new Uint8Array(digest));
 }
@@ -38,7 +38,7 @@ export async function hmacSha256Hex(secret: string, data: string): Promise<strin
 export async function hmacSha256Base64(secretBytes: Uint8Array, data: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     'raw',
-    secretBytes,
+    new Uint8Array(secretBytes),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign'],

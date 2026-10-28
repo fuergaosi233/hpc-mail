@@ -48,12 +48,12 @@ export function generateTotpSecret(): string {
 async function hmacSha1(key: Uint8Array, msg: Uint8Array): Promise<Uint8Array> {
   const cryptoKey = await crypto.subtle.importKey(
     'raw',
-    key,
+    new Uint8Array(key),
     { name: 'HMAC', hash: 'SHA-1' },
     false,
     ['sign'],
   );
-  const sig = await crypto.subtle.sign('HMAC', cryptoKey, msg);
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, new Uint8Array(msg));
   return new Uint8Array(sig);
 }
 

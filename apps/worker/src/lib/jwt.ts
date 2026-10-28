@@ -8,7 +8,7 @@ function base64url(input: ArrayBuffer | Uint8Array): string {
   return btoa(binary).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
-function base64urlDecode(str: string): Uint8Array {
+function base64urlDecode(str: string): Uint8Array<ArrayBuffer> {
   let normalized = str.replace(/-/g, '+').replace(/_/g, '/');
   while (normalized.length % 4) normalized += '=';
   return Uint8Array.from(atob(normalized), (c) => c.charCodeAt(0));

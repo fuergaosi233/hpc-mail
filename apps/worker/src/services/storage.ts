@@ -20,7 +20,7 @@ export function attachmentKey(
 }
 
 export async function sha256Hex16(buffer: ArrayBuffer | Uint8Array): Promise<string> {
-  const data = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  const data = new Uint8Array(buffer);
   const digest = await crypto.subtle.digest('SHA-256', data);
   return bytesToHex(new Uint8Array(digest)).slice(0, 16);
 }

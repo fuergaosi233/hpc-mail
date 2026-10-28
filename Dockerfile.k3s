@@ -1,0 +1,9 @@
+FROM node:22-alpine
+WORKDIR /app
+COPY --chown=node:node apps/worker/server-dist/ /app/
+ENV NODE_ENV=production PORT=8080 SMTP_PORT=2525 ASSETS_DIR=/app/assets MIGRATIONS_DIR=/app/migrations OBJECTS_DIR=/data/objects
+RUN mkdir -p /data/objects && chown -R node:node /data
+USER node
+EXPOSE 8080 2525
+STOPSIGNAL SIGTERM
+CMD ["node", "/app/server.mjs"]

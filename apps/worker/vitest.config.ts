@@ -20,6 +20,7 @@ export default defineConfig(async () => {
     ],
     test: {
       setupFiles: ['./test/apply-migrations.ts'],
+      exclude: ['server/**', '**/node_modules/**', '**/dist/**'],
     },
   };
 });

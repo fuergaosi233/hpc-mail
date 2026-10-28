@@ -1,0 +1,10 @@
+name = "hpc-mail-ingress-20261028"
+main = "index.ts"
+compatibility_date = "2026-10-28"
+workers_dev = false
+
+[vars]
+BACKEND_URL = "https://mail.multi-agent.wiki"
+
+[observability]
+enabled = true

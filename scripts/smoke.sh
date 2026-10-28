@@ -3,6 +3,12 @@
 # 用法: BASE_URL=https://your-domain.example ADMIN_USERNAME=xx ADMIN_PASSWORD=xx ./scripts/smoke.sh
 set -euo pipefail
 
+curl() {
+  local options=(--connect-timeout 10 --max-time 30)
+  if [ -n "${CURL_CONNECT_TO:-}" ]; then options+=(--connect-to "$CURL_CONNECT_TO"); fi
+  command curl "${options[@]}" "$@"
+}
+
 : "${BASE_URL:?需要 BASE_URL}"
 : "${ADMIN_USERNAME:?需要 ADMIN_USERNAME}"
 : "${ADMIN_PASSWORD:?需要 ADMIN_PASSWORD}"
