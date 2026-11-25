@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { SessionUser } from '@hpc-mail/shared';
 import { CurrentUserContext } from '@/lib/use-session';
 const mocks=vi.hoisted(()=>({release:vi.fn(async()=>({success:true,deletedMessages:1})),toast:vi.fn()}));
+vi.mock('./use-my-proxies',()=>({useMyProxies:()=>({byAddress:new Map()})}));
 vi.mock('@/api/resources',()=>({mailboxApi:{release:mocks.release}}));
 vi.mock('@/components/ui/toast',()=>({toast:mocks.toast}));
 vi.mock('@/lib/use-config',()=>({useDomains:()=>({data:['example.com']})}));

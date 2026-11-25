@@ -61,7 +61,9 @@ describe('API Key 预设工具函数', () => {
   it('勾选恰好等于预设时识别预设，否则为自定义', () => {
     expect(matchScopePreset(['mailbox.read', 'mail.read'])).toBe('read');
     expect(matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read'])).toBe('send');
-    expect(matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write'])).toBe('full');
+    expect(matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write', 'proxy.read'])).toBe('full');
+    // 新增 proxy.read 之前创建的「完全访问」Key 现在显示为自定义
+    expect(matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write'])).toBe('custom');
     expect(matchScopePreset(['mail.read'])).toBe('custom');
     expect(matchScopePreset([])).toBe('custom');
   });
@@ -114,6 +116,7 @@ describe('CreateApiKeyDialog', () => {
     expect(screen.getByRole('checkbox', { name: '标记已读/删除' })).toBeChecked();
 
     await user.click(screen.getByRole('checkbox', { name: '管理邮箱' }));
+    await user.click(screen.getByRole('checkbox', { name: '读取邮箱代理' }));
     expect(screen.getByRole('radio', { name: '完全访问' })).toHaveAttribute('aria-checked', 'true');
 
     await user.click(screen.getByRole('checkbox', { name: '发送邮件' }));

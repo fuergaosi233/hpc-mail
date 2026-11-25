@@ -63,6 +63,8 @@ HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Ro
 | **发件** | 回复 / 转发 / CC / BCC / 附件，站内互投即时落库，外发配额可配 |
 | **转发通知** | 按「收件地址归属人」分流的个人偏好：邮箱转发（含中转降级）、飞书 Webhook 卡片（HMAC 签名 + 防 SSRF）、通用 Webhook |
 | **托管域名** | 用户在「我的域名」填入自己的域名，系统用站长的 Cloudflare 账户建 zone 并给出 NS；用户改好 NS 后自动开通收件（catch-all）与发信，未认领地址的来信自动归域名所有者；域名可共享给其他用户认领地址、可过户，管理员可暂停、过户或删除任意托管域名 |
+| **代理池** | 每个邮箱地址可绑定一个代理（任意供应商，手工添加或批量导入），后台管理绑定、批量导出、给未绑定地址自动分配；自动化用 `/v1/proxies/lookup`（scope `proxy.read`）按地址取代理 URL |
+| **采购（可选）** | 1024proxy：报价 → 管理员确认下单 → 在 1024 结算页付款 → 自动对账入库；Spaceship：粘贴域名列表批量报价 → 确认购买 → 自动建 Cloudflare zone、改 NS、开 Email Routing catch-all 并加入系统域名。均默认关闭，单笔/单批/24 小时上限为 0 即禁止采购，结果不明的下单或注册永不自动重试 |
 | **多用户** | admin / user 两角色；注册模式默认关闭（可开邀请码/开放）；地址认领制；域名可设「仅管理员」或开放认领，可按域名限制每人认领数；支持用户专属域名范围、总数和单域名上限 |
 | **开放 API** | `/v1` 全套接口，API Key 支持 scope、每分钟限流、IP 白名单、过期时间与调用审计 |
 | **账户安全** | JWT + D1 强一致会话、改密 / 禁用即时踢线、TOTP 两步验证（可全局强制）、新 IP 登录飞书告警 |
@@ -243,7 +245,9 @@ wrangler r2 bucket create hpc-cloud-mail-r2
 
 > **API Token 权限**：用「Edit Cloudflare Workers」模板创建，再手动补两条——**Account → D1:Edit**（模板不含）、**Zone → Workers Routes:Edit** 且 Zone Resources 勾选 `CUSTOM_DOMAIN` 所在 zone（缺这条会在「部署 Worker」步骤失败）。
 >
-> **托管域名 Token（可选）**：单独创建一个 Token，权限 **Zone → Zone:Edit、DNS:Edit、Zone Settings:Edit、Email Routing Rules:Edit**，**Account → Email Sending:Edit**；Zone Resources 选「All zones from an account」并 **Exclude 站点域名等关键 zone**。部署时 CI 把它与 `CLOUDFLARE_ACCOUNT_ID` 写入 Worker secrets（`cf_api_token` / `cf_account_id`）。用户的域名会成为你账户下的 zone：收件、发信额度与信誉都算在你的账户上，可在后台「托管域名」页暂停或删除。Cloudflare 在账户超过 50 个 zone 且 pending 多于 active 时禁止新增，后台「系统设置 → 域名托管」可限制每人域名数与同时等待生效的数量。
+> **托管域名 Token（可选）**：单独创建一个 Token，权限 **Zone → Zone:Edit、DNS:Edit、Zone Settings:Edit、Email Routing Rules:Edit**，**Account → Email Sending:Edit**；Zone Resources 选「All zones from an account」并 **Exclude 站点域名等关键 zone**。部署时 CI 把它与 `CLOUDFLARE_ACCOUNT_ID` 写入 Worker secrets（`cf_api_token` / `cf_account_id`）。用户的域名会成为你账户下的 zone：收件、发信额度与信誉都算在你的账户上，可在后台「托管域名」页暂停或删除。Cloudflare 在账户超过 50 个 zone 且 pending 多于 active 时禁止新增，后台「系统设置 → 域名托管」可限制每人域名数与同时等待生效的数量。Spaceship 域名采购复用这同一组 `cf_api_token` / `cf_account_id`，catch-all 指向 `worker_name`（Worker 部署即本 Worker；也可在采购设置里填 `ingressWorkerName` 覆盖）。
+>
+> **采购凭据加密密钥（可选）**：代理密码与 1024proxy / Spaceship 凭据在库里用 AES-GCM 加密。默认密钥由 `jwt_secret` 派生；要独立密钥可 `wrangler secret put secret_box_key`（32 字节随机数的 base64，如 `openssl rand -base64 32`）。CI 不会自动写入它；之后再加入不影响已加密的旧值，但删除它或轮换 `jwt_secret` 会让已存的值无法解密。
 
 **3. 首次部署**：fork 仓库的 **Actions 默认是禁用的**——先进仓库 Actions 页点击启用，然后在 `Deploy HPC Mail` workflow 手动 **Run workflow**（刚 fork 没有新提交，push 不会自动触发）。全新空 D1 **不需要**勾 `reset_database`，迁移会自动从零建表；只有复用了含旧表的数据库才勾它（危险：会清空数据）。此后每次 push 到 `main` 自动部署。
 
@@ -274,7 +278,7 @@ curl -s -X POST "$BASE/v1/messages" \
   -d '{"from":{"localPart":"noreply","domain":"your-domain.example"},"to":["someone@example.org"],"subject":"Hello","text":"来自 HPC Mail 的邮件"}'
 ```
 
-全部端点：`GET /v1/status` · `GET /v1/domains` · `GET|POST /v1/mailboxes` · `GET|POST /v1/messages` · `GET /v1/messages/:id` · `GET /v1/messages/:id/attachments/:attId` · `GET /v1/openapi.json`。scope 粒度：`mail.read` / `mail.write` / `mail.send` / `mailbox.read` / `mailbox.write`。
+全部端点：`GET /v1/status` · `GET /v1/domains` · `GET|POST /v1/mailboxes` · `GET|POST /v1/messages` · `GET /v1/messages/:id` · `GET /v1/messages/:id/attachments/:attId` · `GET /v1/proxies` · `GET /v1/proxies/lookup?address=` · `GET /v1/openapi.json`。scope 粒度：`mail.read` / `mail.write` / `mail.send` / `mailbox.read` / `mailbox.write` / `proxy.read`（读取邮箱绑定的代理，含明文代理密码；普通用户的 Key 只能查自己认领的地址）。
 
 ## 设置模型：系统级 vs 个人级
 

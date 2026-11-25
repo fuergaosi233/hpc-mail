@@ -62,6 +62,9 @@ spec:
             - {name: BUILD_SHA, value: k3s-pg-20261028-v6}
             - {name: SITE_ORIGIN, value: 'https://anytoken.email'}
             - {name: SMTP_HOSTNAME, value: mx.anytoken.email}
+            # Catch-all target for zones the app configures (Spaceship purchases, hosted domains).
+            # Inert until CF_API_TOKEN and CF_ACCOUNT_ID are added to the hpc-mail Secret.
+            - {name: CF_EMAIL_WORKER_NAME, value: hpc-mail-ingress-20261028}
             - {name: MAIL_DOMAINS, value: 'anytoken.email,multi-agent.wiki,0xolivia.xyz,astergate.cc,seed-diffusion.com,gamesgadget.com,freetrips.net'}
           ports:
             - {name: http, containerPort: 8080}

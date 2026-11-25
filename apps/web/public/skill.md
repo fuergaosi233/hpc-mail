@@ -1,11 +1,11 @@
 ---
 name: hpc-mail
-description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和搜索邮件、获取邮箱验证码与验证链接、发送回复转发及附件、管理邮箱和共享、多域名与用户托管域名、通知、API Keys、账户与管理员设置。当用户明确要求操作 HPC Mail，或已确认目标邮箱属于此实例并提供了相应授权时使用；普通邮箱请求不能据此推断属于 HPC Mail。
+description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和搜索邮件、获取邮箱验证码与验证链接、发送回复转发及附件、管理邮箱和共享、查询邮箱绑定的代理、多域名与用户托管域名、通知、API Keys、账户与管理员设置（含代理池与采购）。当用户明确要求操作 HPC Mail，或已确认目标邮箱属于此实例并提供了相应授权时使用；普通邮箱请求不能据此推断属于 HPC Mail。
 ---
 
 # HPC Mail
 
-默认实例：`https://hpc.email`。先确定用户要操作的账户、邮箱和动作，再选择已有凭证对应的 API。此指南描述能力，不额外授权发送邮件、推送测试、配置外部转发、删除数据或扩大共享范围；已有授权足够时直接完成任务。
+默认实例：`https://hpc.email`。先确定用户要操作的账户、邮箱和动作，再选择已有凭证对应的 API。此指南描述能力，不额外授权发送邮件、推送测试、配置外部转发、删除数据、扩大共享范围或任何付费采购；已有授权足够时直接完成任务。
 
 ## 先选鉴权与参考
 
@@ -19,12 +19,14 @@ description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和�
 | 为一次最多 999 个地址分配随机后缀（均匀随机或 Claude 0 封号策略；零封号认领和可用性请求须携带 strategy=claude） | `/api/mailboxes/random-plan`；用户 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 列出自己的/共享的邮箱、检查地址可用性及不可用原因 | `/v1/mailboxes…`：`mailbox.read`；或 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 认领、改显示名、释放邮箱与清除历史 | `/v1/mailboxes…`：`mailbox.write`；或 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 取某个邮箱地址绑定的代理（代理 URL/账号密码，供注册、登录等自动化使用）、列出自己地址的代理 | `GET /v1/proxies/lookup?address=…`、`GET /v1/proxies`：`proxy.read`；或 `GET /api/proxies/mine`：JWT（只含自己认领的地址） | [邮箱、共享与多域名](references/mailboxes-and-domains.md#邮箱代理) |
 | 登录/注册/登出、密码、头像、两步验证 | `/api/auth…`；JWT，登录/注册除外 | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
 | 创建/更新/禁用/吊销 Key、自己的调用审计 | `/api/api-keys…`；JWT | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
 | 个人飞书/PushDeer/Webhook/邮箱转发、健康与重试 | `/api/me/notify-prefs…`；JWT | [通知与转发](references/notifications.md) |
 | 管理自己邮箱的共享名单、多只邮箱一次共享给同一批人、搜索共享成员 | `/api/mailboxes/shares…`、`/api/mailboxes/share-users`；用户 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 把自己的域名托管到本站（建 zone、给出 NS、查看生效进度）、DNS 解析管理、域名成员共享与过户、删除托管 | `/api/hosted-domains…`；用户 JWT（管理员全站：`/api/admin/hosted-domains…`） | [邮箱、共享与多域名](references/mailboxes-and-domains.md#用户托管域名) |
 | 用户专属邮箱权限、强制过户邮箱、全站任意邮箱共享名单、域名增删/公开性/配额/参与随机、每域 Claude 统计、接入检查 | `/api/admin…`；管理员 JWT | [管理员参考](references/administration.md)、[邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 代理池（增删改、批量导入导出、邮箱↔代理绑定、自动分配）、1024proxy 采购代理、Spaceship 批量购买域名并接入收件 | `/api/admin/proxies…`、`/api/admin/proxy-1024…`、`/api/admin/domain-purchases…`；管理员 JWT，涉及付费的步骤需用户明确授权 | [管理员功能](references/administration.md#代理池与采购) |
 | 用户、邀请码、系统设置、全站 Key 与管理审计、审阅其他用户邮件 | `/api/admin…` 及邮件的管理员 `scope`；管理员 JWT | [管理员功能](references/administration.md) |
 
 完整机器可读规格：[API Key API](https://hpc.email/v1/openapi.json)、[JWT API](https://hpc.email/api/openapi.json)。两份规格公开可读；业务接口仍逐项鉴权。安装本指南时保留 `references/` 的相对目录；只拿到了本文时，可从 `https://hpc.email/references/<文件名>` 读取对应参考。

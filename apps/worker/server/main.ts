@@ -32,6 +32,11 @@ const env = {
   db, kv: new PostgresKV(db), r2: new FileBucket(process.env.OBJECTS_DIR ?? '/data/objects'),
   jwt_secret: process.env.JWT_SECRET, site_origin: process.env.SITE_ORIGIN,
   build_sha: process.env.BUILD_SHA ?? 'k3s-postgres', email: { send },
+  // 可选：Cloudflare 凭据（用户托管域名与 Spaceship 域名采购建 zone / Email Routing）；
+  // CF_EMAIL_WORKER_NAME 是 catch-all 指向的入站 Email Worker（k3s 为 hpc-mail-ingress-20261028），
+  // SECRET_BOX_KEY 是采购凭据与代理密码的加密密钥（base64 32 字节，不设则由 JWT_SECRET 派生）。
+  cf_api_token: process.env.CF_API_TOKEN || undefined, cf_account_id: process.env.CF_ACCOUNT_ID || undefined,
+  worker_name: process.env.CF_EMAIL_WORKER_NAME || undefined, secret_box_key: process.env.SECRET_BOX_KEY || undefined,
   assets: { async fetch(request: Request) {
     let pathname: string;
     try { pathname = decodeURIComponent(new URL(request.url).pathname); } catch { return new Response('Bad Request', { status: 400 }); }

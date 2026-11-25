@@ -19,6 +19,11 @@ export interface Env {
   cf_account_id?: string;
   /** 托管域名 catch-all 投递的目标脚本名，须与 wrangler.toml 的 name 一致 */
   worker_name?: string;
+  /**
+   * secret（可选）：采购凭据与代理密码的加密密钥，32 字节随机数的 base64（k3s 为 SECRET_BOX_KEY）。
+   * 未配置时由 jwt_secret 经 HKDF 派生；此时轮换 jwt_secret 会让已加密的值无法解密。
+   */
+  secret_box_key?: string;
 }
 
 /** 内部 API 鉴权后的用户上下文 */

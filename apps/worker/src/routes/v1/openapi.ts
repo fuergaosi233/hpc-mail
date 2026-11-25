@@ -1,14 +1,16 @@
+import { API_SCOPES } from '@hpc-mail/shared';
 import {
   array, bool, changed, claimStrategy, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, operation,
   positiveId, query, ref, scopeQuery, specInfo, specificationOperation, str, uploadPaths, usedSchemas, type Paths,
 } from '../openapi-common.js';
+import { v1ProxyPaths } from '../openapi-procurement.js';
 
 /** Public API-key contract. Session/admin operations are described separately. */
 export function buildOpenApiSpec(origin: string) {
   const paths: Paths = {
     '/openapi.json': { get: specificationOperation() },
     '/status': { get: operation('Check API key access', object({ status: { type: 'string', const: 'operational' }, userId: positiveId,
-      role: { type: 'string', enum: ['admin', 'user'] }, scopes: array({ type: 'string', enum: ['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write'] }) }),
+      role: { type: 'string', enum: ['admin', 'user'] }, scopes: array({ type: 'string', enum: [...API_SCOPES] }) }),
       { description: 'Requires an active API key and enabled API. No additional scope. This confirms access, not end-to-end mail delivery.' }) },
     '/domains': { get: operation('List configured domains available to this user', object({ domains: array(str) }),
       { description: 'No additional scope. Ordinary users see public domains or their dedicated mailboxPolicy domains, including explicitly granted private domains; administrators see all configured domains. Active hosted domains follow the system domains: those the key owner owns or was granted (see the session API /hosted-domains), or every active hosted domain for administrators. Claim only a returned domain. Removed domains remain usable for existing owned mailbox identities but are absent from this new-claim list.' }) },
@@ -64,6 +66,7 @@ export function buildOpenApiSpec(origin: string) {
     '/messages/{id}/attachments/{attId}': { get: operation('Download a visible message attachment', str, { scope: 'mail.read', parameters: scopeQuery, binary: 'application/octet-stream',
       description: 'Binary bytes with a safe Content-Type/Content-Disposition, without a data envelope. Attachment must belong to message id and the message must be visible.' }) },
     ...uploadPaths('mail.send'),
+    ...v1ProxyPaths(),
   };
   return {
     openapi: '3.1.0', info: specInfo('HPC Mail Open API', 'API-key mail/mailbox automation. Bearer hpcm_ keys are distinct from JWT sessions. Keys are limited by owner, scope, expiry, IP allowlist and per-key/user/instance rates; users cannot create arbitrary domains. Management, notification preferences, sessions and 2FA use the related JWT API.'),

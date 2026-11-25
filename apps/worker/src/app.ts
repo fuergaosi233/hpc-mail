@@ -2,6 +2,9 @@ import { Hono } from 'hono';
 import { AppError } from './lib/errors.js';
 import { onError, requestId } from './middleware/error.js';
 import adminApiKeys from './routes/admin/api-keys.js';
+import adminDomainPurchases from './routes/admin/domain-purchases.js';
+import adminProxies from './routes/admin/proxies.js';
+import adminProxy1024 from './routes/admin/proxy-1024.js';
 import adminHostedDomains from './routes/admin/hosted-domains.js';
 import adminAudit from './routes/admin/audit.js';
 import adminInvites from './routes/admin/invites.js';
@@ -20,6 +23,7 @@ import hostedDomains from './routes/hosted-domains.js';
 import mailboxes from './routes/mailboxes.js';
 import messages from './routes/messages.js';
 import notifyPrefs from './routes/notify-prefs.js';
+import proxies from './routes/proxies.js';
 import v1 from './routes/v1/index.js';
 import { buildSessionOpenApiSpec } from './routes/api-openapi.js';
 import type { AppContext } from './types.js';
@@ -48,6 +52,7 @@ export function createApp() {
   api.route('/attachments', attachments);
   api.route('/uploads', uploads);
   api.route('/api-keys', apiKeys);
+  api.route('/proxies', proxies);
   api.route('/admin/users', adminUsers);
   api.route('/admin/mailbox-shares', adminMailboxShares);
   api.route('/admin/mailboxes', adminMailboxes);
@@ -56,6 +61,9 @@ export function createApp() {
   api.route('/admin/invites', adminInvites);
   api.route('/admin/api-keys', adminApiKeys);
   api.route('/admin/audit-logs', adminAudit);
+  api.route('/admin/proxies', adminProxies);
+  api.route('/admin/proxy-1024', adminProxy1024);
+  api.route('/admin/domain-purchases', adminDomainPurchases);
 
   app.route('/api', api);
   app.route('/v1', v1);

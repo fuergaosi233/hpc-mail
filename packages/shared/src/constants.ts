@@ -13,6 +13,8 @@ export const API_SCOPES = [
   'mail.send',
   'mailbox.read',
   'mailbox.write',
+  /** 读取邮箱绑定的代理（含明文凭据）；普通 Key 只能读自己认领的地址，共享给我的不算 */
+  'proxy.read',
 ] as const;
 export type ApiScope = (typeof API_SCOPES)[number];
 
@@ -81,6 +83,8 @@ export const MAX_BATCH_SHARE_MAILBOXES = 100;
 export const MAX_MAILBOX_GRANTEES = 100;
 /** 每个托管域名最多共享给多少位成员 */
 export const MAX_HOSTED_DOMAIN_MEMBERS = 100;
+/** 系统域名列表（settings.domains.list）上限；域名采购的报价与确认按「已列出 + 采购中 + 本次选中」校验 */
+export const MAX_SYSTEM_DOMAINS = 64;
 export const MAX_DRAFT_ATTACHMENT_BYTES_PER_USER = 100 * 1024 * 1024;
 
 /** 用户名：小写字母/数字开头，3-32 位，允许 - _ */

@@ -1,6 +1,20 @@
 import { sql } from 'drizzle-orm';
 import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
-import type { MessageRecipients, RecipientOutcome, UserMailboxPolicy, UserNotifyPrefs } from '@hpc-mail/shared';
+import {
+  DOMAIN_BATCH_STATUSES,
+  DOMAIN_ITEM_STATUSES,
+  PROXY1024_PRODUCTS,
+  PROXY_BINDING_SOURCES,
+  PROXY_HEALTH,
+  PROXY_ORDER_STATUSES,
+  PROXY_PROTOCOLS,
+  PROXY_SOURCES,
+  PROXY_STATUSES,
+  type MessageRecipients,
+  type RecipientOutcome,
+  type UserMailboxPolicy,
+  type UserNotifyPrefs,
+} from '@hpc-mail/shared';
 
 /** 统一时间戳列：unix 毫秒，Drizzle 映射为 Date */
 const createdAtColumn = () =>
@@ -484,3 +498,190 @@ export const deliveryObjectLeases = sqliteTable('delivery_object_leases', {
   token: text('token').notNull(),
   expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
 }, (t) => [primaryKey({ columns: [t.r2Key, t.token] }), index('idx_delivery_lease_expiry').on(t.expiresAt)]);
+
+/** 代理库存：任意来源（手工/导入/1024）。密码用 secret box 加密（enc:v1:…），列表接口永不返回密码。 */
+export const proxies = sqliteTable('proxies', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  label: text('label').notNull().default(''),
+  /** 供应商名，自由文本小写（'1024proxy' 由采购同步写入；手工可填任意值，缺省 'manual'） */
+  provider: text('provider').notNull().default('manual'),
+  source: text('source', { enum: PROXY_SOURCES }).notNull().default('manual'),
+  protocol: text('protocol', { enum: PROXY_PROTOCOLS }).notNull().default('http'),
+  host: text('host').notNull(),
+  port: integer('port').notNull(),
+  username: text('username').notNull().default(''),
+  /** sealed；'' 表示无密码 */
+  passwordEnc: text('password_enc').notNull().default(''),
+  /** static_isp | unlimited_port | unlimited_bandwidth | residential_sticky | 自由文本 */
+  product: text('product').notNull().default(''),
+  /** ISO-3166 alpha-2 大写，'' 表示未知 */
+  country: text('country').notNull().default(''),
+  region: text('region').notNull().default(''),
+  city: text('city').notNull().default(''),
+  /** 供应商侧唯一标识（1024 static_use 行 id、端口服务器 id、`sub:<user>:sid:<sid>`）；手工为 null */
+  providerRef: text('provider_ref'),
+  /** proxy_orders.id */
+  orderId: integer('order_id'),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }),
+  status: text('status', { enum: PROXY_STATUSES }).notNull().default('active'),
+  /** 1..1000 */
+  maxBindings: integer('max_bindings').notNull().default(1),
+  healthStatus: text('health_status', { enum: PROXY_HEALTH }).notNull().default('unknown'),
+  healthCheckedAt: integer('health_checked_at', { mode: 'timestamp_ms' }),
+  healthLatencyMs: integer('health_latency_ms'),
+  healthError: text('health_error').notNull().default(''),
+  notes: text('notes').notNull().default(''),
+  createdBy: integer('created_by').notNull().default(0),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  uniqueIndex('uq_proxies_endpoint').on(t.host, t.port, t.username),
+  // provider_ref 为 NULL 的行互不冲突（SQLite 与 PostgreSQL 一致）
+  uniqueIndex('uq_proxies_provider_ref').on(t.provider, t.providerRef),
+  index('idx_proxies_status').on(t.status, t.id),
+  index('idx_proxies_order').on(t.orderId),
+  index('idx_proxies_expires').on(t.expiresAt),
+]);
+
+/** 地址 ↔ 代理绑定。以地址为主键（未认领地址同样可绑），与认领/释放/过户解耦。 */
+export const addressProxyBindings = sqliteTable('address_proxy_bindings', {
+  /** 小写完整地址 */
+  address: text('address').primaryKey(),
+  proxyId: integer('proxy_id').notNull(),
+  /** '@' 之后的部分，小写 */
+  domain: text('domain').notNull(),
+  source: text('source', { enum: PROXY_BINDING_SOURCES }).notNull().default('manual'),
+  boundBy: integer('bound_by').notNull().default(0),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  index('idx_address_proxy_bindings_proxy').on(t.proxyId),
+  index('idx_address_proxy_bindings_domain').on(t.domain, t.address),
+]);
+
+/** 1024proxy 订单：quote → confirm(下单) → awaiting_payment → paid → fulfilled；结果不明 = unknown，永不自动重试 */
+export const proxyOrders = sqliteTable('proxy_orders', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  status: text('status', { enum: PROXY_ORDER_STATUSES }).notNull().default('quoted'),
+  product: text('product', { enum: PROXY1024_PRODUCTS }).notNull(),
+  /** 1024 sn；static_isp 为 '' */
+  sku: text('sku').notNull().default(''),
+  /** GB / 端口数 / IP 数 */
+  quantity: integer('quantity').notNull(),
+  /** static_isp 的下单串 "KR-30-2,US-30-5"；其余 '' */
+  orderSpec: text('order_spec').notNull().default(''),
+  /** 管理员看到的报价 */
+  estimateCents: integer('estimate_cents').notNull(),
+  /** ≥ estimate（未折扣价）；上限按它比较 */
+  capBasisCents: integer('cap_basis_cents').notNull(),
+  /** 记录里的 true_money */
+  actualCents: integer('actual_cents'),
+  balanceCentsAtQuote: integer('balance_cents_at_quote'),
+  quoteExpiresAt: integer('quote_expires_at', { mode: 'timestamp_ms' }).notNull(),
+  orderNo: text('order_no'),
+  /** sealed（可能内含会话） */
+  checkoutUrlEnc: text('checkout_url_enc').notNull().default(''),
+  leaseUntil: integer('lease_until', { mode: 'timestamp_ms' }),
+  lastError: text('last_error').notNull().default(''),
+  materializedCount: integer('materialized_count').notNull().default(0),
+  createdBy: integer('created_by').notNull(),
+  confirmedBy: integer('confirmed_by'),
+  confirmedAt: integer('confirmed_at', { mode: 'timestamp_ms' }),
+  orderedAt: integer('ordered_at', { mode: 'timestamp_ms' }),
+  paidAt: integer('paid_at', { mode: 'timestamp_ms' }),
+  checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  uniqueIndex('uq_proxy_orders_order_no').on(t.orderNo),
+  index('idx_proxy_orders_status').on(t.status, t.checkedAt),
+  index('idx_proxy_orders_confirmed').on(t.confirmedAt),
+]);
+
+/** Spaceship 批量采购批次 */
+export const domainPurchaseBatches = sqliteTable('domain_purchase_batches', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  status: text('status', { enum: DOMAIN_BATCH_STATUSES }).notNull().default('quoted'),
+  years: integer('years').notNull().default(1),
+  autoRenew: integer('auto_renew', { mode: 'boolean' }).notNull().default(false),
+  privacyLevel: text('privacy_level', { enum: ['public', 'high'] }).notNull().default('high'),
+  /** 可购条目 cap basis 之和 */
+  quoteTotalCents: integer('quote_total_cents').notNull().default(0),
+  confirmedTotalCents: integer('confirmed_total_cents').notNull().default(0),
+  quoteExpiresAt: integer('quote_expires_at', { mode: 'timestamp_ms' }).notNull(),
+  /** 确认进行中的租约 */
+  leaseUntil: integer('lease_until', { mode: 'timestamp_ms' }),
+  lastError: text('last_error').notNull().default(''),
+  createdBy: integer('created_by').notNull(),
+  confirmedBy: integer('confirmed_by'),
+  confirmedAt: integer('confirmed_at', { mode: 'timestamp_ms' }),
+  completedAt: integer('completed_at', { mode: 'timestamp_ms' }),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+  createdAt: createdAtColumn(),
+}, (t) => [index('idx_domain_purchase_batches_status').on(t.status, t.id)]);
+
+/** 批次内每个域名的持久化进度（cron 可续跑） */
+export const domainPurchaseItems = sqliteTable('domain_purchase_items', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  batchId: integer('batch_id').notNull(),
+  /** A-label，小写 */
+  domain: text('domain').notNull(),
+  status: text('status', { enum: DOMAIN_ITEM_STATUSES }).notNull().default('quoted'),
+  /** available|taken|invalidDomainName|tldNotSupported|unexpectedError */
+  availability: text('availability').notNull().default(''),
+  /** DOMAIN_SKIP_REASONS 之一或 '' */
+  skipReason: text('skip_reason').notNull().default(''),
+  /** standard|premium */
+  priceClass: text('price_class').notNull().default(''),
+  finalCents: integer('final_cents'),
+  regularCents: integer('regular_cents'),
+  /** max(final, regular) × years */
+  capBasisCents: integer('cap_basis_cents'),
+  /** spaceship-async-operationid */
+  operationId: text('operation_id'),
+  /** pending|success|failed */
+  opStatus: text('op_status').notNull().default(''),
+  cfZoneId: text('cf_zone_id'),
+  nameServers: text('name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+  zoneStatus: text('zone_status').notNull().default(''),
+  routingStatus: text('routing_status').notNull().default(''),
+  /** GET /v1/domains/{d} 的 lifecycleStatus */
+  lifecycleStatus: text('lifecycle_status').notNull().default(''),
+  verificationStatus: text('verification_status').notNull().default(''),
+  suspensions: text('suspensions', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+  /** register|poll|zone|nameservers|routing|catch_all|domain_add */
+  failedStep: text('failed_step').notNull().default(''),
+  lastError: text('last_error').notNull().default(''),
+  /** spaceship-error-code / CF code */
+  errorCode: text('error_code').notNull().default(''),
+  /** 最近一次错误的 spaceship-operation-id 头 */
+  vendorOperationId: text('vendor_operation_id').notNull().default(''),
+  /** 当前步骤已尝试次数 */
+  stepAttempts: integer('step_attempts').notNull().default(0),
+  leaseUntil: integer('lease_until', { mode: 'timestamp_ms' }),
+  nextCheckAt: integer('next_check_at', { mode: 'timestamp_ms' }),
+  zoneCreateAttemptedAt: integer('zone_create_attempted_at', { mode: 'timestamp_ms' }),
+  registerAttemptedAt: integer('register_attempted_at', { mode: 'timestamp_ms' }),
+  registeredAt: integer('registered_at', { mode: 'timestamp_ms' }),
+  /** 最近一次在 Spaceship 设置 NS 的时间；NS 生效超时从这里算（管理员重试会重设） */
+  nsSetAt: integer('ns_set_at', { mode: 'timestamp_ms' }),
+  readyAt: integer('ready_at', { mode: 'timestamp_ms' }),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  index('idx_domain_purchase_items_batch').on(t.batchId, t.id),
+  index('idx_domain_purchase_items_status').on(t.status, t.nextCheckAt),
+  index('idx_domain_purchase_items_domain').on(t.domain),
+]);
+
+/** 供应商会话/凭据健康（cron 写，避免与管理员编辑 settings 争写） */
+export const integrationStatus = sqliteTable('integration_status', {
+  /** 'proxy1024' | 'spaceship' */
+  provider: text('provider').primaryKey(),
+  /** ok|missing|invalid|error|unknown */
+  state: text('state').notNull().default('unknown'),
+  /** 非敏感信息（账号邮箱、错误信息） */
+  detail: text('detail').notNull().default(''),
+  balanceCents: integer('balance_cents'),
+  checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
+});

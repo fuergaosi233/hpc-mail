@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 const box = { id: 42, address: 'existing@example.com', domain: 'example.com', userId: 10, ownerUsername: 'old-owner',
   displayName: '', messageCount: 12, createdAt: '2026-10-06T00:00:00Z' };
+vi.mock('./use-address-proxies', () => ({ useAddressProxies: () => ({ byAddress: new Map(), isError: false }) }));
 vi.mock('@/api/resources', () => ({ adminApi: { searchUsers: vi.fn(), transferMailbox: vi.fn() }, mailboxApi: { release: vi.fn() } }));
 vi.mock('@/lib/use-media-query', () => ({ useIsMobile: () => true }));
 vi.mock('@/features/mailboxes/use-mailboxes', () => ({ useMailboxesQuery: () => ({ data: [box], isLoading: false, isError: false }) }));

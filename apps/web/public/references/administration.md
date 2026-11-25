@@ -109,6 +109,33 @@ AI 模型默认未配置，翻译默认关闭；本站不再使用 Cloudflare Wo
 
 通知/转发已为个人偏好，不在上述系统设置中；通过 `/api/me/notify-prefs` 修改当前管理员的个人通道，不能 PUT 旧全局 `feishu/notify_webhook/gmail_forward` 字段。
 
+## 代理池与采购
+
+以下接口全部只用管理员 JWT `/api`，Key scopes 不提供；涉及付费（1024 下单、Spaceship 注册域名）的操作必须有用户对金额和范围的明确授权，不能因为本说明就执行。
+
+**代理池与绑定（`/admin/proxies`）**
+
+| 方法与路径 | 契约 |
+|---|---|
+| `GET /admin/proxies?cursor=&limit=&q=&status=&provider=&country=&bound=yes\|no&orderId=` | 库存分页；视图永不含密码（`hasPassword`） |
+| `GET /admin/proxies/stats` | `{total,active,expired,disabled,bound,free,byProvider}` |
+| `POST /admin/proxies` | `{label?,provider?,protocol?,host,port,username?,password?,product?,country?,region?,city?,expiresAt?,status?,maxBindings?,notes?}` → 201；host:port:username 重复返回 409 |
+| `PUT /admin/proxies/:id` | 只改提交的字段；`password` 提交 `******` 保留、空串清除 |
+| `DELETE /admin/proxies/:id?force=1` | 仍有绑定时不带 `force=1` 返回 409，带上则连同绑定删除 |
+| `POST /admin/proxies/:id/reveal` | 明文凭据（含 `url`），每分钟 30 次，记审计但不记密码 |
+| `POST /admin/proxies/:id/health` | `{ok,latencyMs?,error?}`；服务端不主动探测，由自动化上报 |
+| `POST /admin/proxies/import` | `{text,format:auto\|url\|host_port_user_pass\|user_pass_at_host_port,defaults?,dryRun?}`，每行一个，最多 2000 行；返回 `{created,duplicates,invalid:[{line,reason}],dryRun}`。先 `dryRun:true` 预览 |
+| `GET /admin/proxies/export?format=url\|host_port_user_pass\|user_pass_at_host_port\|json&scope=bindings\|proxies&domain=&status=` | `{format,count,content}`；`scope=bindings` 文本每行 `地址<TAB>代理`，json 为 `[{address,...凭据}]`；超过 10000 行返回 400（请按域名/状态缩小），不会截断；含明文密码，每分钟 6 次 |
+| `GET /admin/proxies/bindings?cursor=&limit=&domain=&q=&proxyId=` | 绑定分页：`{address,domain,proxyId,source,proxy,ownerUserId,ownerUsername,...}` |
+| `POST /admin/proxies/bindings/lookup` | `{addresses:[...]}`（1–500）→ `{items:[{address,binding}]}`，未绑定为 null |
+| `PUT /admin/proxies/bindings/:address` | `{proxyId}`；地址需 URL 编码，可为未认领地址；代理已停用/过期或已达 `maxBindings` 返回 409 |
+| `DELETE /admin/proxies/bindings/:address` | 解绑 |
+| `POST /admin/proxies/auto-assign` | `{target:claimed\|addresses,domain?,addresses?,limit?,filter?:{provider,country,product},dryRun?}` → `{assigned,unassigned,freeProxiesLeft,dryRun}`；只给尚未绑定的地址分配 active 且有空余额度的代理，不替换已有绑定，并发的手工绑定优先 |
+
+**1024proxy 采购（`/admin/proxy-1024`）**：配置在 `settings.proxy1024`（`enabled,email,password,sessionToken,lang,maxOrderCents,maxDailyCents,quoteTtlMinutes`；password/sessionToken 只写，回显 `******`）。单笔与 24 小时上限任一为 0 即禁止下单。流程：`GET /status`（`?live=1` 实时检查会话与余额）→ `POST /quotes`（201，生成报价单，不下单）→ 管理员核对金额后 `POST /orders/:id/confirm {expectedCents}`（必须等于报价 `estimateCents`；价格上涨、余额不足、报价过期返回 409 且不下单）。确认只创建 1024 订单并给出 `checkoutUrl`，**付款由管理员在 1024 结算页用余额完成**，定时任务随后对账入库。下单结果不明的订单状态为 `unknown`，系统永不自动重试，需人工到 1024 控制台核对后 `POST /orders/:id/resolve`（`abandon` 或 `attach_order_no`；后者也可替换消费记录里查不到的旧订单号）。已付款但迟迟识别不到新服务器的无限端口/带宽订单（付款 24 小时后定时任务不再自动同步），在库存中核对后用 `mark_fulfilled` 标记已交付。会话可直接粘贴 `sessionToken`，或用 `POST /login/captcha` + 人工拖动滑块后 `POST /login`。其他：`GET /catalogue`、`GET /sub-users`、`GET /orders`、`POST /orders/:id/refresh|cancel|allocate`、`POST /sync`（同步已购代理进库存）、`POST /generate-sticky`（201）。
+
+**Spaceship 批量买域名（`/admin/domain-purchases`）**：配置在 `settings.spaceship`（`enabled,apiKey,apiSecret,registrantContactId,years,autoRenew,privacyLevel,allowPremium,maxDomainCents,maxBatchCents,maxDailyCents,maxBatchDomains,quoteTtlMinutes,ingressWorkerName`；apiKey/apiSecret 只写）。流程：`GET /status`（`reasons` 列出不能采购的原因）→ `POST /quotes {domains}`（201，粘贴文本或数组；已在系统域名、被用户托管、本站有历史或正在采购的域名直接跳过）→ 核对表格后 `POST /:id/confirm {domains,expectedTotalCents}`（重新核对可用性与价格，任何变化返回 409；单域名、批次、24 小时与系统域名名额上限在同一事务里检查）。之后由定时任务逐域推进：注册（每域最多一次；确认 24 小时内未发起注册即作废，超过报价有效期才注册时会先复核可用性与价格，涨价或不再可买则作废不扣费；停用采购或上限设为 0 时已确认条目暂停注册）→ 建 Cloudflare zone → 在 Spaceship 设置 Cloudflare 分配的 NS → zone 生效后开启 Email Routing 并把 catch-all 指向收件 Worker → 加入 `settings.domains.list`（即可收信）。用 `GET /:id` 看每域 `status/failedStep/lastError/maybeCharged/actions`；注册之后的步骤失败可 `POST /items/:itemId/retry`，注册结果不明（`unknown`）只能凭 Spaceship 的实时证据 `POST /items/:itemId/resolve`，绝不会重新注册。其他：`POST /test-credentials`、`POST /contact`（保存注册人联系人）、`POST /items/:itemId/refresh`、`POST /:id/cancel`。
+
 ## Key 与管理审计
 
 | 方法与 `/api` 路径 | 契约 |

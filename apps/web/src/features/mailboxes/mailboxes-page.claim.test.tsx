@@ -4,6 +4,7 @@ import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import type { SessionUser } from '@hpc-mail/shared';
 import { CurrentUserContext } from '@/lib/use-session';
+vi.mock('./use-my-proxies', () => ({ useMyProxies: () => ({ byAddress: new Map() }) }));
 vi.mock('@/api/resources', () => ({ mailboxApi: { availability: vi.fn(async () => ({ available: true })) } }));
 const domains = vi.hoisted(() => ({ data: ['example.com'] }));
 vi.mock('@/lib/use-config', () => ({ useDomains: () => domains }));

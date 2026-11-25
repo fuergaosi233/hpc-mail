@@ -75,6 +75,16 @@ for (const schema of [settingsResponse, settingsUpdate]) {
   for (const name of ['paidSuspendedLimit', 'suspendedPercent']) {
     claimFields[name] = { ...claimFields[name], deprecated: true, description: 'Compatibility only; ignored for eligibility. Any historical Claude suspension always excludes the domain.' };
   }
+  const secretNote = 'Write-only secret, stored encrypted. Responses return ****** when set (empty string when not). Submitting ****** keeps it; an empty string clears it; values starting with enc:v1: are rejected.';
+  for (const [group, fields, description] of [
+    ['proxy1024', ['password', 'sessionToken'], '1024proxy purchasing (administrator JWT feature at /admin/proxy-1024). Off unless enabled with a session token and both caps above 0; a cap of 0 forbids purchasing. Amounts are integer US cents.'],
+    ['spaceship', ['apiKey', 'apiSecret'], 'Spaceship bulk domain purchasing (administrator JWT feature at /admin/domain-purchases). Off unless enabled with API key, secret, registrant contact and caps above 0; a cap of 0 forbids purchasing. ingressWorkerName is the Email Worker new catch-all rules target; empty falls back to the explicitly configured worker_name / CF_EMAIL_WORKER_NAME. Amounts are integer US cents.'],
+  ] as const) {
+    if (!properties[group]) continue;
+    properties[group]!.description = description;
+    const groupFields = properties[group]!.properties as Record<string, Schema>;
+    for (const field of fields) groupFields[field] = { ...groupFields[field], description: secretNote };
+  }
   properties.translation!.description = 'AI translation switch and quota. Enabling requires a configured ai_model (checked against the merged result when both are submitted). dailyCharsPerUser limits characters sent per user per UTC day, administrators included; 0 is unlimited.';
 }
 const notifyPrefs = fromZod(userNotifyPrefsSchema, 'output');
@@ -272,11 +282,15 @@ export const changed = object({ changed: int });
 export const okResult = object({ ok: { const: true, type: 'boolean' } });
 export function operation(summary: string, data: Schema, options: {
   request?: string; requestRequired?: boolean; status?: number; parameters?: Schema[]; description?: string; public?: boolean; role?: 'admin'; scope?: string; binary?: string; security?: Schema[];
+  /** Operations that call an external vendor also document 502 upstream_failed and 503 not_configured. */
+  vendorErrors?: boolean;
 } = {}): Operation {
   const responseSchema = options.binary ? { type: 'string', format: 'binary' } : object({ data });
-  const errors = Object.fromEntries([400, 401, 403, 404, 409, 413, 429, 500].map(code => [code, {
+  const codes = [400, 401, 403, 404, 409, 413, 429, 500, ...(options.vendorErrors ? [502, 503] : [])];
+  const errors = Object.fromEntries(codes.map(code => [code, {
     description: ({ 400: 'Invalid request', 401: 'Missing/invalid credentials; login may return totp_required', 403: 'Permission denied or totp_setup_required',
-      404: 'Resource not found or not visible', 409: 'Conflict, stale revision or send result not confirmed', 413: 'Payload exceeds limits', 429: 'Rate limit exceeded', 500: 'Server or notification-delivery error' } as Record<number, string>)[code],
+      404: 'Resource not found or not visible', 409: 'Conflict, stale revision or send result not confirmed', 413: 'Payload exceeds limits', 429: 'Rate limit exceeded', 500: 'Server or notification-delivery error',
+      502: 'upstream_failed: the vendor returned a definite error', 503: 'not_configured: feature disabled, credentials missing or a cap is 0' } as Record<number, string>)[code],
     content: { 'application/json': { schema: ref('Error') } },
   }]));
   return { summary, description: options.description || summary, tags: [options.role ? 'Administration' : 'Mail'],
@@ -294,7 +308,8 @@ export function describePaths(paths: Paths, namespace = ''): Paths {
     ...methods,
     ...(Array.from(path.matchAll(/\{([^}]+)\}/g)).length ? { parameters: Array.from(path.matchAll(/\{([^}]+)\}/g), match => ({
       name: match[1], in: 'path', required: true,
-      schema: match[1] === 'token' ? { type: 'string', minLength: 1 } : match[1] === 'recordId' ? dnsRecordId : positiveId,
+      schema: match[1] === 'token' ? { type: 'string', minLength: 1 } : match[1] === 'recordId' ? dnsRecordId
+        : match[1] === 'address' ? { type: 'string', minLength: 3, maxLength: 254, description: 'URL-encoded full mailbox address.' } : positiveId,
     })) } : {}),
     ...Object.fromEntries(Object.entries(methods).map(([method, value]) => [method, {
       ...value, operationId: `${namespace}${method}_${path.replace(/[^a-zA-Z0-9]+/g, '_')}`,

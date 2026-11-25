@@ -234,7 +234,8 @@ export function SettingsPage() {
   const save = useMutation({
     mutationFn: (payload: Settings) => {
       // Domain edits have their own revision check on the domain page; never resubmit a stale copy here.
-      const { domains: _domains, ...settings } = payload;
+      // proxy1024 / spaceship 由各自功能页的配置卡片保存（含 1024 登录写入的会话令牌），这里不回写旧快照。
+      const { domains: _domains, proxy1024: _proxy1024, spaceship: _spaceship, ...settings } = payload;
       return adminApi.updateSettings(settings);
     },
     onSuccess: (saved) => {

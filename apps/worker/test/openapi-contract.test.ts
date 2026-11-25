@@ -10,6 +10,7 @@ const app = createApp();
 const origin = 'https://mail.example';
 const specs = { api: buildSessionOpenApiSpec(origin), v1: buildOpenApiSpec(origin) };
 const methods = new Set(['get', 'post', 'put', 'delete', 'patch', 'options', 'head']);
+const admin = 'admin';
 
 function operations(namespace: keyof typeof specs) {
   return Object.entries(specs[namespace].paths).flatMap(([path, item]) => Object.keys(item)
@@ -207,6 +208,34 @@ describe('OpenAPI routes and public contracts', () => {
       expect(((properties.ai_model!.properties as Record<string, Schema>).apiKey!).description).toContain('******');
       expect(Object.keys(properties.translation!.properties as Schema).sort()).toEqual(['dailyCharsPerUser', 'enabled']);
     }
+  });
+
+  it('documents proxy lookup on /v1 with proxy.read and keeps purchasing JWT-admin only', () => {
+    expect(specs.v1.paths['/proxies/lookup']?.get?.['x-required-scopes']).toEqual(['proxy.read']);
+    expect(specs.v1.paths['/proxies']?.get?.['x-required-scopes']).toEqual(['proxy.read']);
+    const lookupParams = specs.v1.paths['/proxies/lookup']!.get!.parameters as Array<{ name: string; required: boolean }>;
+    expect(lookupParams).toContainEqual(expect.objectContaining({ name: 'address', required: true }));
+    const status = specs.v1.paths['/status']!.get!.responses as Record<string, { content: Record<string, { schema: { properties: { data: Schema } } }> }>;
+    const scopes = (status['200']!.content['application/json']!.schema.properties.data.properties as Record<string, Schema>).scopes!;
+    expect((scopes.items as Schema).enum).toContain('proxy.read');
+    for (const path of Object.keys(specs.v1.paths)) {
+      expect(path).not.toMatch(/proxy-1024|domain-purchases|admin/);
+    }
+    for (const [path, item] of Object.entries(specs.api.paths)) {
+      if (!/^\/admin\/(proxies|proxy-1024|domain-purchases)/.test(path)) continue;
+      for (const [method, op] of Object.entries(item)) {
+        if (methods.has(method)) expect(op['x-required-role']).toBe(admin);
+      }
+    }
+    const created = (path: string) => Object.keys(specs.api.paths[path]!.post!.responses as object);
+    for (const path of ['/admin/proxies', '/admin/proxy-1024/quotes', '/admin/proxy-1024/generate-sticky', '/admin/domain-purchases/quotes']) {
+      expect(created(path)).toContain('201');
+    }
+    expect(created('/admin/proxy-1024/orders/{id}/confirm')).toEqual(expect.arrayContaining(['200', '502', '503']));
+    const bindingParams = specs.api.paths['/admin/proxies/bindings/{address}']!.parameters as unknown as Array<{ name: string; schema: Schema }>;
+    expect(bindingParams.find((param) => param.name === 'address')?.schema.type).toBe('string');
+    expect(specs.api.paths['/proxies/mine']?.get?.['x-required-role']).toBeUndefined();
+    expect(JSON.stringify(specs.api.components.schemas.Proxy)).not.toContain('"password"');
   });
 
   it('describes structured errors with request ids and avoids publishing plaintext credentials', async () => {
