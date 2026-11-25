@@ -7,6 +7,7 @@ import type { AppContext } from '../../types.js';
 import { createUploadRoutes } from '../uploads.js';
 import v1Mailboxes from './mailboxes.js';
 import v1Messages from './messages.js';
+import v1Proxies from './proxies.js';
 import { buildOpenApiSpec } from './openapi.js';
 
 const app = new Hono<AppContext>();
@@ -38,6 +39,7 @@ app.get('/openapi.json', (c) => c.json(buildOpenApiSpec(new URL(c.req.url).origi
 
 app.route('/mailboxes', v1Mailboxes);
 app.route('/messages', v1Messages);
+app.route('/proxies', v1Proxies);
 app.route('/uploads', createUploadRoutes(apiKeyAuth, async (c, next) => {
   requireScope(c, 'mail.send');
   await next();

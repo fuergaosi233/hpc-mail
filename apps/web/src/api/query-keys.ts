@@ -62,7 +62,32 @@ export const queryKeys = {
     hostedDomains: ['admin', 'hosted-domains'] as const,
     hostedDomainList: (filters: { status?: string; q?: string }) => ['admin', 'hosted-domains', filters] as const,
     hostedDomainsHealth: ['admin', 'hosted-domains-health'] as const,
+
+    /** 代理池：库存、统计、绑定、按地址批量查询；写操作后按 proxiesRoot 前缀整体失效 */
+    proxiesRoot: ['admin', 'proxies'] as const,
+    proxies: (filters: Record<string, unknown>) => ['admin', 'proxies', 'list', filters] as const,
+    proxyStats: ['admin', 'proxies', 'stats'] as const,
+    proxyBindings: (filters: Record<string, unknown>) => ['admin', 'proxies', 'bindings', filters] as const,
+    proxyLookup: (addresses: readonly string[]) => ['admin', 'proxies', 'lookup', addresses] as const,
+
+    /** 1024proxy 采购 */
+    proxy1024Root: ['admin', 'proxy-1024'] as const,
+    proxy1024Status: ['admin', 'proxy-1024', 'status'] as const,
+    proxy1024Catalogue: ['admin', 'proxy-1024', 'catalogue'] as const,
+    proxy1024SubUsers: ['admin', 'proxy-1024', 'sub-users'] as const,
+    proxyOrdersRoot: ['admin', 'proxy-1024', 'orders'] as const,
+    proxyOrders: (filters: Record<string, unknown>) => ['admin', 'proxy-1024', 'orders', 'list', filters] as const,
+    proxyOrder: (id: number) => ['admin', 'proxy-1024', 'orders', 'detail', id] as const,
+
+    /** Spaceship 域名采购 */
+    domainPurchasesRoot: ['admin', 'domain-purchases'] as const,
+    domainPurchaseStatus: ['admin', 'domain-purchases', 'status'] as const,
+    domainBatches: (filters: Record<string, unknown>) => ['admin', 'domain-purchases', 'batches', filters] as const,
+    domainBatch: (id: number) => ['admin', 'domain-purchases', 'batch', id] as const,
   },
+
+  /** 我认领的地址绑定的代理（/api/proxies/mine）；不进 boot-prefetch */
+  myProxies: ['proxies', 'mine'] as const,
 } as const;
 
 /** Ownership changes affect visibility, counts and administration together. Drop old private mail first. */

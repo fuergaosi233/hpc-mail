@@ -55,6 +55,19 @@ const AdminHostedDomainsPage = page(
   preloadable(() => import('@/features/admin/hosted-domains/admin-hosted-domains-page')),
   (m) => m.AdminHostedDomainsPage,
 );
+const ProxiesPage = page(preloadable(() => import('@/features/admin/proxies/proxies-page')), (m) => m.ProxiesPage);
+const Proxy1024Page = page(
+  preloadable(() => import('@/features/admin/proxy-1024/proxy-1024-page')),
+  (m) => m.Proxy1024Page,
+);
+const DomainPurchasesPage = page(
+  preloadable(() => import('@/features/admin/domain-purchases/domain-purchases-page')),
+  (m) => m.DomainPurchasesPage,
+);
+const DomainBatchPage = page(
+  preloadable(() => import('@/features/admin/domain-purchases/domain-batch-page')),
+  (m) => m.DomainBatchPage,
+);
 const SettingsPage = page(preloadable(() => import('@/features/admin/settings/settings-page')), (m) => m.SettingsPage);
 const AuditPage = page(preloadable(() => import('@/features/admin/audit/audit-page')), (m) => m.AuditPage);
 const AddressesPage = page(
@@ -101,6 +114,10 @@ export const router = createBrowserRouter([
           { path: 'invites', element: <InvitesPage />, handle: title('邀请码') },
           { path: 'domains', element: <DomainsPage />, handle: title('收件域名') },
           { path: 'hosted-domains', element: <AdminHostedDomainsPage />, handle: title('托管域名') },
+          { path: 'proxies', element: <ProxiesPage />, handle: title('代理池') },
+          { path: 'proxy-1024', element: <Proxy1024Page />, handle: title('1024 购买') },
+          { path: 'domain-purchases', element: <DomainPurchasesPage />, handle: title('域名采购') },
+          { path: 'domain-purchases/:id', element: <DomainBatchPage />, handle: title('采购批次') },
           { path: 'addresses', element: <AddressesPage />, handle: title('全站地址') },
           { path: 'addresses/:mailboxId/mail', element: <AdminAddressMailPage />, handle: title('地址邮件') },
           { path: 'shared-mailboxes', element: <Navigate to="/admin/addresses" replace /> },

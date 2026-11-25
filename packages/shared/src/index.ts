@@ -11,3 +11,8 @@ export * from './schemas/notify-prefs.js';
 export * from './schemas/audit.js';
 export * from './schemas/hosted-domain.js';
 export * from './schemas/hosted-dns.js';
+export * from './money.js';
+export * from './secret-field.js';
+export * from './schemas/proxy.js';
+export * from './schemas/proxy-1024.js';
+export * from './schemas/domain-purchase.js';

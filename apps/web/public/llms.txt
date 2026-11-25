@@ -7,7 +7,7 @@
 ## 操作说明
 
 - [Agent 技能说明](/skill.md)：认证选择、能力地图和按任务使用的参考文档。
-- [API Key OpenAPI](/v1/openapi.json)：使用 hpcm_ 开头的 API Key，按 mail/mailbox scopes 操作邮箱。
+- [API Key OpenAPI](/v1/openapi.json)：使用 hpcm_ 开头的 API Key，按 mail/mailbox/proxy scopes 操作邮箱、读取邮箱绑定的代理。
 - [会话 OpenAPI](/api/openapi.json)：用户名密码及可选 2FA 登录后，使用 JWT；包含账户、通知和管理员 API。
 
 从用户提供的凭据和任务选择认证方式；API Key 与 JWT 不能互换。首次接入时先读取技能说明。

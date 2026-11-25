@@ -18,6 +18,8 @@ const SETTINGS = {
   translation: { enabled: true, dailyCharsPerUser: 200000 },
   claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 50, dailyLimit: 3 },
   hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 1000 },
+  proxy1024: { enabled: true, email: 'ops@example.com', password: '******', sessionToken: '******', lang: 'en', maxOrderCents: 0, maxDailyCents: 0, quoteTtlMinutes: 15 },
+  spaceship: { enabled: false, apiKey: '******', apiSecret: '', registrantContactId: '', years: 1, autoRenew: false, privacyLevel: 'high', allowPremium: false, maxDomainCents: 0, maxBatchCents: 0, maxDailyCents: 0, maxBatchDomains: 20, quoteTtlMinutes: 15, ingressWorkerName: '' },
 } as unknown as Settings;
 
 const mocks = vi.hoisted(() => ({
@@ -84,6 +86,9 @@ describe('SettingsPage 保留前缀', () => {
       ),
     );
     expect(mocks.update.mock.calls[0]![0]).not.toHaveProperty('domains');
+    // 采购凭据由各功能页保存，系统设置页不回写旧快照（避免覆盖 1024 登录刚写入的会话令牌）
+    expect(mocks.update.mock.calls[0]![0]).not.toHaveProperty('proxy1024');
+    expect(mocks.update.mock.calls[0]![0]).not.toHaveProperty('spaceship');
     client.clear();
   });
 

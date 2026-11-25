@@ -62,10 +62,11 @@ hpc '/auth/me'
 | `mail.send` | 发信及独立附件上传/取消上传 |
 | `mailbox.read` | 自有/共享邮箱列表、地址可用性 |
 | `mailbox.write` | 认领、邮箱显示名、释放及可选清除历史 |
+| `proxy.read` | 读取邮箱地址绑定的代理凭据（`/v1/proxies/lookup`、`/v1/proxies`）；普通 Key 只限所属用户认领的地址 |
 
 `GET /v1/status` 返回 `{status:"operational",userId,role,scopes}`；`GET /v1/domains` 返回 `{domains:[...]}`；均只需任一有效 Key，无独立 scope。普通用户看到公开域，管理员看到配置中的全部域；存量旧邮箱域需另从邮箱列表发现。
 
-要创建 Key，先用 JWT 登录且完成必要 2FA，再经 `/api/api-keys` 操作。只按任务授予最小 scopes，用户仅要查验证码时通常选 `mail.read`；若还要认领可加 `mailbox.read/mailbox.write`，无需自动加 `mail.send`。新建和长期保留 Key 应符合用户对自动化的授权。
+要创建 Key，先用 JWT 登录且完成必要 2FA，再经 `/api/api-keys` 操作。只按任务授予最小 scopes，用户仅要查验证码时通常选 `mail.read`；若还要认领可加 `mailbox.read/mailbox.write`，需要邮箱对应代理时加 `proxy.read`（返回明文代理密码），无需自动加 `mail.send`。新建和长期保留 Key 应符合用户对自动化的授权。
 
 ```bash
 # 当前 API="$BASE/api"、AUTH 为 JWT；完整 key 仅在创建成功时返回一次
@@ -85,7 +86,7 @@ KEY_RESPONSE=$(hpc '/api-keys' -X POST -H 'Content-Type: application/json' \
 | `DELETE /api-keys/:id` | 吊销，不能通过重新启用恢复；`{success:true}` |
 | `GET /api-keys/:id/logs?cursor=…&limit=30` | 自己 Key 的调用审计分页 |
 
-`name` 1–64 字符；`scopes` 非空且只接受上表五个；每用户最多 10 个未吊销 Key（禁用也占名额）。`rateLimit` 每分钟 1–600，创建默认 120。`allowedIps` 最多 32 个 IPv4/IPv6 或 CIDR；`[]` 不限制 IP。创建 `expiresAt` 为未来 ISO 8601 时间，不传即不过期；更新明确 `null` 改为不过期，未传保持。Key 调用审计含 `id,requestId,method,path,statusCode,ip,durationMs,createdAt`，无请求正文和凭证明文；保留约 90 天。
+`name` 1–64 字符；`scopes` 非空且只接受上表六个；每用户最多 10 个未吊销 Key（禁用也占名额）。`rateLimit` 每分钟 1–600，创建默认 120。`allowedIps` 最多 32 个 IPv4/IPv6 或 CIDR；`[]` 不限制 IP。创建 `expiresAt` 为未来 ISO 8601 时间，不传即不过期；更新明确 `null` 改为不过期，未传保持。Key 调用审计含 `id,requestId,method,path,statusCode,ip,durationMs,createdAt`，无请求正文和凭证明文；保留约 90 天。
 
 ## 错误与限流
 

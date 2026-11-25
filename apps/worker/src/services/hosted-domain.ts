@@ -3,6 +3,7 @@ import type {
   HostedDomainTransferResult, HostedDomainsHealth, Settings, TransferHostedDomainRequest,
 } from '@hpc-mail/shared';
 import { and, desc, eq, inArray, notInArray, or, sql, type SQL } from 'drizzle-orm';
+import { DOMAIN_ITEM_IN_FLIGHT } from '@hpc-mail/shared';
 import { createDb } from '../db/client.js';
 import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
@@ -208,9 +209,17 @@ function createZoneError(error: unknown): AppError {
   return new AppError('internal', `Cloudflare 创建域名失败：${error.message}`);
 }
 
+/**
+ * 系统采购流程占用的域名：进行中（含结果不明）、已加入系统域名，或注册成功后在后续步骤失败（域名已归站长所有）。
+ * 这些域名不能被用户托管，否则会抢先建 zone，让采购卡在「拒绝接管」或被托管流程误接管。
+ */
+const PURCHASE_HOLDS_DOMAIN_SQL = `EXISTS (SELECT 1 FROM domain_purchase_items WHERE domain = ?1
+  AND (status IN (${[...DOMAIN_ITEM_IN_FLIGHT, 'domain_added'].map((v) => `'${v}'`).join(', ')})
+    OR (status = 'failed' AND failed_step NOT IN ('register', 'poll'))))`;
+
 /** 占位守卫未通过：读回各项条件，给出具体原因 */
 async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: Settings['hosted_domains']): Promise<AppError> {
-  const [hosted, used, owned, pending, totalPending, user] = await env.db.batch([
+  const [hosted, used, owned, pending, totalPending, user, purchasing] = await env.db.batch([
     env.db.prepare('SELECT user_id FROM hosted_domains WHERE domain = ?').bind(domain),
     env.db.prepare(`SELECT (EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
       OR EXISTS (SELECT 1 FROM messages WHERE domain = ?1)) AS used`).bind(domain),
@@ -218,6 +227,7 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status = 'pending'").bind(viewer.id),
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE status = 'pending'"),
     env.db.prepare("SELECT 1 FROM users WHERE id = ? AND status = 'active'").bind(viewer.id),
+    env.db.prepare(`SELECT ${PURCHASE_HOLDS_DOMAIN_SQL} AS held`).bind(domain),
   ]);
   const first = <T>(result: D1Result | undefined) => result?.results?.[0] as T | undefined;
   const holder = first<{ user_id: number }>(hosted);
@@ -226,6 +236,9 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
   }
   if (Number(first<{ used: number }>(used)?.used)) {
     return new AppError('conflict', '本站已有该域名的历史地址或邮件，不能作为托管域名添加');
+  }
+  if (Number(first<{ held: number }>(purchasing)?.held)) {
+    return new AppError('conflict', '该域名正在由本站采购或已是本站采购的域名，不能作为托管域名添加');
   }
   if (!first(user)) return new AppError('user_disabled', '用户已被禁用');
   const isAdmin = viewer.role === 'admin';
@@ -257,6 +270,7 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
     WHERE NOT EXISTS (SELECT 1 FROM hosted_domains WHERE domain = ?1)
       AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
       AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?1)
+      AND NOT ${PURCHASE_HOLDS_DOMAIN_SQL}
       AND (?3 = 1 OR ?4 = 0 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status <> 'deleting') < ?4)
       AND (?3 = 1 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status = 'pending') < ?5)
       AND (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') < ?6

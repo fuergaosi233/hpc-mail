@@ -1,7 +1,9 @@
 import { z } from 'zod';
-import { DEFAULT_RESERVED_LOCAL_PARTS, REGISTRATION_MODES } from '../constants.js';
+import { DEFAULT_RESERVED_LOCAL_PARTS, MAX_SYSTEM_DOMAINS, REGISTRATION_MODES } from '../constants.js';
 import { emailAddressSchema } from './mail.js';
 import { domainSchema } from './mailbox.js';
+import { proxy1024SettingSchema } from './proxy-1024.js';
+import { spaceshipSettingSchema } from './domain-purchase.js';
 
 /** 掩码占位：设置回显时密文一律显示为该值；提交时值等于它则不更新 */
 export const SECRET_MASK = '******';
@@ -81,7 +83,7 @@ export type DomainEntry = z.infer<typeof domainEntrySchema>;
 
 /** 系统域名列表：管理端维护，空数组表示未配置任何域名（认领/发件将被拒） */
 export const domainsSettingSchema = z.object({
-  list: z.array(domainEntrySchema).max(64).refine((entries) => new Set(entries.map((e) => e.domain)).size === entries.length, '域名不能重复'),
+  list: z.array(domainEntrySchema).max(MAX_SYSTEM_DOMAINS).refine((entries) => new Set(entries.map((e) => e.domain)).size === entries.length, '域名不能重复'),
   revision: z.number().int().min(0).optional(),
 });
 
@@ -198,6 +200,10 @@ export const SETTING_SCHEMAS = {
   translation: translationSettingSchema,
   claim_random: claimRandomSettingSchema,
   hosted_domains: hostedDomainsSettingSchema,
+  /** 1024proxy 采购（password / sessionToken 为密文字段） */
+  proxy1024: proxy1024SettingSchema,
+  /** Spaceship 域名采购（apiKey / apiSecret 为密文字段） */
+  spaceship: spaceshipSettingSchema,
 } as const;
 export type SettingKey = keyof typeof SETTING_SCHEMAS;
 
@@ -224,7 +230,23 @@ export const DEFAULT_SETTINGS: Settings = {
   translation: { enabled: false, dailyCharsPerUser: 200_000 },
   claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 50, dailyLimit: 3 },
   hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 0 },
+  // 采购功能默认全关：未启用、无凭据、上限 0（0 = 禁止采购）
+  proxy1024: proxy1024SettingSchema.parse({}),
+  spaceship: spaceshipSettingSchema.parse({}),
 };
+
+/**
+ * 密文设置字段（`key.field`）：管理端回显 SECRET_MASK，提交 SECRET_MASK 保留原值，审计只记「已更新/已清除」。
+ * ai_model.apiKey 历史上明文存储；其余字段在库里用 secret box 加密。
+ */
+export const SECRET_SETTING_PATHS = [
+  'ai_model.apiKey',
+  'proxy1024.password',
+  'proxy1024.sessionToken',
+  'spaceship.apiKey',
+  'spaceship.apiSecret',
+] as const;
+export type SecretSettingPath = (typeof SECRET_SETTING_PATHS)[number];
 
 export const updateSettingsRequestSchema = z
   .object({
@@ -242,6 +264,8 @@ export const updateSettingsRequestSchema = z
     translation: translationSettingSchema.optional(),
     claim_random: claimRandomSettingSchema.optional(),
     hosted_domains: hostedDomainsSettingSchema.optional(),
+    proxy1024: proxy1024SettingSchema.optional(),
+    spaceship: spaceshipSettingSchema.optional(),
   })
   .refine((v) => Object.keys(SETTING_SCHEMAS).some((key) => v[key as SettingKey] !== undefined), {
     message: '至少提供一个待更新配置',

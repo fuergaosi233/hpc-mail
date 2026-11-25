@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AtSign, Inbox, MoreHorizontal, Pencil, Plus, Share2, Trash2 } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import type { Mailbox } from '@hpc-mail/shared';
+import type { Mailbox, MyProxyBinding } from '@hpc-mail/shared';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
@@ -31,6 +31,8 @@ import { useIsMobile } from '@/lib/use-media-query';
 import { ClaimDialog } from './claim-dialog';
 import { useMailboxesQuery, useSharedMailboxesQuery } from './use-mailboxes';
 import { OwnMailboxShareDialog } from './mailbox-share-dialog';
+import { MyProxyBadge } from './my-proxy-badge';
+import { useMyProxies } from './use-my-proxies';
 
 function EditMailboxDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onClose: () => void }) {
   const queryClient = useQueryClient();
@@ -166,8 +168,8 @@ function ReleaseDialog({
 
 export const inboxHref = (address: string) => `/inbox?address=${encodeURIComponent(address)}`;
 
-/** 地址：点击进入只看该地址的收件箱，旁边一键复制 */
-function AddressCell({ address }: { address: string }) {
+/** 地址：点击进入只看该地址的收件箱，旁边一键复制；绑定了代理时再显示「代理」徽标 */
+function AddressCell({ address, proxy }: { address: string; proxy?: MyProxyBinding }) {
   return (
     <span className="flex min-w-0 items-center gap-1.5">
       <Link
@@ -178,17 +180,20 @@ function AddressCell({ address }: { address: string }) {
         {address}
       </Link>
       <CopyButton value={address} ariaLabel={`复制 ${address}`} size="sm" className="h-7 shrink-0 border-transparent px-1.5" />
+      {proxy && <MyProxyBadge binding={proxy} />}
     </span>
   );
 }
 
 function MailboxCards({
   items,
+  proxies,
   onEdit,
   onRelease,
   onShare,
 }: {
   items: Mailbox[];
+  proxies: Map<string, MyProxyBinding>;
   onEdit: (mailbox: Mailbox) => void;
   onRelease: (mailbox: Mailbox) => void;
   onShare: (mailbox: Mailbox) => void;
@@ -199,7 +204,7 @@ function MailboxCards({
       {items.map((mailbox) => (
         <CardListItem
           key={mailbox.id}
-          title={<AddressCell address={mailbox.address} />}
+          title={<AddressCell address={mailbox.address} proxy={proxies.get(mailbox.address.toLowerCase())} />}
           subtitle={mailbox.displayName || undefined}
           meta={
             <>
@@ -248,6 +253,7 @@ export function MailboxesPage() {
   const { data: visibleDomains } = domainsQuery;
   const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(false);
   const shared = useSharedMailboxesQuery();
+  const { byAddress: proxies } = useMyProxies();
   const [searchParams, setSearchParams] = useSearchParams();
   const [claimOpen, setClaimOpen] = useState(false);
   /** 认领弹窗预选的域名：/mailboxes?claim=1&domain=… 带入 */
@@ -313,7 +319,7 @@ export function MailboxesPage() {
           className="rounded-lg border border-line bg-surface"
         />
       ) : isMobile ? (
-        <MailboxCards items={items} onEdit={setEditing} onRelease={setReleasing} onShare={setSharing} />
+        <MailboxCards items={items} proxies={proxies} onEdit={setEditing} onRelease={setReleasing} onShare={setSharing} />
       ) : (
         <Table>
           <TableHeader>
@@ -329,7 +335,7 @@ export function MailboxesPage() {
             {items.map((mailbox) => (
               <TableRow key={mailbox.id}>
                 <TableCell>
-                  <AddressCell address={mailbox.address} />
+                  <AddressCell address={mailbox.address} proxy={proxies.get(mailbox.address.toLowerCase())} />
                 </TableCell>
                 <TableCell className="text-ink-secondary">{mailbox.displayName || '—'}</TableCell>
                 <TableCell className="text-ink-secondary">{mailbox.messageCount}</TableCell>

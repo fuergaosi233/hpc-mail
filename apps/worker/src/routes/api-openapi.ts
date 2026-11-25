@@ -4,6 +4,7 @@ import {
   page, pageQuery, query, ref, scopeQuery, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
 } from './openapi-common.js';
 import { MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-dns.js';
+import { sessionProcurementPaths } from './openapi-procurement.js';
 
 /** Complete JWT-session contract; API keys are never accepted for these operations. */
 export function buildSessionOpenApiSpec(origin: string) {
@@ -213,6 +214,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     },
     '/admin/api-keys/{id}/logs': { get: operation('Read any API key audit logs', page(ref('ApiRequestLog')), { ...admin, parameters: pageQuery }) },
     '/admin/audit-logs': { get: operation('Read administrator audit logs', page(ref('AdminAuditLog')), { ...admin, parameters: pageQuery }) },
+    ...sessionProcurementPaths(),
   };
   return { openapi: '3.1.0', info: specInfo('HPC Mail Session and Administration API',
     'JWT session API for all web-client functions. Authorization: Bearer <JWT> from login/register. hpcm_ API keys cannot authenticate these routes; see the related /v1 specification. Administrator endpoints require an active admin role. If site policy requires 2FA, un-enrolled sessions receive 403 totp_setup_required; /auth/me, logout and /auth/2fa routes remain available to complete setup.'),

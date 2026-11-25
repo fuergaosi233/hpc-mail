@@ -41,6 +41,35 @@ The ordinary account `friend01` owns `astor.wu@freetrips.net` and `friend@anytok
 
 External sending and forwarding from the Node runtime require `SMTP_RELAY_URL`. Site-internal delivery works without an external relay. No paid plan has been enabled.
 
+## Proxy pool, 1024proxy and Spaceship purchasing (optional)
+
+The proxy pool and mailbox ↔ proxy bindings work with no extra configuration. 1024proxy and Spaceship purchasing are off until an administrator enables them in the app (`proxy1024` / `spaceship` settings, caps above 0; a cap of 0 forbids purchasing). Vendor credentials are entered in the admin UI and stored encrypted in the database, not in Kubernetes. Nothing here has been deployed; the current Secret is unchanged.
+
+Environment read by `server/main.ts` (all optional; put secrets in the `hpc-mail` Secret, which is loaded with `envFrom`):
+
+| Variable | Kind | Purpose |
+|---|---|---|
+| `CF_API_TOKEN` | Secret | Cloudflare API token used to create zones and configure Email Routing for purchased domains. Also makes user-hosted domains possible; those stay off unless `hosted_domains.enabled` is set. |
+| `CF_ACCOUNT_ID` | Secret | Cloudflare account that owns the new zones. Both CF values are required; with either missing, purchased domains stop after registration until they are added. |
+| `CF_EMAIL_WORKER_NAME` | Plain value (set in `k3s.yaml`) | Email Worker that catch-all rules target: `hpc-mail-ingress-20261028`. The `spaceship.ingressWorkerName` setting overrides it. Without either, domain purchasing refuses to confirm (`not_configured`); the main Worker name `hpc-cloud-mail` is never used on this runtime. |
+| `SECRET_BOX_KEY` | Secret | 32 random bytes, base64 (`openssl rand -base64 32`). Encrypts proxy passwords and vendor credentials (`kid k1`). Without it a key derived from `JWT_SECRET` is used (`kid j1`). Adding it later keeps old values readable; removing it or rotating `JWT_SECRET` makes the stored values undecryptable. |
+
+Cloudflare API token permissions (scoped to the account above, all zones of that account):
+
+- Zone → Zone: Edit (create zones; `PUT /zones/:id/activation_check`)
+- Zone → Zone: Read (list zones by name, zone status and the account zone count)
+- Zone → DNS: Edit (Email Routing writes the MX/SPF/DKIM records when enabled)
+- Zone → Zone Settings: Edit (same as the existing hosted-domain token guidance in the root README; enabling Email Routing changes zone settings)
+- Zone → Email Routing Rules: Edit (enable Email Routing and the catch-all rule pointing at the ingress Worker)
+- Account → Email Routing Addresses: Edit (account-level Email Routing; listed for parity with the hosted-domain setup)
+
+These calls were exercised only against a mocked Cloudflare API in this change, not with a real token. Check the token with `GET /api/admin/hosted-domains/health` (token validity and zone counts) before enabling purchases; it does not prove every permission above.
+The token does not need Workers, Tunnel or billing permissions. Rotating it only requires updating the Secret and restarting the pod.
+
+Outbound HTTPS from the pod must reach `api.cloudflare.com`, `spaceship.dev`, `api.1024proxy.com` and the public `1024proxy.com` pricing pages. The namespace NetworkPolicy restricts ingress only.
+
+Scheduled work runs in the existing 5-minute loop (`proxy.expire`, `proxy_1024.reconcile`, `domain_purchase.advance`). Every external side effect is claimed in the database first, so overlapping replicas cannot register a domain or place an order twice; a lost vendor response is recorded as `unknown` and is never retried automatically.
+
 ## Validation and operation
 
 ```sh

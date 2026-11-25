@@ -16,6 +16,7 @@ const boxes = Array.from({ length: TOTAL }, (_, i) => ({
   messageCount: i,
   createdAt: '2026-10-06T00:00:00Z',
 }));
+vi.mock('./use-address-proxies', () => ({ useAddressProxies: () => ({ byAddress: new Map(), isError: false }) }));
 vi.mock('@/api/resources', () => ({
   adminApi: { searchUsers: vi.fn(), transferMailbox: vi.fn(), listMailboxShares: mocks.listShares, listUsers: vi.fn(async () => []) },
   mailboxApi: { release: vi.fn() },

@@ -1,12 +1,14 @@
 import {
   DEFAULT_SETTINGS,
   SECRET_MASK,
+  SECRET_SETTING_PATHS,
   SETTING_SCHEMAS,
   type SettingKey,
   type Settings,
   type UpdateSettingsRequest,
 } from '@hpc-mail/shared';
 import { AppError } from '../lib/errors.js';
+import { isSealed, openSecret, sealSecret } from '../lib/secret-box.js';
 import { createDb } from '../db/client.js';
 import { isAiModelConfigured } from './ai-provider.js';
 import { settings as settingsTable } from '../db/schema.js';
@@ -116,6 +118,8 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
 
   const next: Partial<Pick<Settings, 'ai_model' | 'translation'>> = {};
   let domains: { value: string; expected: number } | undefined;
+  /** 1024 会话 token 被换掉或清空：清掉 integration_status 的 invalid 标记，cron 才会重新探测新 token */
+  let proxy1024TokenChanged = false;
   for (const key of Object.keys(SETTING_SCHEMAS) as SettingKey[]) {
     const incoming = patch[key];
     if (incoming === undefined) continue;
@@ -126,6 +130,21 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
       // 提交 SECRET_MASK 表示保留已存 apiKey
       next.ai_model = { ...value, apiKey: value.apiKey === SECRET_MASK ? (await loadCurrent()).ai_model.apiKey : value.apiKey };
       writes.push({ key, value: JSON.stringify(next.ai_model) });
+    } else if (key === 'proxy1024' || key === 'spaceship') {
+      const value = { ...(parsed.data as Record<string, unknown>) };
+      for (const field of VENDOR_SECRET_FIELDS[key]) {
+        const incomingSecret = value[field] as string;
+        if (incomingSecret === SECRET_MASK) {
+          // 保留库里的原密文（不解密、不重新加密）
+          value[field] = ((await loadCurrent())[key] as Record<string, unknown>)[field];
+        } else if (isSealed(incomingSecret)) {
+          throw new AppError('validation_failed', '凭据不能以 enc:v1: 开头');
+        } else {
+          value[field] = await sealSecret(env, incomingSecret);
+          if (key === 'proxy1024' && field === 'sessionToken') proxy1024TokenChanged = true;
+        }
+      }
+      writes.push({ key, value: JSON.stringify(value) });
     } else if (key === 'translation') {
       next.translation = parsed.data as Settings['translation'];
       writes.push({ key, value: JSON.stringify(next.translation) });
@@ -163,11 +182,76 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
     await db.insert(settingsTable).values(w)
       .onConflictDoUpdate({ target: settingsTable.key, set: { value: w.value } });
   }
+  if (proxy1024TokenChanged) {
+    await env.db.prepare("UPDATE integration_status SET state = 'unknown', detail = '' WHERE provider = 'proxy1024' AND state = 'invalid'").run();
+  }
   await invalidateSettingsCache(env, ctx);
 }
 
-/** 管理端回显：AI 模型 apiKey 已配置时显示 SECRET_MASK（飞书/webhook 密钥已下放个人偏好） */
+/** 管理端回显：密文字段（SECRET_SETTING_PATHS）已配置时显示 SECRET_MASK，未配置为 ''（飞书/webhook 密钥已下放个人偏好） */
 export function maskSettings(settings: Settings): Settings {
-  const { ai_model: aiModel } = settings;
-  return { ...settings, ai_model: { ...aiModel, apiKey: aiModel.apiKey ? SECRET_MASK : '' } };
+  const masked = { ...settings } as Record<string, unknown>;
+  for (const path of SECRET_SETTING_PATHS) {
+    const [key, field] = path.split('.') as [SettingKey, string];
+    const group = { ...(masked[key] as Record<string, unknown>) };
+    group[field] = group[field] ? SECRET_MASK : '';
+    masked[key] = group;
+  }
+  return masked as Settings;
+}
+
+/** 采购设置里的密文字段（与 SECRET_SETTING_PATHS 一致） */
+const VENDOR_SECRET_FIELDS = {
+  proxy1024: ['password', 'sessionToken'],
+  spaceship: ['apiKey', 'apiSecret'],
+} as const satisfies Record<'proxy1024' | 'spaceship', readonly string[]>;
+
+type Proxy1024Secrets = { settings: Settings['proxy1024']; password: string; sessionToken: string };
+type SpaceshipSecrets = { settings: Settings['spaceship']; apiKey: string; apiSecret: string };
+
+/**
+ * 直读 D1 设置并解密一个供应商的密文字段。返回的 settings 里密文字段保持密文，
+ * 明文只在返回值的独立字段里，调用方不要把它们写进日志、审计或响应。
+ */
+export async function readVendorSecrets(env: Env, key: 'proxy1024'): Promise<Proxy1024Secrets>;
+export async function readVendorSecrets(env: Env, key: 'spaceship'): Promise<SpaceshipSecrets>;
+export async function readVendorSecrets(env: Env, key: 'proxy1024' | 'spaceship'): Promise<Proxy1024Secrets | SpaceshipSecrets> {
+  const fresh = await getSettingsFresh(env);
+  if (key === 'proxy1024') {
+    const settings = fresh.proxy1024;
+    const [password, sessionToken] = await Promise.all([openSecret(env, settings.password), openSecret(env, settings.sessionToken)]);
+    return { settings, password, sessionToken };
+  }
+  const settings = fresh.spaceship;
+  const [apiKey, apiSecret] = await Promise.all([openSecret(env, settings.apiKey), openSecret(env, settings.apiSecret)]);
+  return { settings, apiKey, apiSecret };
+}
+
+/**
+ * 只改一个密文字段（加密后写入），不动同组其他字段：按原 JSON 文本做 CAS，与管理员同时保存设置冲突时重读重试。
+ * 1024 登录成功后用它保存新的会话 token。
+ */
+export async function writeVendorSecret(env: Env, key: 'proxy1024', field: 'sessionToken', plaintext: string): Promise<void> {
+  const sealed = await sealSecret(env, plaintext);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const row = await env.db.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first<{ value: string }>();
+    let current = DEFAULT_SETTINGS[key];
+    if (row) {
+      try {
+        const parsed = SETTING_SCHEMAS[key].safeParse(JSON.parse(row.value));
+        if (parsed.success) current = parsed.data;
+      } catch {
+        // 非法存储值按默认处理（与 mergeSettingRows 一致）
+      }
+    }
+    const value = JSON.stringify({ ...current, [field]: sealed });
+    const written = row
+      ? await env.db.prepare('UPDATE settings SET value = ? WHERE key = ? AND value = ? RETURNING key').bind(value, key, row.value).first()
+      : await env.db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING RETURNING key').bind(key, value).first();
+    if (written) {
+      await invalidateSettingsCache(env);
+      return;
+    }
+  }
+  throw new AppError('conflict', '设置正在被其他请求修改，请稍后重试');
 }

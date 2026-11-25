@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { measureElement as measureSize, useWindowVirtualizer } from '@tanstack/react-virtual';
-import { ArrowRightLeft, AtSign, Mail, MoreHorizontal, Search, Share2, Trash2 } from 'lucide-react';
+import { ArrowRightLeft, AtSign, Mail, MoreHorizontal, Search, Share2, Trash2, Waypoints } from 'lucide-react';
 import {
   memo,
   type RefObject,
@@ -13,7 +13,7 @@ import {
   useState,
 } from 'react';
 import { Link, type NavigateFunction, useNavigate } from 'react-router-dom';
-import type { Mailbox } from '@hpc-mail/shared';
+import type { Mailbox, ProxyBindingView } from '@hpc-mail/shared';
 import { invalidateMailboxOwnership } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
@@ -36,7 +36,10 @@ import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
 import { useIsMobile } from '@/lib/use-media-query';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
+import { BindProxyDialog } from '@/features/admin/proxies/bind-proxy-dialog';
+import { proxyEndpoint, proxyTitle } from '@/features/admin/proxies/proxy-meta';
 import { TransferMailboxDialog } from './transfer-mailbox-dialog';
+import { useAddressProxies } from './use-address-proxies';
 import { AddressShareDialog } from './address-share-dialog';
 
 function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onClose: () => void }) {
@@ -115,15 +118,35 @@ function AddressLink({ mailbox }: { mailbox: Mailbox }) {
 
 interface RowActions {
   onTransfer: (mailbox: Mailbox) => void;
+  onBindProxy: (mailbox: Mailbox) => void;
   onShare: (mailbox: Mailbox) => void;
   onRelease: (mailbox: Mailbox) => void;
   /** 共享弹窗关闭后把焦点还给触发它的按钮 */
   shareTrigger: RefObject<HTMLButtonElement | null>;
 }
 
+/** 地址 → 绑定的代理（null = 未绑定；不在 Map 里 = 尚未查到） */
+type ProxyMap = Map<string, ProxyBindingView | null>;
+
 interface AddressListProps {
   mailboxes: Mailbox[];
+  proxies: ProxyMap;
   actions: RowActions;
+}
+
+/** 「代理」列：只显示端点与状态，不含凭据 */
+function ProxyCell({ binding }: { binding: ProxyBindingView | null | undefined }) {
+  if (binding === undefined) return <span className="text-ink-tertiary">…</span>;
+  if (binding === null) return <span className="text-ink-tertiary">—</span>;
+  const inactive = binding.proxy.status !== 'active';
+  return (
+    <span
+      className={inactive ? 'truncate text-critical' : 'truncate text-ink-secondary'}
+      title={`#${binding.proxy.id} ${proxyTitle(binding.proxy)} · ${proxyEndpoint(binding.proxy)}${inactive ? `（${binding.proxy.status}）` : ''}`}
+    >
+      #{binding.proxy.id} {binding.proxy.country || binding.proxy.host}
+    </span>
+  );
 }
 
 /**
@@ -175,13 +198,14 @@ function useWindowRows<T extends HTMLElement>(mailboxes: Mailbox[], estimateSize
 
 interface RowProps {
   mailbox: Mailbox;
+  proxy: ProxyBindingView | null | undefined;
   index: number;
   measureElement: (node: Element | null) => void;
   navigate: NavigateFunction;
   actions: RowActions;
 }
 
-const AddressTableRow = memo(function AddressTableRow({ mailbox, index, measureElement, navigate, actions }: RowProps) {
+const AddressTableRow = memo(function AddressTableRow({ mailbox, proxy, index, measureElement, navigate, actions }: RowProps) {
   return (
     <TableRow ref={measureElement} data-index={index} aria-rowindex={index + 2}>
       <TableCell className="truncate font-medium">
@@ -191,11 +215,17 @@ const AddressTableRow = memo(function AddressTableRow({ mailbox, index, measureE
         {mailbox.ownerUsername || '—'}
       </TableCell>
       <TableCell className="text-ink-secondary">{mailbox.messageCount}</TableCell>
+      <TableCell className="truncate">
+        <ProxyCell binding={proxy} />
+      </TableCell>
       <TableCell className="text-ink-tertiary">{formatDateTime(mailbox.createdAt)}</TableCell>
       <TableCell>
         <div className="flex justify-end gap-1">
           <IconButton size="sm" aria-label={`查看邮件 ${mailbox.address}`} onClick={() => navigate(mailPath(mailbox))}>
             <Mail className="size-4" />
+          </IconButton>
+          <IconButton size="sm" aria-label={`绑定代理 ${mailbox.address}`} title="绑定代理" onClick={() => actions.onBindProxy(mailbox)}>
+            <Waypoints className="size-4" />
           </IconButton>
           <IconButton size="sm" aria-label={`过户 ${mailbox.address}`} onClick={() => actions.onTransfer(mailbox)}>
             <ArrowRightLeft className="size-4" />
@@ -224,12 +254,12 @@ const AddressTableRow = memo(function AddressTableRow({ mailbox, index, measureE
 function SpacerRow({ height }: { height: number }) {
   return (
     <tr aria-hidden="true">
-      <td colSpan={5} className="p-0" style={{ height }} />
+      <td colSpan={6} className="p-0" style={{ height }} />
     </tr>
   );
 }
 
-const AddressTable = memo(function AddressTable({ mailboxes, actions }: AddressListProps) {
+const AddressTable = memo(function AddressTable({ mailboxes, proxies, actions }: AddressListProps) {
   const navigate = useNavigate();
   const { listRef, rows, measureElement, before, after } = useWindowRows<HTMLTableSectionElement>(mailboxes, 57);
   return (
@@ -237,16 +267,18 @@ const AddressTable = memo(function AddressTable({ mailboxes, actions }: AddressL
     <Table className="table-fixed" aria-rowcount={mailboxes.length + 1}>
       <colgroup>
         <col />
-        <col className="w-[15%]" />
-        <col className="w-[10%]" />
-        <col className="w-[20%]" />
-        <col className="w-44" />
+        <col className="w-[13%]" />
+        <col className="w-[8%]" />
+        <col className="w-[14%]" />
+        <col className="w-[17%]" />
+        <col className="w-52" />
       </colgroup>
       <TableHeader>
         <TableRow aria-rowindex={1}>
           <TableHead>地址</TableHead>
           <TableHead>归属用户</TableHead>
           <TableHead>邮件数</TableHead>
+          <TableHead>代理</TableHead>
           <TableHead>认领时间</TableHead>
           <TableHead className="text-right">操作</TableHead>
         </TableRow>
@@ -260,6 +292,7 @@ const AddressTable = memo(function AddressTable({ mailboxes, actions }: AddressL
             <AddressTableRow
               key={mailbox.id}
               mailbox={mailbox}
+              proxy={proxies.get(mailbox.address.toLowerCase())}
               index={row.index}
               measureElement={measureElement}
               navigate={navigate}
@@ -275,6 +308,7 @@ const AddressTable = memo(function AddressTable({ mailboxes, actions }: AddressL
 
 const AddressCard = memo(function AddressCard({
   mailbox,
+  proxy,
   index,
   total,
   measureElement,
@@ -293,6 +327,7 @@ const AddressCard = memo(function AddressCard({
         <>
           <span>{mailbox.messageCount} 封邮件</span>
           <span>{formatDateTime(mailbox.createdAt)} 认领</span>
+          {proxy && <span>代理 #{proxy.proxy.id}</span>}
         </>
       }
       actions={
@@ -307,6 +342,10 @@ const AddressCard = memo(function AddressCard({
             <DropdownMenuItem onSelect={() => navigate(mailPath(mailbox))}>
               <Mail className="size-4 text-ink-tertiary" />
               查看邮件
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => actions.onBindProxy(mailbox)}>
+              <Waypoints className="size-4 text-ink-tertiary" />
+              {proxy ? '更换代理' : '绑定代理'}
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => actions.onTransfer(mailbox)}>
               <ArrowRightLeft className="size-4 text-ink-tertiary" />
@@ -327,7 +366,7 @@ const AddressCard = memo(function AddressCard({
   );
 });
 
-const AddressCards = memo(function AddressCards({ mailboxes, actions }: AddressListProps) {
+const AddressCards = memo(function AddressCards({ mailboxes, proxies, actions }: AddressListProps) {
   const navigate = useNavigate();
   const { listRef, rows, measureElement, before, after } = useWindowRows<HTMLUListElement>(mailboxes, 90);
   return (
@@ -340,6 +379,7 @@ const AddressCards = memo(function AddressCards({ mailboxes, actions }: AddressL
           <AddressCard
             key={mailbox.id}
             mailbox={mailbox}
+            proxy={proxies.get(mailbox.address.toLowerCase())}
             index={row.index}
             total={mailboxes.length}
             measureElement={measureElement}
@@ -362,6 +402,7 @@ export function AddressesPage() {
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
   const [transferring, setTransferring] = useState<Mailbox | null>(null);
   const [sharing, setSharing] = useState<Mailbox | null>(null);
+  const [bindingProxy, setBindingProxy] = useState<Mailbox | null>(null);
   const shareTrigger = useRef<HTMLButtonElement | null>(null);
 
   const closeSharing = useCallback(() => {
@@ -371,9 +412,13 @@ export function AddressesPage() {
 
   // 引用保持稳定：输入搜索词、打开弹窗时列表与各行不必重渲染
   const actions = useMemo<RowActions>(
-    () => ({ onTransfer: setTransferring, onShare: setSharing, onRelease: setReleasing, shareTrigger }),
+    () => ({ onTransfer: setTransferring, onBindProxy: setBindingProxy, onShare: setSharing, onRelease: setReleasing, shareTrigger }),
     [],
   );
+
+  // 代理列：对全部已加载地址按 500 个一批查询（与搜索无关，输入关键词不会重新请求）
+  const allAddresses = useMemo(() => (mailboxes ?? []).map((m) => m.address), [mailboxes]);
+  const { byAddress: proxies } = useAddressProxies(allAddresses);
 
   const filtered = useMemo(() => {
     const term = deferredQ.trim().toLowerCase();
@@ -386,7 +431,7 @@ export function AddressesPage() {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <PageHeader title="全站地址" description="查看所有已认领地址及其收发件，管理共享、过户或强制释放。" />
+      <PageHeader title="全站地址" description="查看所有已认领地址及其收发件，管理共享、过户、代理绑定或强制释放。" />
       <div className="relative mb-4">
         <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-ink-tertiary" />
         <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索地址或用户名" className="pl-9" />
@@ -403,13 +448,19 @@ export function AddressesPage() {
           className="rounded-lg border border-line bg-surface"
         />
       ) : isMobile ? (
-        <AddressCards mailboxes={filtered} actions={actions} />
+        <AddressCards mailboxes={filtered} proxies={proxies} actions={actions} />
       ) : (
-        <AddressTable mailboxes={filtered} actions={actions} />
+        <AddressTable mailboxes={filtered} proxies={proxies} actions={actions} />
       )}
 
       <ForceReleaseDialog mailbox={releasing} onClose={() => setReleasing(null)} />
       <TransferMailboxDialog mailbox={transferring} onClose={() => setTransferring(null)} />
+      <BindProxyDialog
+        open={bindingProxy !== null}
+        address={bindingProxy?.address}
+        currentProxyId={bindingProxy ? (proxies.get(bindingProxy.address.toLowerCase())?.proxyId ?? null) : null}
+        onClose={() => setBindingProxy(null)}
+      />
       {sharing && <AddressShareDialog key={sharing.id} mailbox={sharing} onClose={closeSharing} />}
     </div>
   );

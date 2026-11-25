@@ -1,6 +1,6 @@
 # 邮箱、共享与多域名
 
-shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD 在 JWT `/api` 与 Key `/v1` 均可用；共享管理与用户托管域名只用 JWT `/api`；强制过户、全站共享和系统域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
+shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD 在 JWT `/api` 与 Key `/v1` 均可用；邮箱绑定的代理用 Key `/v1/proxies…`（`proxy.read`）或 JWT `/api/proxies/mine` 读取；共享管理与用户托管域名只用 JWT `/api`；强制过户、全站共享和系统域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
 
 ## 发现域名与邮箱
 
@@ -77,6 +77,25 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 共享管理视图还包含 `ownerUserId,ownerUsername`。保存时建议带 `expectedOwnerId=ownerUserId`，所有者已变化返回 409；写入时再次校验归属，防止并发过户覆盖新共享。
 
 更新前读回完整名单，保留仍需授权的人，避免把新增一个人当整体替换。已禁用的成员不能重新出现在 PUT 名单中，应移除失效成员；DELETE 单人撤销可处理失效成员。共享 owner 被禁用时共享立即不可见；角色升降级保留共享；释放邮箱/过户/删除用户时相关共享撤销，重新认领不会恢复旧名单。
+
+## 邮箱代理
+
+每个完整邮箱地址最多绑定一个代理（管理员在「代理池」维护，可来自任意供应商）。绑定属于地址而不是账户：释放、过户不会删除绑定，但非管理员能否看到始终按**当前**认领关系判断，释放后原所有者立即看不到。共享给自己的邮箱不提供代理凭据。
+
+| 路径 | 鉴权 | 返回 |
+|---|---|---|
+| `GET /v1/proxies/lookup?address=…` | `proxy.read` | `{address,proxy}`；未绑定时 `proxy:null`。普通 Key 只能查所属用户认领的地址，其他地址一律 404（不暴露是否存在）；管理员 Key 可查任意地址（含未认领） |
+| `GET /v1/proxies?cursor=&limit=&domain=` | `proxy.read` | `{items:[{address,proxy}],nextCursor}`，按地址排序；默认只列所属用户认领地址的绑定，`all=1` 仅管理员 Key（全站），普通 Key 返回 403 |
+| `GET /api/proxies/mine` | 用户 JWT | `{items:[{address,proxy}]}`，自己认领地址的绑定，最多 500 条 |
+
+`proxy` 字段：`proxyId,protocol(http\|https\|socks5),host,port,username,password,url,country,city,product,status(active\|disabled\|expired),expiresAt`。`url` 为 `protocol://user:pass@host:port`（用户名密码已百分号编码，IPv6 加方括号），可直接作为 HTTP/SOCKS 客户端的代理地址；使用前检查 `status` 为 `active`、`expiresAt` 未过。响应含**明文代理密码**：保存在受保护的运行状态里，不写入公开日志或报告。
+
+```bash
+# 需要 proxy.read 的 Key；HPC_ADDRESS 为已认领的完整地址
+hpc '/proxies/lookup' --get --data-urlencode "address=$HPC_ADDRESS" | jq -r '.data.proxy.url // empty'
+```
+
+查不到（`proxy:null`）表示该地址尚未绑定，需管理员在代理池绑定或自动分配，Key 无法自行绑定。管理员的绑定、批量查询、导出和自动分配接口见[管理员参考](administration.md#代理池与采购)。
 
 ## 域名新增、关闭公开和删除
 

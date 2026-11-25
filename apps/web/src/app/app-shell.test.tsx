@@ -110,6 +110,10 @@ describe('AppShell', () => {
     const second = renderShell('/inbox', { ...user, role: 'admin' });
     expect(await screen.findByRole('link', { name: '我的域名' })).toHaveAttribute('href', '/domains');
     expect(screen.getByRole('link', { name: '托管域名' })).toHaveAttribute('href', '/admin/hosted-domains');
+    // 代理池与两个采购页紧跟在「托管域名」之后
+    expect(screen.getByRole('link', { name: '代理池' })).toHaveAttribute('href', '/admin/proxies');
+    expect(screen.getByRole('link', { name: '1024 购买' })).toHaveAttribute('href', '/admin/proxy-1024');
+    expect(screen.getByRole('link', { name: '域名采购' })).toHaveAttribute('href', '/admin/domain-purchases');
     second.client.clear();
   });
 

@@ -1,4 +1,4 @@
-import { SETTING_SCHEMAS, type AdminAuditLogEntry, type Page, type SettingKey, type Settings } from '@hpc-mail/shared';
+import { SECRET_SETTING_PATHS, SETTING_SCHEMAS, type AdminAuditLogEntry, type Page, type SettingKey, type Settings } from '@hpc-mail/shared';
 import { desc, lt } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { adminAuditLogs } from '../db/schema.js';
@@ -63,7 +63,7 @@ function describeDomains(before: Settings['domains'], after: Settings['domains']
 }
 
 /** 密文字段只记录是否变化，绝不写入值 */
-const SECRET_SETTING_FIELDS = new Set(['ai_model.apiKey']);
+const SECRET_SETTING_FIELDS = new Set<string>(SECRET_SETTING_PATHS);
 
 function describeValue(key: string, before: unknown, after: unknown): string[] {
   if (SECRET_SETTING_FIELDS.has(key)) return before === after ? [] : [`${key} ${after ? '已更新' : '已清除'}`];

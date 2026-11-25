@@ -16,6 +16,9 @@ export interface Page<T> {
   nextCursor: string | null;
 }
 
+/** 游标分页的别名（代理池 / 采购接口沿用 Page 形状） */
+export type CursorPage<T> = Page<T>;
+
 export const ERROR_CODES = [
   'validation_failed',
   'unauthorized',
@@ -33,6 +36,10 @@ export const ERROR_CODES = [
   'address_taken',
   'payload_too_large',
   'internal',
+  /** 功能未启用，或凭据/上限未配置：503 */
+  'not_configured',
+  /** 供应商返回了明确错误：502（message 带供应商原因，绝不含凭据） */
+  'upstream_failed',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 
@@ -53,4 +60,6 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   address_taken: 409,
   payload_too_large: 413,
   internal: 500,
+  not_configured: 503,
+  upstream_failed: 502,
 };

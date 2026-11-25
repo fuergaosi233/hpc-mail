@@ -11,6 +11,7 @@ window.scrollTo = vi.fn() as typeof window.scrollTo;
 const mocks = vi.hoisted(() => ({ transfer: vi.fn(), search: vi.fn(), toast: vi.fn() }));
 const box = { id: 42, address: 'existing@example.com', domain: 'example.com', userId: 10, ownerUsername: 'old-owner',
   displayName: '', messageCount: 12, createdAt: '2026-10-06T00:00:00Z' };
+vi.mock('./use-address-proxies', () => ({ useAddressProxies: () => ({ byAddress: new Map(), isError: false }) }));
 vi.mock('@/api/resources', () => ({ adminApi: { searchUsers: mocks.search, transferMailbox: mocks.transfer }, mailboxApi: { release: vi.fn() } }));
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
 vi.mock('@/features/mailboxes/use-mailboxes', () => ({ useMailboxesQuery: () => ({ data: [box], isLoading: false, isError: false }) }));

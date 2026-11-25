@@ -16,6 +16,9 @@ import { getSettings } from './setting.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
 import { syncDueHostedDomains } from './hosted-domain.js';
+import { DOMAIN_PURCHASE_RATE_SCOPES, SPACESHIP_POLL_SCOPE, runDomainPurchaseCron } from './domain-purchase.js';
+import { PROXY_RATE_SCOPES, expireProxies } from './proxy-inventory.js';
+import { runProxy1024Cron } from './proxy-purchase.js';
 import { HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE } from './hosted-dns.js';
 import { processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases } from './storage-cleanup.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
@@ -164,6 +167,10 @@ export async function runScheduled(env: Env, maintenance = true): Promise<void> 
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
+  // 代理池 / 1024 采购 / Spaceship 域名采购：未启用或未配置时只读一次设置（1024 另有两条本地状态修正）就返回
+  await step(report, 'proxy.expire', () => expireProxies(env));
+  await step(report, 'proxy_1024.reconcile', () => runProxy1024Cron(env));
+  await step(report, 'domain_purchase.advance', () => runDomainPurchaseCron(env));
   if (maintenance) await runMaintenance(env, report);
   console.log(JSON.stringify({ event: 'scheduled', maintenance, ms: Date.now() - started, steps: report }));
 }
@@ -224,6 +231,8 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     await purgeCounters(env, 'ai-extract', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, TRANSLATE_CHARS_SCOPE, dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, TRANSLATE_REQUESTS_SCOPE, minuteWindow(1) - 120);
+    for (const scope of [...PROXY_RATE_SCOPES, ...DOMAIN_PURCHASE_RATE_SCOPES]) await purgeCounters(env, scope, minuteWindow(1) - 120);
+    await purgeCounters(env, SPACESHIP_POLL_SCOPE, minuteWindow(5) - 24);
     await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });

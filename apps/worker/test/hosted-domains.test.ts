@@ -239,6 +239,31 @@ describe('添加托管域名', () => {
     expect(cf.calls.filter((entry) => entry === 'POST /zones')).toHaveLength(1);
   });
 
+  it('系统采购中 / 已采购的域名（含注册后在后续步骤失败的）不能托管；注册前失败、已跳过的不受影响', async () => {
+    const cf = fakeCloudflare({ dnssec: [] });
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const batch = await env.db.prepare(`INSERT INTO domain_purchase_batches (status, quote_expires_at, created_by) VALUES ('processing', ?, ?) RETURNING id`)
+      .bind(Date.now(), owner.id).first<{ id: number }>();
+    const item = (domain: string, status: string, failedStep = '') => env.db.prepare(`INSERT INTO domain_purchase_items (batch_id, domain, status, failed_step)
+      VALUES (?, ?, ?, ?)`).bind(batch!.id, domain, status, failedStep).run();
+    const held = [f.domain('registered'), f.domain('unknown'), f.domain('added'), f.domain('zonefail')];
+    await item(held[0]!, 'registered');
+    await item(held[1]!, 'unknown');
+    await item(held[2]!, 'domain_added');
+    await item(held[3]!, 'failed', 'zone');
+    for (const domain of held) {
+      expect((await errorOf(await call('POST', '/hosted-domains', owner.jwt, { domain }), 409)).message).toContain('采购');
+      expect(await db.select().from(hostedDomains).where(eq(hostedDomains.domain, domain)).get()).toBeUndefined();
+    }
+    expect(cf.calls.filter((entry) => entry === 'POST /zones')).toHaveLength(0);
+
+    const free = f.domain('regfail');
+    await item(free, 'failed', 'register');
+    await item(free, 'skipped');
+    expect((await data<HostedDomain>(await call('POST', '/hosted-domains', owner.jwt, { domain: free }), 201)).domain).toBe(free);
+  });
+
   it('Cloudflare 拒绝时释放占位并给出可读原因；功能未配置凭据时 403', async () => {
     const f = await fixture();
     const owner = await f.actor('owner');
