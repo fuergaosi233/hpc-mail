@@ -6,6 +6,8 @@ The PostgreSQL adapter preserves the application's prepared-statement and transa
 
 ## Current deployment
 
+> **2026-11-18: production moved to worklab space-2** (Tokyo, no mainland nodes). The live manifests and runbook are in `worklab/infra/space-2/k8s/hpc-mail/`; the image is `ghcr.io/anystarx/hpc-mail:<tag>` and the database is `hpc_mail` on the `vke-apps-pg` CNPG cluster. The tunnel and Tencent sections below describe the retired HomeLab deployment (kept at 0 replicas for rollback). Its tunnel lost every connector when the `gamesgadget-mail` namespace was deleted, and the Tencent origin resets TLS for the unfiled `anytoken.email` SNI.
+
 - Web: `https://anytoken.email` (the previous `mail.multi-agent.wiki` ingress is retained).
 - Namespace: `hpc-mail`
 - Application and object volume: `pve-bigbox-ubuntu-3`
